@@ -17,30 +17,34 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 #include <obs-module.h>
-#include <plugin-support.h>
+#include <obs-frontend-api.h>
 
-OBS_DECLARE_MODULE()
-OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
+#include <QDialog>
+#include <QMainWindow>
+#include <QPointer>
 
-extern struct obs_source_info warp_media_source_info;
+namespace {
 
-#ifdef WARP_HAVE_FRONTEND
-extern void warp_register_tools_menu(void);
-#endif
+QPointer<QDialog> warp_dialog;
 
-bool obs_module_load(void)
+void show_warp_window(void *)
 {
-	obs_register_source(&warp_media_source_info);
+	if (!warp_dialog) {
+		auto *main_window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
 
-#ifdef WARP_HAVE_FRONTEND
-	warp_register_tools_menu();
-#endif
+		warp_dialog = new QDialog(main_window);
+		warp_dialog->setWindowTitle(obs_module_text("Warp.WindowTitle"));
+		warp_dialog->resize(800, 500);
+	}
 
-	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
-	return true;
+	warp_dialog->show();
+	warp_dialog->raise();
+	warp_dialog->activateWindow();
 }
 
-void obs_module_unload(void)
+} // namespace
+
+extern "C" void warp_register_tools_menu(void)
 {
-	obs_log(LOG_INFO, "plugin unloaded");
+	obs_frontend_add_tools_menu_item(obs_module_text("Warp.ToolsMenu"), show_warp_window, nullptr);
 }
