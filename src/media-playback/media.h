@@ -43,9 +43,11 @@ extern "C" {
 #define MP_SPEED_MAX 400
 
 /* Warp addition: capacity of the decoded-frame history used to show
- * backward frame steps instantly (largest step hotkey is 20 frames).
+ * backward frame steps instantly. The largest step hotkey is 20 frames,
+ * and rapid presses arriving while the media thread is busy coalesce
+ * into one larger step, so keep room for a couple of stacked steps.
  * The byte cap keeps the history from ballooning on very large frames. */
-#define MP_FRAME_HIST_SIZE 25
+#define MP_FRAME_HIST_SIZE 45
 #define MP_FRAME_HIST_MAX_BYTES (256 * 1024 * 1024)
 
 struct mp_media {
