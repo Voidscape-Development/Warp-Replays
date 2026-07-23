@@ -10,7 +10,7 @@ A media source based on OBS Studio's built-in Media Source, with the same proper
 
 * **On-the-fly playback speed** from 10% to 400%, changed without restarting or losing the current position:
   * Speed Up (+10%) / Slow Down (-10%) / Reset Speed (100%) hotkeys
-  * Preset speed hotkeys: 25%, 50%, 200%
+  * Preset speed hotkeys: 25%, 50%, 125%, 150%, 200%
   * The Speed property in the source settings also applies live
 * **Frame stepping** hotkeys: step 1, 5, 10, or 20 frames forward or backward. Stepping while the video is playing pauses it first; stepping is frame-accurate, including backward steps.
 

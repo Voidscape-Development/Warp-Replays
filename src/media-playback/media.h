@@ -42,6 +42,12 @@ extern "C" {
 #define MP_SPEED_MIN 10
 #define MP_SPEED_MAX 400
 
+/* Warp addition: capacity of the decoded-frame history used to show
+ * backward frame steps instantly (largest step hotkey is 20 frames).
+ * The byte cap keeps the history from ballooning on very large frames. */
+#define MP_FRAME_HIST_SIZE 25
+#define MP_FRAME_HIST_MAX_BYTES (256 * 1024 * 1024)
+
 struct mp_media {
 	AVFormatContext *fmt;
 
@@ -117,6 +123,18 @@ struct mp_media {
 	int speed_request;
 	int step_frames;
 	bool v_frame_displayed;
+
+	/* Warp addition: ring buffer of references to recently decoded video
+	 * frames (oldest at hist_start, newest last), used to display
+	 * backward frame steps instantly instead of stalling on the keyframe
+	 * re-decode. Timestamps are stored unscaled (real media time) so
+	 * entries stay valid across speed changes. Only touched from the
+	 * media thread. */
+	AVFrame *hist_frames[MP_FRAME_HIST_SIZE];
+	int64_t hist_pts[MP_FRAME_HIST_SIZE];
+	size_t hist_start;
+	size_t hist_num;
+	size_t hist_bytes;
 };
 
 typedef struct mp_media mp_media_t;
@@ -135,6 +153,10 @@ extern void mp_media_seek(mp_media_t *m, int64_t pos);
 extern void mp_media_set_speed(mp_media_t *m, int speed);
 extern int mp_media_get_speed(mp_media_t *m);
 extern void mp_media_step_frames(mp_media_t *m, int frames);
+
+/* media-thread only: record the decoder's current video frame in the
+ * frame history (called from mp_decode_next) */
+extern void mp_media_hist_push(mp_media_t *m, struct mp_decode *d);
 
 /* #define DETAILED_DEBUG_INFO */
 
