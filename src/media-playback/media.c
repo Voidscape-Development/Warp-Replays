@@ -773,6 +773,86 @@ static void mp_media_apply_speed(mp_media_t *m, int new_speed)
 
 	m->speed = new_speed;
 	reset_ts(m);
+
+	/* reset_ts() zeroes next_ns expecting the caller to pass through
+	 * mp_media_sleep() before playing again (as the unpause path does),
+	 * but a speed change falls through to playback in the same thread
+	 * iteration. Re-anchor the pacing clock here, otherwise it stays
+	 * permanently in the past and playback runs unthrottled, flooding
+	 * the frontend with frames. */
+	m->next_ns = os_gettime_ns();
+}
+
+/* Warp addition: ring buffer of recently decoded video frames. Frames are
+ * pushed as references (no pixel copies) each time the video decoder
+ * produces one, so during playback the history always covers the frames
+ * just behind the current position. Backward steps that land inside the
+ * history can be displayed immediately instead of stalling on the
+ * keyframe re-decode. */
+
+static size_t mp_media_hist_frame_bytes(const AVFrame *f)
+{
+	int size = av_image_get_buffer_size(f->format, f->width, f->height, 1);
+	return size > 0 ? (size_t)size : 0;
+}
+
+static void mp_media_hist_pop_oldest(mp_media_t *m)
+{
+	AVFrame **slot = &m->hist_frames[m->hist_start];
+	m->hist_bytes -= mp_media_hist_frame_bytes(*slot);
+	av_frame_free(slot);
+	m->hist_start = (m->hist_start + 1) % MP_FRAME_HIST_SIZE;
+	m->hist_num--;
+}
+
+static void mp_media_hist_clear(mp_media_t *m)
+{
+	while (m->hist_num)
+		mp_media_hist_pop_oldest(m);
+	m->hist_start = 0;
+}
+
+void mp_media_hist_push(mp_media_t *m, struct mp_decode *d)
+{
+	/* GPU-surface frames are not cached: holding references to them
+	 * would starve the decoder's fixed surface pool */
+	if (!d->frame || d->frame->hw_frames_ctx)
+		return;
+
+	AVFrame *clone = av_frame_clone(d->frame);
+	if (!clone)
+		return;
+
+	size_t bytes = mp_media_hist_frame_bytes(clone);
+	while (m->hist_num && (m->hist_num >= MP_FRAME_HIST_SIZE || m->hist_bytes + bytes > MP_FRAME_HIST_MAX_BYTES))
+		mp_media_hist_pop_oldest(m);
+
+	size_t idx = (m->hist_start + m->hist_num) % MP_FRAME_HIST_SIZE;
+	m->hist_frames[idx] = clone;
+	/* store unscaled media time so entries survive speed changes */
+	m->hist_pts[idx] = av_rescale(d->frame_pts, m->speed, 100);
+	m->hist_num++;
+	m->hist_bytes += bytes;
+}
+
+static AVFrame *mp_media_hist_find(mp_media_t *m, int64_t pts, int64_t tolerance, int64_t *found_pts)
+{
+	AVFrame *best = NULL;
+	int64_t best_diff = tolerance;
+
+	for (size_t i = 0; i < m->hist_num; i++) {
+		size_t idx = (m->hist_start + i) % MP_FRAME_HIST_SIZE;
+		int64_t diff = m->hist_pts[idx] - pts;
+		if (diff < 0)
+			diff = -diff;
+		if (diff <= best_diff) {
+			best_diff = diff;
+			best = m->hist_frames[idx];
+			*found_pts = m->hist_pts[idx];
+		}
+	}
+
+	return best;
 }
 
 /* Warp addition: step the paused video by a signed number of frames and
@@ -813,6 +893,29 @@ static void mp_media_step(mp_media_t *m, int frames)
 		int64_t target = cur + (int64_t)frames * interval;
 		if (target < 0)
 			target = 0;
+
+		/* if the target frame is still in the frame history, show it
+		 * right away; the keyframe re-decode below then only serves
+		 * to re-synchronize the decoder with what is on screen */
+		int64_t found_pts;
+		AVFrame *cached = mp_media_hist_find(m, av_rescale(target, m->speed, 100),
+						     av_rescale(interval, m->speed, 100) / 2, &found_pts);
+		if (cached && m->v_seek_cb) {
+			AVFrame *dec_frame = d->frame;
+			int64_t dec_pts = d->frame_pts;
+			bool dec_ready = d->frame_ready;
+
+			/* borrow the decoder slot so the cached frame runs
+			 * through the normal conversion/callback path */
+			d->frame = cached;
+			d->frame_pts = av_rescale(found_pts, 100, m->speed);
+			d->frame_ready = true;
+			mp_media_next_video(m, true);
+
+			d->frame = dec_frame;
+			d->frame_pts = dec_pts;
+			d->frame_ready = dec_ready;
+		}
 
 		/* seek to the keyframe before the target without letting
 		 * seek_to preview it, then decode forward to the exact
@@ -1056,6 +1159,7 @@ void mp_media_free(mp_media_t *media)
 
 	mp_media_stop(media);
 	mp_kill_thread(media);
+	mp_media_hist_clear(media);
 	mp_decode_free(&media->v);
 	mp_decode_free(&media->a);
 	for (size_t i = 0; i < media->packet_pool.num; i++)

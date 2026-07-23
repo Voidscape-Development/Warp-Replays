@@ -33,7 +33,7 @@
 /* number of percentage points each speed up/down hotkey press applies */
 #define WARP_SPEED_STEP 10
 
-#define WARP_NUM_SPEED_PRESETS 3
+#define WARP_NUM_SPEED_PRESETS 5
 #define WARP_NUM_STEP_HOTKEYS 8
 
 struct warp_source;
@@ -716,7 +716,7 @@ static void warp_source_step_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *
 
 static void warp_source_register_warp_hotkeys(struct warp_source *s, obs_source_t *source)
 {
-	static const int speed_presets[WARP_NUM_SPEED_PRESETS] = {25, 50, 200};
+	static const int speed_presets[WARP_NUM_SPEED_PRESETS] = {25, 50, 125, 150, 200};
 	static const int step_counts[] = {1, 5, 10, 20};
 
 	obs_hotkey_register_source(source, "WarpMedia.SpeedUp", obs_module_text("Hotkey.SpeedUp"),
