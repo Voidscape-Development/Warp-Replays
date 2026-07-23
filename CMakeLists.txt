@@ -38,9 +38,12 @@ if(ENABLE_QT)
     ${CMAKE_PROJECT_NAME}
     PRIVATE $<$<C_COMPILER_ID:Clang,AppleClang>:-Wno-quoted-include-in-framework-header -Wno-comma>
   )
+  # AUTOMOC's compiler-predefines probe runs clang from an Xcode script
+  # phase, where Xcode 26 injects conflicting *_DEPLOYMENT_TARGET
+  # variables that make clang error out
   set_target_properties(
     ${CMAKE_PROJECT_NAME}
-    PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON
+    PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON AUTOMOC_COMPILER_PREDEFINES OFF
   )
 endif()
 
