@@ -24,6 +24,7 @@ OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
 extern struct obs_source_info warp_media_source_info;
 extern struct obs_source_info warp_playlist_source_info;
+extern struct obs_source_info warp_detection_filter_info;
 
 #ifdef WARP_HAVE_FRONTEND
 extern void warp_register_tools_menu(void);
@@ -33,6 +34,7 @@ bool obs_module_load(void)
 {
 	obs_register_source(&warp_media_source_info);
 	obs_register_source(&warp_playlist_source_info);
+	obs_register_source(&warp_detection_filter_info);
 
 #ifdef WARP_HAVE_FRONTEND
 	warp_register_tools_menu();
