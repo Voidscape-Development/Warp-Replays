@@ -452,7 +452,6 @@ static void warp_pl_swap_transition(struct warp_playlist_source *s)
 		return;
 	}
 
-	obs_source_set_audio_mixers(tr, 0xFF);
 	obs_transition_set_alignment(tr, OBS_ALIGN_CENTER);
 	obs_transition_set_scale_type(tr, OBS_TRANSITION_SCALE_ASPECT);
 	obs_transition_set_size(tr, s->cx, s->cy);
@@ -1487,8 +1486,13 @@ static obs_missing_files_t *warp_playlist_missingfiles(void *data)
 struct obs_source_info warp_playlist_source_info = {
 	.id = "warp_playlist_source",
 	.type = OBS_SOURCE_TYPE_INPUT,
-	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_AUDIO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_COMPOSITE |
-			OBS_SOURCE_DO_NOT_DUPLICATE | OBS_SOURCE_CONTROLLABLE_MEDIA,
+	/* OBS_SOURCE_AUDIO must not be set alongside OBS_SOURCE_COMPOSITE:
+	 * obs_register_source() rejects that combination outright, which keeps
+	 * the source out of the Add Source menu entirely. A composite source
+	 * delivers its audio through audio_render instead, the way scenes and
+	 * the slide show source do. */
+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_COMPOSITE | OBS_SOURCE_DO_NOT_DUPLICATE |
+			OBS_SOURCE_CONTROLLABLE_MEDIA,
 	.get_name = warp_playlist_getname,
 	.create = warp_playlist_create,
 	.destroy = warp_playlist_destroy,
