@@ -38,10 +38,6 @@ extern "C" {
 #pragma warning(pop)
 #endif
 
-/* Warp addition: supported playback speed range, in percent */
-#define MP_SPEED_MIN 10
-#define MP_SPEED_MAX 400
-
 /* Warp addition: capacity of the decoded-frame history used to show
  * backward frame steps instantly. The largest step hotkey is 20 frames,
  * and rapid presses arriving while the media thread is busy coalesce

@@ -691,6 +691,20 @@ static void warp_source_speed_preset_hotkey(void *data, obs_hotkey_id id, obs_ho
 	warp_source_apply_speed(b->s, b->value);
 }
 
+static void warp_source_do_step(struct warp_source *s, int frames)
+{
+	if (!s->media || !s->is_local_file)
+		return;
+
+	/* stepping while playing pauses first, then steps */
+	if (s->state == OBS_MEDIA_STATE_PLAYING)
+		obs_source_media_play_pause(s->source, true);
+	else if (s->state != OBS_MEDIA_STATE_PAUSED)
+		return;
+
+	media_playback_step_frames(s->media, frames);
+}
+
 static void warp_source_step_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
 {
 	UNUSED_PARAMETER(id);
@@ -702,16 +716,31 @@ static void warp_source_step_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *
 	if (!pressed || !obs_source_showing(s->source))
 		return;
 
-	if (!s->media || !s->is_local_file)
-		return;
+	warp_source_do_step(s, b->value);
+}
 
-	/* stepping while playing pauses first, then steps */
-	if (s->state == OBS_MEDIA_STATE_PLAYING)
-		obs_source_media_play_pause(s->source, true);
-	else if (s->state != OBS_MEDIA_STATE_PAUSED)
-		return;
+/* procs used by the Warp Playlist source to drive its private media items */
+static void set_speed_proc(void *data, calldata_t *cd)
+{
+	long long speed;
 
-	media_playback_step_frames(s->media, b->value);
+	if (calldata_get_int(cd, "speed", &speed))
+		warp_source_apply_speed(data, (int)speed);
+}
+
+static void get_speed_proc(void *data, calldata_t *cd)
+{
+	struct warp_source *s = data;
+
+	calldata_set_int(cd, "speed", s->speed_percent);
+}
+
+static void step_frames_proc(void *data, calldata_t *cd)
+{
+	long long frames;
+
+	if (calldata_get_int(cd, "frames", &frames))
+		warp_source_do_step(data, (int)frames);
 }
 
 static void warp_source_register_warp_hotkeys(struct warp_source *s, obs_source_t *source)
@@ -796,6 +825,9 @@ static void *warp_source_create(obs_data_t *settings, obs_source_t *source)
 	proc_handler_add(ph, "void preload_first_frame()", preload_first_frame_proc, s);
 	proc_handler_add(ph, "void get_duration(out int duration)", get_duration, s);
 	proc_handler_add(ph, "void get_nb_frames(out int num_frames)", get_nb_frames, s);
+	proc_handler_add(ph, "void warp_set_speed(int speed)", set_speed_proc, s);
+	proc_handler_add(ph, "void warp_get_speed(out int speed)", get_speed_proc, s);
+	proc_handler_add(ph, "void warp_step_frames(int frames)", step_frames_proc, s);
 
 	warp_source_update(s, settings);
 	return s;

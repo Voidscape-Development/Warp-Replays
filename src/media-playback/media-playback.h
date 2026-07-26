@@ -65,6 +65,11 @@ extern bool media_playback_has_video(media_playback_t *mp);
 extern bool media_playback_has_audio(media_playback_t *mp);
 
 /* Warp additions: on-the-fly speed control and frame stepping */
+
+/* supported playback speed range, in percent */
+#define MP_SPEED_MIN 10
+#define MP_SPEED_MAX 400
+
 extern void media_playback_set_speed(media_playback_t *mp, int speed);
 extern int media_playback_get_speed(media_playback_t *mp);
 extern void media_playback_step_frames(media_playback_t *mp, int frames);
