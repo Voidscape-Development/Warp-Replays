@@ -33,7 +33,7 @@ void show_warp_window(void *)
 		auto *main_window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
 
 		warp_dialog = new QDialog(main_window);
-		warp_dialog->setWindowTitle(obs_module_text("Warp.WindowTitle"));
+		warp_dialog->setWindowTitle(obs_module_text("Warp.Window.Title"));
 		warp_dialog->resize(800, 500);
 	}
 
@@ -46,5 +46,5 @@ void show_warp_window(void *)
 
 extern "C" void warp_register_tools_menu(void)
 {
-	obs_frontend_add_tools_menu_item(obs_module_text("Warp.ToolsMenu"), show_warp_window, nullptr);
+	obs_frontend_add_tools_menu_item(obs_module_text("Warp.Tools.Menu"), show_warp_window, nullptr);
 }

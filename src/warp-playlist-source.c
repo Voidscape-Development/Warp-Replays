@@ -130,7 +130,7 @@ struct warp_playlist_source {
 static const char *warp_playlist_getname(void *unused)
 {
 	UNUSED_PARAMETER(unused);
-	return obs_module_text("WarpPlaylistSource");
+	return obs_module_text("Warp.PlaylistSource.Name");
 }
 
 /* ------------------------------------------------------------------------- */
@@ -513,13 +513,13 @@ static obs_properties_t *warp_playlist_getproperties(void *data)
 
 	obs_properties_t *props = obs_properties_create();
 
-	dstr_copy(&filter, obs_module_text("MediaFileFilter.AllMediaFiles"));
+	dstr_copy(&filter, obs_module_text("Warp.FileFilter.AllMedia"));
 	dstr_cat(&filter, media_filter);
-	dstr_cat(&filter, obs_module_text("MediaFileFilter.VideoFiles"));
+	dstr_cat(&filter, obs_module_text("Warp.FileFilter.Video"));
 	dstr_cat(&filter, video_filter);
-	dstr_cat(&filter, obs_module_text("MediaFileFilter.AudioFiles"));
+	dstr_cat(&filter, obs_module_text("Warp.FileFilter.Audio"));
 	dstr_cat(&filter, audio_filter);
-	dstr_cat(&filter, obs_module_text("MediaFileFilter.AllFiles"));
+	dstr_cat(&filter, obs_module_text("Warp.FileFilter.All"));
 	dstr_cat(&filter, " (*.*)");
 
 	/* the file dialog opens where the last added file came from */
@@ -537,20 +537,20 @@ static obs_properties_t *warp_playlist_getproperties(void *data)
 		pthread_mutex_unlock(&s->mutex);
 	}
 
-	obs_properties_add_editable_list(props, "playlist", obs_module_text("Playlist"), OBS_EDITABLE_LIST_TYPE_FILES,
-					 filter.array, path.array);
+	obs_properties_add_editable_list(props, "playlist", obs_module_text("Warp.Playlist.Files"),
+					 OBS_EDITABLE_LIST_TYPE_FILES, filter.array, path.array);
 	dstr_free(&filter);
 	dstr_free(&path);
 
-	obs_properties_add_bool(props, "shuffle", obs_module_text("Shuffle"));
+	obs_properties_add_bool(props, "shuffle", obs_module_text("Warp.Playlist.Shuffle"));
 
-	prop = obs_properties_add_bool(props, "auto_advance", obs_module_text("AutoAdvance"));
-	obs_property_set_long_description(prop, obs_module_text("AutoAdvance.ToolTip"));
+	prop = obs_properties_add_bool(props, "auto_advance", obs_module_text("Warp.Playlist.AutoAdvance"));
+	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.AutoAdvance.Desc"));
 
-	obs_properties_add_bool(props, "loop_playlist", obs_module_text("LoopPlaylist"));
+	obs_properties_add_bool(props, "loop_playlist", obs_module_text("Warp.Playlist.Loop"));
 
-	prop = obs_properties_add_list(props, "transition", obs_module_text("PlaylistTransition"), OBS_COMBO_TYPE_LIST,
-				       OBS_COMBO_FORMAT_STRING);
+	prop = obs_properties_add_list(props, "transition", obs_module_text("Warp.Playlist.Transition"),
+				       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 
 	const char *transition_id;
 
@@ -560,28 +560,28 @@ static obs_properties_t *warp_playlist_getproperties(void *data)
 		obs_property_list_add_string(prop, name ? name : transition_id, transition_id);
 	}
 
-	prop = obs_properties_add_int_slider(props, "transition_duration", obs_module_text("TransitionDuration"), 0,
-					     10000, 50);
+	prop = obs_properties_add_int_slider(props, "transition_duration",
+					     obs_module_text("Warp.Playlist.TransitionDuration"), 0, 10000, 50);
 	obs_property_int_set_suffix(prop, " ms");
 
-	prop = obs_properties_add_int_slider(props, "speed_percent", obs_module_text("SpeedPercentage"), MP_SPEED_MIN,
+	prop = obs_properties_add_int_slider(props, "speed_percent", obs_module_text("Warp.Video.Speed"), MP_SPEED_MIN,
 					     MP_SPEED_MAX, 1);
 	obs_property_int_set_suffix(prop, "%");
-	obs_property_set_long_description(prop, obs_module_text("SpeedPercentage.Playlist.ToolTip"));
+	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.Speed.Desc"));
 
-	obs_properties_add_bool(props, "restart_on_activate", obs_module_text("RestartPlaylistWhenActivated"));
+	obs_properties_add_bool(props, "restart_on_activate", obs_module_text("Warp.Playlist.RestartOnActivate"));
 
-	obs_properties_add_bool(props, "clear_on_media_end", obs_module_text("ClearOnPlaylistEnd"));
+	obs_properties_add_bool(props, "clear_on_media_end", obs_module_text("Warp.Playlist.ClearOnEnd"));
 
-	obs_properties_add_bool(props, "hw_decode", obs_module_text("HardwareDecode"));
+	obs_properties_add_bool(props, "hw_decode", obs_module_text("Warp.Video.HardwareDecode"));
 
-	prop = obs_properties_add_list(props, "color_range", obs_module_text("ColorRange"), OBS_COMBO_TYPE_LIST,
-				       OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(prop, obs_module_text("ColorRange.Auto"), VIDEO_RANGE_DEFAULT);
-	obs_property_list_add_int(prop, obs_module_text("ColorRange.Partial"), VIDEO_RANGE_PARTIAL);
-	obs_property_list_add_int(prop, obs_module_text("ColorRange.Full"), VIDEO_RANGE_FULL);
+	prop = obs_properties_add_list(props, "color_range", obs_module_text("Warp.Video.ColorRange"),
+				       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(prop, obs_module_text("Warp.Video.ColorRange.Auto"), VIDEO_RANGE_DEFAULT);
+	obs_property_list_add_int(prop, obs_module_text("Warp.Video.ColorRange.Partial"), VIDEO_RANGE_PARTIAL);
+	obs_property_list_add_int(prop, obs_module_text("Warp.Video.ColorRange.Full"), VIDEO_RANGE_FULL);
 
-	obs_properties_add_bool(props, "linear_alpha", obs_module_text("LinearAlpha"));
+	obs_properties_add_bool(props, "linear_alpha", obs_module_text("Warp.Video.LinearAlpha"));
 
 	return props;
 }
@@ -955,29 +955,32 @@ static void warp_playlist_register_hotkeys(struct warp_playlist_source *s, obs_s
 	static const int speed_presets[WARP_PL_NUM_SPEED_PRESETS] = {25, 50, 125, 150, 200};
 	static const int step_counts[] = {1, 5, 10, 20};
 
-	s->play_pause_hotkey = obs_hotkey_pair_register_source(source, "WarpPlaylist.Play", obs_module_text("Play"),
-							       "WarpPlaylist.Pause", obs_module_text("Pause"),
-							       warp_playlist_play_hotkey, warp_playlist_pause_hotkey, s,
-							       s);
-	s->stop_hotkey = obs_hotkey_register_source(source, "WarpPlaylist.Stop", obs_module_text("Stop"),
+	s->play_pause_hotkey = obs_hotkey_pair_register_source(
+		source, "WarpPlaylist.Play", obs_module_text("Warp.Hotkey.Play"), "WarpPlaylist.Pause",
+		obs_module_text("Warp.Hotkey.Pause"), warp_playlist_play_hotkey, warp_playlist_pause_hotkey, s, s);
+	s->stop_hotkey = obs_hotkey_register_source(source, "WarpPlaylist.Stop", obs_module_text("Warp.Hotkey.Stop"),
 						    warp_playlist_stop_hotkey, s);
-	s->next_hotkey = obs_hotkey_register_source(source, "WarpPlaylist.Next", obs_module_text("Hotkey.NextVideo"),
+	s->next_hotkey = obs_hotkey_register_source(source, "WarpPlaylist.Next",
+						    obs_module_text("Warp.Hotkey.Playlist.Next"),
 						    warp_playlist_next_hotkey, s);
-	s->prev_hotkey = obs_hotkey_register_source(
-		source, "WarpPlaylist.Previous", obs_module_text("Hotkey.PreviousVideo"), warp_playlist_prev_hotkey, s);
-	s->first_hotkey = obs_hotkey_register_source(source, "WarpPlaylist.First", obs_module_text("Hotkey.FirstVideo"),
+	s->prev_hotkey = obs_hotkey_register_source(source, "WarpPlaylist.Previous",
+						    obs_module_text("Warp.Hotkey.Playlist.Previous"),
+						    warp_playlist_prev_hotkey, s);
+	s->first_hotkey = obs_hotkey_register_source(source, "WarpPlaylist.First",
+						     obs_module_text("Warp.Hotkey.Playlist.First"),
 						     warp_playlist_first_hotkey, s);
 	s->restart_hotkey = obs_hotkey_register_source(source, "WarpPlaylist.RestartCurrent",
-						       obs_module_text("Hotkey.RestartCurrentVideo"),
+						       obs_module_text("Warp.Hotkey.Playlist.RestartCurrent"),
 						       warp_playlist_restart_hotkey, s);
-	s->clear_hotkey = obs_hotkey_register_source(
-		source, "WarpPlaylist.ClearQueue", obs_module_text("Hotkey.ClearQueue"), warp_playlist_clear_hotkey, s);
+	s->clear_hotkey = obs_hotkey_register_source(source, "WarpPlaylist.ClearQueue",
+						     obs_module_text("Warp.Hotkey.Playlist.Clear"),
+						     warp_playlist_clear_hotkey, s);
 
-	obs_hotkey_register_source(source, "WarpPlaylist.SpeedUp", obs_module_text("Hotkey.SpeedUp"),
+	obs_hotkey_register_source(source, "WarpPlaylist.SpeedUp", obs_module_text("Warp.Hotkey.Speed.Up"),
 				   warp_playlist_speed_up_hotkey, s);
-	obs_hotkey_register_source(source, "WarpPlaylist.SpeedDown", obs_module_text("Hotkey.SpeedDown"),
+	obs_hotkey_register_source(source, "WarpPlaylist.SpeedDown", obs_module_text("Warp.Hotkey.Speed.Down"),
 				   warp_playlist_speed_down_hotkey, s);
-	obs_hotkey_register_source(source, "WarpPlaylist.SpeedReset", obs_module_text("Hotkey.SpeedReset"),
+	obs_hotkey_register_source(source, "WarpPlaylist.SpeedReset", obs_module_text("Warp.Hotkey.Speed.Reset"),
 				   warp_playlist_speed_reset_hotkey, s);
 
 	for (size_t i = 0; i < WARP_PL_NUM_SPEED_PRESETS; i++) {
@@ -988,7 +991,7 @@ static void warp_playlist_register_hotkeys(struct warp_playlist_source *s, obs_s
 		s->speed_bindings[i].value = speed_presets[i];
 
 		snprintf(name, sizeof(name), "WarpPlaylist.SpeedPreset%d", speed_presets[i]);
-		snprintf(text_key, sizeof(text_key), "Hotkey.Speed%d", speed_presets[i]);
+		snprintf(text_key, sizeof(text_key), "Warp.Hotkey.Speed.Preset%d", speed_presets[i]);
 		obs_hotkey_register_source(source, name, obs_module_text(text_key), warp_playlist_speed_preset_hotkey,
 					   &s->speed_bindings[i]);
 	}
@@ -1003,13 +1006,13 @@ static void warp_playlist_register_hotkeys(struct warp_playlist_source *s, obs_s
 		fwd->s = s;
 		fwd->value = step_counts[i];
 		snprintf(name, sizeof(name), "WarpPlaylist.StepForward%d", step_counts[i]);
-		snprintf(text_key, sizeof(text_key), "Hotkey.StepForward%d", step_counts[i]);
+		snprintf(text_key, sizeof(text_key), "Warp.Hotkey.Step.Forward%d", step_counts[i]);
 		obs_hotkey_register_source(source, name, obs_module_text(text_key), warp_playlist_step_hotkey, fwd);
 
 		back->s = s;
 		back->value = -step_counts[i];
 		snprintf(name, sizeof(name), "WarpPlaylist.StepBackward%d", step_counts[i]);
-		snprintf(text_key, sizeof(text_key), "Hotkey.StepBackward%d", step_counts[i]);
+		snprintf(text_key, sizeof(text_key), "Warp.Hotkey.Step.Backward%d", step_counts[i]);
 		obs_hotkey_register_source(source, name, obs_module_text(text_key), warp_playlist_step_hotkey, back);
 	}
 }
