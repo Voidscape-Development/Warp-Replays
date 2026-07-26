@@ -16,6 +16,21 @@ A media source based on OBS Studio's built-in Media Source, with the same proper
 
 All hotkeys are per-source and are bound in OBS under Settings → Hotkeys.
 
+### Warp Playlist source
+
+A playlist source in the spirit of the VLC video source, built on the same playback engine as the Warp Media source, so every clip in the list gets the same replay controls:
+
+* **Playlist** of local media files, played in order or shuffled. Shuffled playlists are reshuffled on every pass.
+* **Automatic advance**: the next file starts as the current one is about to end. The transition is started one transition-duration early, so it finishes at the moment the current file runs out instead of freezing on its last frame. The next file is opened and parked on its first frame ahead of time, so the incoming half of the transition has picture from the start.
+* **Loop the playlist** when the last file ends.
+* **Transition between videos**, picked from every transition registered in OBS (Cut, Fade, Swipe, Slide, Fade to Color, Luma Wipe, and any transition plugins installed), with a configurable duration.
+* **Playback speed and frame stepping** for the file that is playing, with the same hotkeys as the Warp Media source. The speed resets to the configured Speed value whenever the playlist moves to another file.
+* **Hotkeys**: Next Video, Previous Video, Back to First Video, Restart Current Video, Clear Playlist, plus Play/Pause, Stop, the speed hotkeys, and the frame stepping hotkeys.
+
+Clear Playlist empties the source's file list for good — it is written to the scene collection like any other settings change. The cleared file paths are written to the OBS log first, so a playlist cleared by a mis-hit during a show can be rebuilt from there.
+
+Media controls (the ones in the OBS media controls dock) apply to the playlist: restart starts the playlist over from its first file, next and previous move through the list, and the time and duration shown are those of the file that is playing.
+
 ### Warp window
 
 A Warp entry in the Tools menu opens the Warp window (currently an empty placeholder for upcoming replay tooling).

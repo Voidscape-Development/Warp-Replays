@@ -52,6 +52,7 @@ target_sources(
   PRIVATE
     src/plugin-main.c
     src/warp-source.c
+    src/warp-playlist-source.c
     src/media-playback/cache.c
     src/media-playback/decode.c
     src/media-playback/media-playback.c
