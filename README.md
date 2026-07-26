@@ -36,10 +36,13 @@ Media controls (the ones in the OBS media controls dock) apply to the playlist: 
 A filter that watches a Warp Media or Warp Playlist source and triggers something else when the operator changes playback. Add it under Filters on any source — it never touches the picture, so the source it is on does not have to be the source it listens to.
 
 * **Listen To**: the Warp Media or Warp Playlist source to watch. Left unset, the filter watches the source it is on. A source that is not in the scene collection yet is picked up as soon as it appears, so the filter survives a scene collection loading in whatever order it likes.
-* **React To**, one event per filter:
-  * *Speed Set to a Value*, with the speed to match (or any speed). This is the speed being put at a value outright: a preset speed hotkey, Reset Speed, or the Speed property. Reaching that same speed by stepping up or down is the increased/decreased event instead.
-  * *Speed Increased (+10%)* / *Speed Decreased (-10%)*, the speed up and slow down hotkeys.
-  * *Frames Skipped Forward* / *Frames Skipped Backward*, with the frame count to match (or any count), for the 1, 5, 10 and 20 frame stepping hotkeys.
+* **React To**, one event per filter. Every speed and frame stepping hotkey has an event of its own, named after that hotkey — *Set Speed to 25%*, *Set Speed to 50%*, *Reset Speed (100%)*, *Set Speed to 125/150/200%*, *Speed Up (+10%)*, *Slow Down (-10%)*, *Step Forward 1/5/10/20 Frames* and *Step Backward 1/5/10/20 Frames* — so every step level can set off something different. Three more events match a value you choose instead:
+  * *Speed Set to a Value…*, matching one speed, or any speed.
+  * *Frames Skipped Forward…* / *Frames Skipped Backward…*, matching one frame count, or any count.
+
+  Speed being set to a value means it was put there outright: a preset speed hotkey, Reset Speed, or the Speed property. Reaching that same speed by stepping up or down fires the *Speed Up* / *Slow Down* event instead.
+
+  The event list is built from the same tables the sources register their hotkeys from, so a preset speed or step size added to the sources turns up here as well.
 * **Then Trigger**:
   * *A Global Hotkey*: any of OBS's own hotkeys — Start Recording, Save Replay, and the rest — listed by the same translated names the Settings → Hotkeys page uses.
   * *A Source Hotkey*: pick a source or scene, then one of its hotkeys, again by the name the hotkeys page shows. Another Warp source's speed and stepping hotkeys are in that list, so one source can drive another.

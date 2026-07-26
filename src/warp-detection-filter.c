@@ -17,6 +17,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <obs-module.h>
@@ -45,12 +46,27 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define S_FILTER_MODE "filter_mode"
 #define S_FILTER_HOTKEY "filter_hotkey"
 
-/* the event listened for */
+/* The event listened for. Each speed and stepping hotkey has an event of its
+ * own, saved as the kind with the hotkey's value on the end - "speed_set_50",
+ * "step_forward_5". The bare kinds are the general ones, which take the value
+ * to match from the properties instead. */
 #define EVENT_SPEED_SET "speed_set"
 #define EVENT_SPEED_UP "speed_up"
 #define EVENT_SPEED_DOWN "speed_down"
 #define EVENT_STEP_FORWARD "step_forward"
 #define EVENT_STEP_BACKWARD "step_backward"
+
+/* the speed Reset Speed sets, which has an event like the presets do */
+#define WARP_DETECT_RESET_SPEED 100
+
+enum warp_detect_kind {
+	WARP_DETECT_KIND_NONE,
+	WARP_DETECT_KIND_SPEED_SET,
+	WARP_DETECT_KIND_SPEED_UP,
+	WARP_DETECT_KIND_SPEED_DOWN,
+	WARP_DETECT_KIND_STEP_FORWARD,
+	WARP_DETECT_KIND_STEP_BACKWARD,
+};
 
 /* what is done about it */
 #define ACTION_GLOBAL_HOTKEY "global_hotkey"
@@ -345,43 +361,96 @@ static void warp_detect_fire(struct warp_detect_filter *f, const char *event)
 /* ------------------------------------------------------------------------- */
 /* listening */
 
-static bool warp_detect_speed_matches(obs_data_t *settings, int speed, const char *change)
+/* Matches the saved event against one of the kinds, and says which value that
+ * event is about: the one on the end of the event when it stands for a single
+ * hotkey ("speed_set_50"), and the one in the properties when it is the general
+ * event ("speed_set"). */
+static bool warp_detect_event_is(const char *event, const char *kind, int *hotkey_value)
+{
+	size_t len = strlen(kind);
+
+	if (strncmp(event, kind, len) != 0)
+		return false;
+
+	if (event[len] == '\0')
+		*hotkey_value = 0;
+	else if (event[len] == '_')
+		*hotkey_value = atoi(event + len + 1);
+	else
+		return false;
+
+	return true;
+}
+
+static enum warp_detect_kind warp_detect_event_kind(obs_data_t *settings, int *value, bool *any)
 {
 	const char *event = obs_data_get_string(settings, S_EVENT);
+	int hotkey_value = 0;
+
+	*value = 0;
+	*any = false;
+
+	if (warp_detect_event_is(event, EVENT_SPEED_SET, &hotkey_value)) {
+		*value = hotkey_value ? hotkey_value : (int)obs_data_get_int(settings, S_SPEED_VALUE);
+		*any = !hotkey_value && obs_data_get_bool(settings, S_ANY_VALUE);
+		return WARP_DETECT_KIND_SPEED_SET;
+	}
 
 	if (strcmp(event, EVENT_SPEED_UP) == 0)
-		return strcmp(change, WARP_SPEED_CHANGE_INCREASED) == 0;
+		return WARP_DETECT_KIND_SPEED_UP;
 
 	if (strcmp(event, EVENT_SPEED_DOWN) == 0)
+		return WARP_DETECT_KIND_SPEED_DOWN;
+
+	if (warp_detect_event_is(event, EVENT_STEP_FORWARD, &hotkey_value)) {
+		*value = hotkey_value ? hotkey_value : (int)obs_data_get_int(settings, S_FRAME_VALUE);
+		*any = !hotkey_value && obs_data_get_bool(settings, S_ANY_VALUE);
+		return WARP_DETECT_KIND_STEP_FORWARD;
+	}
+
+	if (warp_detect_event_is(event, EVENT_STEP_BACKWARD, &hotkey_value)) {
+		*value = hotkey_value ? hotkey_value : (int)obs_data_get_int(settings, S_FRAME_VALUE);
+		*any = !hotkey_value && obs_data_get_bool(settings, S_ANY_VALUE);
+		return WARP_DETECT_KIND_STEP_BACKWARD;
+	}
+
+	return WARP_DETECT_KIND_NONE;
+}
+
+static bool warp_detect_speed_matches(obs_data_t *settings, int speed, const char *change)
+{
+	int value;
+	bool any;
+
+	switch (warp_detect_event_kind(settings, &value, &any)) {
+	case WARP_DETECT_KIND_SPEED_UP:
+		return strcmp(change, WARP_SPEED_CHANGE_INCREASED) == 0;
+	case WARP_DETECT_KIND_SPEED_DOWN:
 		return strcmp(change, WARP_SPEED_CHANGE_DECREASED) == 0;
-
-	if (strcmp(event, EVENT_SPEED_SET) != 0)
+	case WARP_DETECT_KIND_SPEED_SET:
+		/* "set to X%" is the speed being put at a value outright: a
+		 * preset hotkey, Reset Speed, or the Speed property. Landing on
+		 * X by stepping up or down is the increased/decreased event. */
+		return strcmp(change, WARP_SPEED_CHANGE_SET) == 0 && (any || speed == value);
+	default:
 		return false;
-
-	/* "set to X%" is the speed being put at a value outright: a preset
-	 * hotkey, Reset Speed, or the Speed property. Landing on X by stepping
-	 * up or down is the increased/decreased event instead. */
-	if (strcmp(change, WARP_SPEED_CHANGE_SET) != 0)
-		return false;
-
-	return obs_data_get_bool(settings, S_ANY_VALUE) || speed == (int)obs_data_get_int(settings, S_SPEED_VALUE);
+	}
 }
 
 static bool warp_detect_frames_match(obs_data_t *settings, int frames)
 {
-	const char *event = obs_data_get_string(settings, S_EVENT);
-	bool forward = strcmp(event, EVENT_STEP_FORWARD) == 0;
+	int value;
+	bool any;
+	enum warp_detect_kind kind = warp_detect_event_kind(settings, &value, &any);
+	bool forward = kind == WARP_DETECT_KIND_STEP_FORWARD;
 
-	if (!forward && strcmp(event, EVENT_STEP_BACKWARD) != 0)
+	if (!forward && kind != WARP_DETECT_KIND_STEP_BACKWARD)
 		return false;
 
 	if (forward != (frames > 0))
 		return false;
 
-	if (obs_data_get_bool(settings, S_ANY_VALUE))
-		return true;
-
-	return (frames < 0 ? -frames : frames) == (int)obs_data_get_int(settings, S_FRAME_VALUE);
+	return any || (frames < 0 ? -frames : frames) == value;
 }
 
 static void warp_detect_speed_signal(void *param, calldata_t *cd)
@@ -677,6 +746,73 @@ static void warp_detect_fill_filter_hotkeys(obs_property_t *list, const char *so
 	obs_source_release(owner);
 }
 
+/* the events that stand for a single hotkey are labelled with that hotkey's own
+ * name, so the list reads like the one in Settings -> Hotkeys */
+static void warp_detect_add_speed_event(obs_property_t *list, int speed)
+{
+	char event[32];
+	char text_key[64];
+	const char *label;
+
+	snprintf(event, sizeof(event), "%s_%d", EVENT_SPEED_SET, speed);
+
+	if (speed == WARP_DETECT_RESET_SPEED) {
+		label = obs_module_text("Warp.Hotkey.Speed.Reset");
+	} else {
+		snprintf(text_key, sizeof(text_key), "Warp.Hotkey.Speed.Preset%d", speed);
+		label = obs_module_text(text_key);
+	}
+
+	obs_property_list_add_string(list, label, event);
+}
+
+static void warp_detect_add_step_event(obs_property_t *list, const char *kind, const char *direction, int frames)
+{
+	char event[32];
+	char text_key[64];
+
+	snprintf(event, sizeof(event), "%s_%d", kind, frames);
+	snprintf(text_key, sizeof(text_key), "Warp.Hotkey.Step.%s%d", direction, frames);
+
+	obs_property_list_add_string(list, obs_module_text(text_key), event);
+}
+
+static void warp_detect_add_events(obs_property_t *list)
+{
+	static const int speed_presets[WARP_NUM_SPEED_PRESETS] = {WARP_SPEED_PRESET_LIST};
+	static const int step_counts[WARP_NUM_STEP_COUNTS] = {WARP_STEP_COUNT_LIST};
+	bool reset_added = false;
+
+	/* the general event first, then one per hotkey that sets a speed: the
+	 * presets, and the 100% Reset Speed sets, in speed order */
+	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.SpeedSet"), EVENT_SPEED_SET);
+
+	for (size_t i = 0; i < WARP_NUM_SPEED_PRESETS; i++) {
+		if (!reset_added && speed_presets[i] > WARP_DETECT_RESET_SPEED) {
+			warp_detect_add_speed_event(list, WARP_DETECT_RESET_SPEED);
+			reset_added = true;
+		}
+
+		warp_detect_add_speed_event(list, speed_presets[i]);
+	}
+
+	if (!reset_added)
+		warp_detect_add_speed_event(list, WARP_DETECT_RESET_SPEED);
+
+	obs_property_list_add_string(list, obs_module_text("Warp.Hotkey.Speed.Up"), EVENT_SPEED_UP);
+	obs_property_list_add_string(list, obs_module_text("Warp.Hotkey.Speed.Down"), EVENT_SPEED_DOWN);
+
+	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.StepForward"), EVENT_STEP_FORWARD);
+
+	for (size_t i = 0; i < WARP_NUM_STEP_COUNTS; i++)
+		warp_detect_add_step_event(list, EVENT_STEP_FORWARD, "Forward", step_counts[i]);
+
+	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.StepBackward"), EVENT_STEP_BACKWARD);
+
+	for (size_t i = 0; i < WARP_NUM_STEP_COUNTS; i++)
+		warp_detect_add_step_event(list, EVENT_STEP_BACKWARD, "Backward", step_counts[i]);
+}
+
 static bool warp_detect_modified(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
 {
 	const char *event = obs_data_get_string(settings, S_EVENT);
@@ -742,7 +878,6 @@ static obs_properties_t *warp_detect_getproperties(void *data)
 {
 	obs_properties_t *props = obs_properties_create();
 	obs_property_t *prop;
-	char label[128];
 
 	UNUSED_PARAMETER(data);
 
@@ -753,13 +888,7 @@ static obs_properties_t *warp_detect_getproperties(void *data)
 
 	prop = obs_properties_add_list(props, S_EVENT, obs_module_text("Warp.Detect.Event"), OBS_COMBO_TYPE_LIST,
 				       OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(prop, obs_module_text("Warp.Detect.Event.SpeedSet"), EVENT_SPEED_SET);
-	snprintf(label, sizeof(label), obs_module_text("Warp.Detect.Event.SpeedUp"), WARP_SPEED_STEP);
-	obs_property_list_add_string(prop, label, EVENT_SPEED_UP);
-	snprintf(label, sizeof(label), obs_module_text("Warp.Detect.Event.SpeedDown"), WARP_SPEED_STEP);
-	obs_property_list_add_string(prop, label, EVENT_SPEED_DOWN);
-	obs_property_list_add_string(prop, obs_module_text("Warp.Detect.Event.StepForward"), EVENT_STEP_FORWARD);
-	obs_property_list_add_string(prop, obs_module_text("Warp.Detect.Event.StepBackward"), EVENT_STEP_BACKWARD);
+	warp_detect_add_events(prop);
 	obs_property_set_long_description(prop, obs_module_text("Warp.Detect.Event.Desc"));
 	obs_property_set_modified_callback(prop, warp_detect_modified);
 

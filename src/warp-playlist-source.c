@@ -32,9 +32,6 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define WARP_PL_LOG(level, format, ...) \
 	blog(level, "[Warp Playlist '%s']: " format, obs_source_get_name(s->source), ##__VA_ARGS__)
 
-#define WARP_PL_NUM_SPEED_PRESETS 5
-#define WARP_PL_NUM_STEP_HOTKEYS 8
-
 /* How far ahead of the switch point the next file is opened, in wall-clock
  * milliseconds. The item is opened, allowed to decode its first frame, then
  * paused at the start, so the incoming half of the transition has picture
@@ -119,8 +116,8 @@ struct warp_playlist_source {
 	obs_hotkey_id restart_hotkey;
 	obs_hotkey_id clear_hotkey;
 
-	struct warp_pl_hotkey_binding speed_bindings[WARP_PL_NUM_SPEED_PRESETS];
-	struct warp_pl_hotkey_binding step_bindings[WARP_PL_NUM_STEP_HOTKEYS];
+	struct warp_pl_hotkey_binding speed_bindings[WARP_NUM_SPEED_PRESETS];
+	struct warp_pl_hotkey_binding step_bindings[WARP_NUM_STEP_HOTKEYS];
 };
 
 static const char *warp_playlist_getname(void *unused)
@@ -974,8 +971,8 @@ static void warp_playlist_step_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t
 
 static void warp_playlist_register_hotkeys(struct warp_playlist_source *s, obs_source_t *source)
 {
-	static const int speed_presets[WARP_PL_NUM_SPEED_PRESETS] = {25, 50, 125, 150, 200};
-	static const int step_counts[] = {1, 5, 10, 20};
+	static const int speed_presets[WARP_NUM_SPEED_PRESETS] = {WARP_SPEED_PRESET_LIST};
+	static const int step_counts[WARP_NUM_STEP_COUNTS] = {WARP_STEP_COUNT_LIST};
 
 	s->play_pause_hotkey = obs_hotkey_pair_register_source(
 		source, "WarpPlaylist.Play", obs_module_text("Warp.Hotkey.Play"), "WarpPlaylist.Pause",
@@ -1005,7 +1002,7 @@ static void warp_playlist_register_hotkeys(struct warp_playlist_source *s, obs_s
 	obs_hotkey_register_source(source, "WarpPlaylist.SpeedReset", obs_module_text("Warp.Hotkey.Speed.Reset"),
 				   warp_playlist_speed_reset_hotkey, s);
 
-	for (size_t i = 0; i < WARP_PL_NUM_SPEED_PRESETS; i++) {
+	for (size_t i = 0; i < WARP_NUM_SPEED_PRESETS; i++) {
 		char name[64];
 		char text_key[64];
 
@@ -1018,7 +1015,7 @@ static void warp_playlist_register_hotkeys(struct warp_playlist_source *s, obs_s
 					   &s->speed_bindings[i]);
 	}
 
-	for (size_t i = 0; i < sizeof(step_counts) / sizeof(step_counts[0]); i++) {
+	for (size_t i = 0; i < WARP_NUM_STEP_COUNTS; i++) {
 		char name[64];
 		char text_key[64];
 

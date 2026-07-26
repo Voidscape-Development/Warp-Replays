@@ -27,6 +27,18 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 /* number of percentage points each speed up/down hotkey press applies */
 #define WARP_SPEED_STEP 10
 
+/* The speeds the preset hotkeys set, and the frame counts the stepping hotkeys
+ * step by. Both sources register their hotkeys from these, and the Warp
+ * Detection filter builds one event per hotkey from them, so a hotkey added
+ * here turns up in all three places. Kept in ascending order: the filter lists
+ * its events in it. */
+#define WARP_SPEED_PRESET_LIST 25, 50, 125, 150, 200
+#define WARP_NUM_SPEED_PRESETS 5
+
+#define WARP_STEP_COUNT_LIST 1, 5, 10, 20
+#define WARP_NUM_STEP_COUNTS 4
+#define WARP_NUM_STEP_HOTKEYS (WARP_NUM_STEP_COUNTS * 2)
+
 /* Signals both Warp sources emit as playback is controlled, listened for by
  * the Warp Detection filter (and available to scripts through the source's
  * signal handler):
