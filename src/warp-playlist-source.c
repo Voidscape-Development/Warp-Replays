@@ -27,14 +27,10 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <media-playback/media-playback.h>
 
+#include "warp-events.h"
+
 #define WARP_PL_LOG(level, format, ...) \
 	blog(level, "[Warp Playlist '%s']: " format, obs_source_get_name(s->source), ##__VA_ARGS__)
-
-/* id of the Warp Media source, used for the private per-item sources */
-#define WARP_MEDIA_SOURCE_ID "warp_media_source"
-
-/* number of percentage points each speed up/down hotkey press applies */
-#define WARP_PL_SPEED_STEP 10
 
 #define WARP_PL_NUM_SPEED_PRESETS 5
 #define WARP_PL_NUM_STEP_HOTKEYS 8
@@ -651,6 +647,8 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 
 	pthread_mutex_lock(&s->mutex);
 
+	/* zero until the first update, which is the one create() makes */
+	int prev_speed = s->speed;
 	char *playing = NULL;
 
 	if (s->pos < s->order.num) {
@@ -714,7 +712,14 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 	if (s->order.num && s->pos >= s->order.num && (!s->restart_on_activate || active))
 		warp_pl_play_pos(s, 0, false);
 
+	int speed_now = s->speed;
+
 	pthread_mutex_unlock(&s->mutex);
+
+	/* the Speed property applies to the file that is playing, so it is a
+	 * speed change like any hotkey-driven one */
+	if (prev_speed && prev_speed != speed_now)
+		warp_signal_speed_changed(s->source, speed_now, prev_speed, WARP_SPEED_CHANGE_SET);
 
 	bfree(playing);
 }
@@ -866,6 +871,25 @@ static void warp_playlist_clear_hotkey(void *data, obs_hotkey_id id, obs_hotkey_
 	obs_data_release(settings);
 }
 
+/* Applies a speed hotkey and reports what it did. 'value' is the speed to play
+ * at when 'absolute' is set, and the number of points to move by otherwise.
+ * The signal is emitted with the mutex released: whatever reacts to it is free
+ * to drive this playlist straight back. */
+static void warp_pl_speed_hotkey(struct warp_playlist_source *s, int value, bool absolute, const char *change)
+{
+	int prev_speed;
+	int speed;
+
+	pthread_mutex_lock(&s->mutex);
+	prev_speed = s->speed;
+	warp_pl_apply_speed(s, absolute ? value : s->speed + value);
+	speed = s->speed;
+	pthread_mutex_unlock(&s->mutex);
+
+	if (speed != prev_speed)
+		warp_signal_speed_changed(s->source, speed, prev_speed, change);
+}
+
 static void warp_playlist_speed_up_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
 {
 	UNUSED_PARAMETER(id);
@@ -876,9 +900,7 @@ static void warp_playlist_speed_up_hotkey(void *data, obs_hotkey_id id, obs_hotk
 	if (!pressed || !obs_source_showing(s->source))
 		return;
 
-	pthread_mutex_lock(&s->mutex);
-	warp_pl_apply_speed(s, s->speed + WARP_PL_SPEED_STEP);
-	pthread_mutex_unlock(&s->mutex);
+	warp_pl_speed_hotkey(s, WARP_SPEED_STEP, false, WARP_SPEED_CHANGE_INCREASED);
 }
 
 static void warp_playlist_speed_down_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -891,9 +913,7 @@ static void warp_playlist_speed_down_hotkey(void *data, obs_hotkey_id id, obs_ho
 	if (!pressed || !obs_source_showing(s->source))
 		return;
 
-	pthread_mutex_lock(&s->mutex);
-	warp_pl_apply_speed(s, s->speed - WARP_PL_SPEED_STEP);
-	pthread_mutex_unlock(&s->mutex);
+	warp_pl_speed_hotkey(s, -WARP_SPEED_STEP, false, WARP_SPEED_CHANGE_DECREASED);
 }
 
 static void warp_playlist_speed_reset_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -906,9 +926,7 @@ static void warp_playlist_speed_reset_hotkey(void *data, obs_hotkey_id id, obs_h
 	if (!pressed || !obs_source_showing(s->source))
 		return;
 
-	pthread_mutex_lock(&s->mutex);
-	warp_pl_apply_speed(s, 100);
-	pthread_mutex_unlock(&s->mutex);
+	warp_pl_speed_hotkey(s, 100, true, WARP_SPEED_CHANGE_SET);
 }
 
 static void warp_playlist_speed_preset_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -922,9 +940,7 @@ static void warp_playlist_speed_preset_hotkey(void *data, obs_hotkey_id id, obs_
 	if (!pressed || !obs_source_showing(s->source))
 		return;
 
-	pthread_mutex_lock(&s->mutex);
-	warp_pl_apply_speed(s, b->value);
-	pthread_mutex_unlock(&s->mutex);
+	warp_pl_speed_hotkey(s, b->value, true, WARP_SPEED_CHANGE_SET);
 }
 
 static void warp_playlist_step_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -938,6 +954,8 @@ static void warp_playlist_step_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t
 	if (!pressed || !obs_source_showing(s->source))
 		return;
 
+	bool stepped = false;
+
 	pthread_mutex_lock(&s->mutex);
 
 	if (s->current) {
@@ -945,9 +963,13 @@ static void warp_playlist_step_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t
 		 * kick in while the operator is stepping around */
 		warp_pl_call_item_proc(s->current, "warp_step_frames", "frames", b->value);
 		s->state = obs_source_media_get_state(s->current);
+		stepped = true;
 	}
 
 	pthread_mutex_unlock(&s->mutex);
+
+	if (stepped)
+		warp_signal_frames_stepped(s->source, b->value);
 }
 
 static void warp_playlist_register_hotkeys(struct warp_playlist_source *s, obs_source_t *source)
@@ -1021,12 +1043,15 @@ static void warp_playlist_register_hotkeys(struct warp_playlist_source *s, obs_s
 
 static void *warp_playlist_create(obs_data_t *settings, obs_source_t *source)
 {
+	static const char *signals[] = {WARP_SIGNAL_DECL_SPEED_CHANGED, WARP_SIGNAL_DECL_FRAMES_STEPPED, NULL};
+
 	struct warp_playlist_source *s = bzalloc(sizeof(struct warp_playlist_source));
 
 	s->source = source;
 	s->state = OBS_MEDIA_STATE_NONE;
 	s->base_speed = 100;
-	s->speed = 100;
+	/* s->speed is left at zero: the update below fills it in, and a speed
+	 * that was never played at is not a change to report */
 	s->transition_ms = WARP_PL_DEFAULT_TRANSITION_MS;
 	s->rand_state = os_gettime_ns() | 1;
 
@@ -1039,6 +1064,7 @@ static void *warp_playlist_create(obs_data_t *settings, obs_source_t *source)
 	da_init(s->paths);
 	da_init(s->order);
 
+	signal_handler_add_array(obs_source_get_signal_handler(source), signals);
 	warp_playlist_register_hotkeys(s, source);
 
 	warp_playlist_update(s, settings);

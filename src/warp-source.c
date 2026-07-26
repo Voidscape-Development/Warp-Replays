@@ -24,14 +24,13 @@
 #include <media-playback/media-playback.h>
 #include <media-playback/media.h>
 
+#include "warp-events.h"
+
 #define FF_LOG_S(source, level, format, ...)      \
 	blog(level, "[Warp Media '%s']: " format, \
 	     obs_source_get_name(source), ##__VA_ARGS__)
 #define FF_BLOG(level, format, ...) \
 	FF_LOG_S(s->source, level, format, ##__VA_ARGS__)
-
-/* number of percentage points each speed up/down hotkey press applies */
-#define WARP_SPEED_STEP 10
 
 #define WARP_NUM_SPEED_PRESETS 5
 #define WARP_NUM_STEP_HOTKEYS 8
@@ -414,6 +413,9 @@ static void warp_source_update(void *data, obs_data_t *settings)
 {
 	struct warp_source *s = data;
 
+	/* zero until the first update, which is the one create() makes: the
+	 * speed a source starts at is not a change anyone can react to */
+	int prev_speed = s->speed_percent;
 	bool active = obs_source_active(s->source);
 	bool is_local_file = obs_data_get_bool(settings, "is_local_file");
 	bool is_stinger = obs_data_get_bool(settings, "is_stinger");
@@ -515,6 +517,11 @@ static void warp_source_update(void *data, obs_data_t *settings)
 	dump_source_info(s, input, input_format);
 	if ((!s->restart_on_activate || active) && should_restart_media)
 		warp_source_start(s);
+
+	/* the Speed property applies live, so it is a speed change like any
+	 * hotkey-driven one */
+	if (prev_speed && prev_speed != s->speed_percent)
+		warp_signal_speed_changed(s->source, s->speed_percent, prev_speed, WARP_SPEED_CHANGE_SET);
 }
 
 static const char *warp_source_getname(void *unused)
@@ -616,7 +623,10 @@ static void warp_source_stop_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *
 		obs_source_media_stop(s->source);
 }
 
-static void warp_source_apply_speed(struct warp_source *s, int speed)
+/* 'change' is one of the WARP_SPEED_CHANGE_* kinds, and says how the speed was
+ * asked to move: a listener can tell a preset from a step that happens to land
+ * on the same value */
+static void warp_source_apply_speed(struct warp_source *s, int speed, const char *change)
 {
 	if (speed < MP_SPEED_MIN)
 		speed = MP_SPEED_MIN;
@@ -625,6 +635,8 @@ static void warp_source_apply_speed(struct warp_source *s, int speed)
 
 	if (!s->is_local_file || speed == s->speed_percent)
 		return;
+
+	int prev_speed = s->speed_percent;
 
 	s->speed_percent = speed;
 
@@ -638,6 +650,8 @@ static void warp_source_apply_speed(struct warp_source *s, int speed)
 	obs_data_release(settings);
 
 	FF_BLOG(LOG_INFO, "speed set to %d%%", speed);
+
+	warp_signal_speed_changed(s->source, speed, prev_speed, change);
 }
 
 static void warp_source_speed_up_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -650,7 +664,7 @@ static void warp_source_speed_up_hotkey(void *data, obs_hotkey_id id, obs_hotkey
 	if (!pressed || !obs_source_showing(s->source))
 		return;
 
-	warp_source_apply_speed(s, s->speed_percent + WARP_SPEED_STEP);
+	warp_source_apply_speed(s, s->speed_percent + WARP_SPEED_STEP, WARP_SPEED_CHANGE_INCREASED);
 }
 
 static void warp_source_speed_down_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -663,7 +677,7 @@ static void warp_source_speed_down_hotkey(void *data, obs_hotkey_id id, obs_hotk
 	if (!pressed || !obs_source_showing(s->source))
 		return;
 
-	warp_source_apply_speed(s, s->speed_percent - WARP_SPEED_STEP);
+	warp_source_apply_speed(s, s->speed_percent - WARP_SPEED_STEP, WARP_SPEED_CHANGE_DECREASED);
 }
 
 static void warp_source_speed_reset_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -676,7 +690,7 @@ static void warp_source_speed_reset_hotkey(void *data, obs_hotkey_id id, obs_hot
 	if (!pressed || !obs_source_showing(s->source))
 		return;
 
-	warp_source_apply_speed(s, 100);
+	warp_source_apply_speed(s, 100, WARP_SPEED_CHANGE_SET);
 }
 
 static void warp_source_speed_preset_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -689,7 +703,7 @@ static void warp_source_speed_preset_hotkey(void *data, obs_hotkey_id id, obs_ho
 	if (!pressed || !obs_source_showing(b->s->source))
 		return;
 
-	warp_source_apply_speed(b->s, b->value);
+	warp_source_apply_speed(b->s, b->value, WARP_SPEED_CHANGE_SET);
 }
 
 static void warp_source_do_step(struct warp_source *s, int frames)
@@ -704,6 +718,8 @@ static void warp_source_do_step(struct warp_source *s, int frames)
 		return;
 
 	media_playback_step_frames(s->media, frames);
+
+	warp_signal_frames_stepped(s->source, frames);
 }
 
 static void warp_source_step_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -726,7 +742,7 @@ static void set_speed_proc(void *data, calldata_t *cd)
 	long long speed;
 
 	if (calldata_get_int(cd, "speed", &speed))
-		warp_source_apply_speed(data, (int)speed);
+		warp_source_apply_speed(data, (int)speed, WARP_SPEED_CHANGE_SET);
 }
 
 static void get_speed_proc(void *data, calldata_t *cd)
@@ -792,8 +808,12 @@ static void warp_source_register_warp_hotkeys(struct warp_source *s, obs_source_
 
 static void *warp_source_create(obs_data_t *settings, obs_source_t *source)
 {
+	static const char *signals[] = {WARP_SIGNAL_DECL_SPEED_CHANGED, WARP_SIGNAL_DECL_FRAMES_STEPPED, NULL};
+
 	struct warp_source *s = bzalloc(sizeof(struct warp_source));
 	s->source = source;
+
+	signal_handler_add_array(obs_source_get_signal_handler(source), signals);
 
 	// Manual type since the event can be signalled without an active thread
 	if (os_event_init(&s->reconnect_stop_event, OS_EVENT_TYPE_MANUAL)) {

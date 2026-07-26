@@ -31,6 +31,33 @@ Clear Playlist empties the source's file list for good — it is written to the 
 
 Media controls (the ones in the OBS media controls dock) apply to the playlist: restart starts the playlist over from its first file, next and previous move through the list, and the time and duration shown are those of the file that is playing.
 
+### Warp Detection filter
+
+A filter that watches a Warp Media or Warp Playlist source and triggers something else when the operator changes playback. Add it under Filters on any source — it never touches the picture, so the source it is on does not have to be the source it listens to.
+
+* **Listen To**: the Warp Media or Warp Playlist source to watch. Left unset, the filter watches the source it is on. A source that is not in the scene collection yet is picked up as soon as it appears, so the filter survives a scene collection loading in whatever order it likes.
+* **React To**, one event per filter:
+  * *Speed Set to a Value*, with the speed to match (or any speed). This is the speed being put at a value outright: a preset speed hotkey, Reset Speed, or the Speed property. Reaching that same speed by stepping up or down is the increased/decreased event instead.
+  * *Speed Increased (+10%)* / *Speed Decreased (-10%)*, the speed up and slow down hotkeys.
+  * *Frames Skipped Forward* / *Frames Skipped Backward*, with the frame count to match (or any count), for the 1, 5, 10 and 20 frame stepping hotkeys.
+* **Then Trigger**:
+  * *A Global Hotkey*: any of OBS's own hotkeys — Start Recording, Save Replay, and the rest — listed by the same translated names the Settings → Hotkeys page uses.
+  * *A Source Hotkey*: pick a source or scene, then one of its hotkeys, again by the name the hotkeys page shows. Another Warp source's speed and stepping hotkeys are in that list, so one source can drive another.
+  * *A Filter*: pick a source and one of its filters, then enable, disable or toggle it — or trigger one of the filter's own hotkeys.
+
+Hotkeys are triggered through OBS's hotkey routing on the UI thread, exactly as if the key had been pressed, and every trigger is written to the OBS log. For several reactions to the same source, add several Warp Detection filters.
+
+An action that drives the source its own filter is listening to would trigger itself forever, so a filter ignores events its own action caused, and stops triggering for the rest of the second after 20 triggers.
+
+Both Warp sources emit the events as signals on their signal handler, so scripts can listen for them too:
+
+```
+warp_speed_changed(ptr source, int speed, int prev_speed, string change)
+warp_frames_stepped(ptr source, int frames)
+```
+
+`change` is `set`, `increased` or `decreased`; `frames` is negative when stepping backward. The speed a file starts at is not a change: a playlist moving to its next file resets the speed without emitting anything.
+
 ### Warp window
 
 A Warp entry in the Tools menu opens the Warp window (currently an empty placeholder for upcoming replay tooling).

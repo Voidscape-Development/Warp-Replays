@@ -1,0 +1,79 @@
+/*
+Warp
+Copyright (C) 2026 Voidscape Development
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along
+with this program. If not, see <https://www.gnu.org/licenses/>
+*/
+
+#pragma once
+
+#include <obs-module.h>
+
+/* ids of the sources that emit the events below */
+#define WARP_MEDIA_SOURCE_ID "warp_media_source"
+#define WARP_PLAYLIST_SOURCE_ID "warp_playlist_source"
+
+/* number of percentage points each speed up/down hotkey press applies */
+#define WARP_SPEED_STEP 10
+
+/* Signals both Warp sources emit as playback is controlled, listened for by
+ * the Warp Detection filter (and available to scripts through the source's
+ * signal handler):
+ *
+ *   warp_speed_changed(ptr source, int speed, int prev_speed, string change)
+ *   warp_frames_stepped(ptr source, int frames)
+ *
+ * 'change' says how the speed got to its new value; 'frames' is the signed
+ * frame count of a step, negative when stepping backward.
+ *
+ * Speed a file starts at is not a change: moving to the next file in a
+ * playlist resets its speed without emitting anything. */
+#define WARP_SIGNAL_SPEED_CHANGED "warp_speed_changed"
+#define WARP_SIGNAL_FRAMES_STEPPED "warp_frames_stepped"
+
+#define WARP_SIGNAL_DECL_SPEED_CHANGED \
+	"void warp_speed_changed(ptr source, int speed, int prev_speed, string change)"
+#define WARP_SIGNAL_DECL_FRAMES_STEPPED "void warp_frames_stepped(ptr source, int frames)"
+
+/* values of the 'change' field: the speed was set to a value outright (a preset
+ * hotkey, Reset Speed, or the Speed property), or stepped by WARP_SPEED_STEP */
+#define WARP_SPEED_CHANGE_SET "set"
+#define WARP_SPEED_CHANGE_INCREASED "increased"
+#define WARP_SPEED_CHANGE_DECREASED "decreased"
+
+static inline void warp_signal_speed_changed(obs_source_t *source, int speed, int prev_speed, const char *change)
+{
+	struct calldata cd;
+	uint8_t stack[256];
+
+	calldata_init_fixed(&cd, stack, sizeof(stack));
+	calldata_set_ptr(&cd, "source", source);
+	calldata_set_int(&cd, "speed", speed);
+	calldata_set_int(&cd, "prev_speed", prev_speed);
+	calldata_set_string(&cd, "change", change);
+
+	signal_handler_signal(obs_source_get_signal_handler(source), WARP_SIGNAL_SPEED_CHANGED, &cd);
+}
+
+static inline void warp_signal_frames_stepped(obs_source_t *source, int frames)
+{
+	struct calldata cd;
+	uint8_t stack[128];
+
+	calldata_init_fixed(&cd, stack, sizeof(stack));
+	calldata_set_ptr(&cd, "source", source);
+	calldata_set_int(&cd, "frames", frames);
+
+	signal_handler_signal(obs_source_get_signal_handler(source), WARP_SIGNAL_FRAMES_STEPPED, &cd);
+}

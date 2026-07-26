@@ -53,6 +53,7 @@ target_sources(
     src/plugin-main.c
     src/warp-source.c
     src/warp-playlist-source.c
+    src/warp-detection-filter.c
     src/media-playback/cache.c
     src/media-playback/decode.c
     src/media-playback/media-playback.c
