@@ -452,7 +452,6 @@ static void warp_pl_swap_transition(struct warp_playlist_source *s)
 		return;
 	}
 
-	obs_source_set_audio_mixers(tr, 0xFF);
 	obs_transition_set_alignment(tr, OBS_ALIGN_CENTER);
 	obs_transition_set_scale_type(tr, OBS_TRANSITION_SCALE_ASPECT);
 	obs_transition_set_size(tr, s->cx, s->cy);
