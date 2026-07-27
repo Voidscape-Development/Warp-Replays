@@ -72,7 +72,40 @@ struct warp_playlist_source {
 	char *preloaded_path;
 	bool preload_armed;
 
+	/* Guards everything below it. Creating, releasing and re-parenting a
+	 * source all reach into libobs' global source bookkeeping, so none of
+	 * that may be done from under this lock: see warp_pl_unlock(). */
 	pthread_mutex_t mutex;
+
+	/* ----------------------------------------------------------------- */
+	/* work handed to warp_pl_unlock() to carry out once the lock is gone */
+
+	/* sources to release */
+	DARRAY(obs_source_t *) retired;
+	/* an item to open and play, and whether to animate the switch */
+	bool play_armed;
+	size_t play_order_pos;
+	bool play_transition;
+	/* an item to open ahead of the switch point */
+	bool preload_requested;
+	size_t preload_order_pos;
+	/* Bumped every time what the playlist is meant to be playing changes.
+	 * Opening a file takes long enough for a stop, or another switch, to
+	 * land while it is going on; the item is thrown away rather than put on
+	 * screen when the count it was opened for is no longer the current
+	 * one. */
+	uint64_t play_gen;
+	/* what to hand the transition; the target holds a reference, and is
+	 * NULL to show nothing */
+	bool transition_armed;
+	bool transition_use;
+	obs_source_t *transition_target;
+	/* media signals: whatever reacts to one is free to drive this playlist
+	 * straight back, so they are never emitted under the lock */
+	bool signal_started;
+	bool signal_ended;
+	/* set while the outermost warp_pl_unlock() works through the above */
+	bool deferring;
 
 	/* playlist as configured, and the order it is played back in */
 	DARRAY(char *) paths;
@@ -124,6 +157,159 @@ static const char *warp_playlist_getname(void *unused)
 {
 	UNUSED_PARAMETER(unused);
 	return obs_module_text("Warp.PlaylistSource.Name");
+}
+
+/* ------------------------------------------------------------------------- */
+/* locking
+ *
+ * The playlist opens and closes a source for every file it plays. Creating one
+ * takes libobs' global source list lock (and its audio source list lock),
+ * releasing one takes them again to unlink it, and handing one to the
+ * transition re-parents it. None of that may happen from under s->mutex,
+ * because libobs calls back into this source with those same global locks
+ * already held, from threads that then want s->mutex:
+ *
+ *   hotkey thread:   obs->hotkeys.mutex     -> s->mutex (every hotkey below)
+ *   UI thread:       obs->data.sources_mutex -> obs->hotkeys.mutex
+ *                    (obs_save_sources() -> obs_save_source() ->
+ *                     obs_hotkeys_save_source(), on every project save)
+ *   graphics thread: s->mutex -> obs->data.sources_mutex, if a source is
+ *                    created or released with the lock held
+ *
+ * That last edge closes the cycle and wedges the graphics, UI and hotkey
+ * threads for good, which takes the whole of OBS down with it. So the lock
+ * guards this source's own fields and nothing else: work that has to touch
+ * libobs' source graph is queued on the struct and run by warp_pl_unlock()
+ * once the lock has been dropped. */
+
+static void warp_pl_start(struct warp_playlist_source *s, size_t order_pos, bool use_transition, uint64_t gen);
+static void warp_pl_open_preload(struct warp_playlist_source *s, size_t order_pos, uint64_t gen);
+
+/* queues 'source' for release; expects s->mutex to be held */
+static void warp_pl_retire(struct warp_playlist_source *s, obs_source_t *source)
+{
+	if (source)
+		da_push_back(s->retired, &source);
+}
+
+/* Hands 'item' to the transition once the lock is dropped; 'item' may be NULL,
+ * to show nothing. Expects s->mutex to be held. */
+static void warp_pl_arm_transition(struct warp_playlist_source *s, obs_source_t *item, bool use_transition)
+{
+	warp_pl_retire(s, s->transition_target);
+
+	s->transition_target = item ? obs_source_get_ref(item) : NULL;
+	s->transition_armed = true;
+	s->transition_use = use_transition;
+}
+
+static enum obs_media_state warp_pl_state(struct warp_playlist_source *s)
+{
+	enum obs_media_state state;
+
+	pthread_mutex_lock(&s->mutex);
+	state = s->state;
+	pthread_mutex_unlock(&s->mutex);
+
+	return state;
+}
+
+/* the transition, with a reference held: it is swapped out from the tick, so
+ * the callbacks that render and enumerate it cannot use it bare */
+static obs_source_t *warp_pl_get_transition(struct warp_playlist_source *s)
+{
+	obs_source_t *transition;
+
+	pthread_mutex_lock(&s->mutex);
+	transition = obs_source_get_ref(s->transition);
+	pthread_mutex_unlock(&s->mutex);
+
+	return transition;
+}
+
+/* Drops s->mutex and works through whatever was queued while it was held.
+ * Anything queued by that work is picked up in the same pass, so a nested
+ * warp_pl_unlock() only has to drop the lock. */
+static void warp_pl_unlock(struct warp_playlist_source *s)
+{
+	if (s->deferring) {
+		pthread_mutex_unlock(&s->mutex);
+		return;
+	}
+
+	s->deferring = true;
+
+	for (;;) {
+		DARRAY(obs_source_t *) retired;
+
+		bool transition_armed = s->transition_armed;
+		bool transition_use = s->transition_use;
+		uint32_t transition_ms = s->transition_ms;
+		obs_source_t *transition = NULL;
+		obs_source_t *target = NULL;
+
+		bool play = s->play_armed;
+		size_t play_order_pos = s->play_order_pos;
+		bool play_transition = s->play_transition;
+
+		bool preload = s->preload_requested;
+		size_t preload_order_pos = s->preload_order_pos;
+		uint64_t gen = s->play_gen;
+
+		bool started = s->signal_started;
+		bool ended = s->signal_ended;
+
+		retired.da = s->retired.da;
+		da_init(s->retired);
+
+		if (transition_armed) {
+			transition = obs_source_get_ref(s->transition);
+			target = s->transition_target;
+			s->transition_target = NULL;
+		}
+
+		s->transition_armed = false;
+		s->play_armed = false;
+		s->preload_requested = false;
+		s->signal_started = false;
+		s->signal_ended = false;
+
+		if (!retired.num && !transition_armed && !play && !preload && !started && !ended) {
+			s->deferring = false;
+			pthread_mutex_unlock(&s->mutex);
+			da_free(retired);
+			return;
+		}
+
+		pthread_mutex_unlock(&s->mutex);
+
+		/* the transition takes its own references, so it is told about
+		 * the change before the outgoing items are let go of */
+		if (transition)
+			obs_transition_start(transition, OBS_TRANSITION_MODE_AUTO, transition_use ? transition_ms : 0,
+					     target);
+
+		if (transition)
+			obs_source_release(transition);
+		if (target)
+			obs_source_release(target);
+
+		for (size_t i = 0; i < retired.num; i++)
+			obs_source_release(retired.array[i]);
+		da_free(retired);
+
+		if (ended)
+			obs_source_media_ended(s->source);
+		if (started)
+			obs_source_media_started(s->source);
+
+		if (play)
+			warp_pl_start(s, play_order_pos, play_transition, gen);
+		if (preload)
+			warp_pl_open_preload(s, preload_order_pos, gen);
+
+		pthread_mutex_lock(&s->mutex);
+	}
 }
 
 /* ------------------------------------------------------------------------- */
@@ -207,9 +393,29 @@ static bool warp_pl_step_pos(struct warp_playlist_source *s, int dir, size_t *ou
 }
 
 /* ------------------------------------------------------------------------- */
-/* playback (all of these expect s->mutex to be held) */
+/* playback */
 
-static obs_source_t *warp_pl_create_item(struct warp_playlist_source *s, const char *path)
+/* what an item is opened with, read under s->mutex so that the item itself can
+ * be created with the lock dropped */
+struct warp_pl_item_config {
+	int speed;
+	bool hw_decode;
+	bool is_linear_alpha;
+	enum video_range_type range;
+};
+
+/* expects s->mutex to be held */
+static void warp_pl_read_item_config(struct warp_playlist_source *s, struct warp_pl_item_config *cfg)
+{
+	cfg->speed = s->base_speed;
+	cfg->hw_decode = s->hw_decode;
+	cfg->is_linear_alpha = s->is_linear_alpha;
+	cfg->range = s->range;
+}
+
+/* expects s->mutex NOT to be held */
+static obs_source_t *warp_pl_create_item(struct warp_playlist_source *s, const char *path,
+					 const struct warp_pl_item_config *cfg)
 {
 	obs_data_t *settings = obs_data_create();
 
@@ -221,10 +427,10 @@ static obs_source_t *warp_pl_create_item(struct warp_playlist_source *s, const c
 	obs_data_set_bool(settings, "clear_on_media_end", false);
 	obs_data_set_bool(settings, "restart_on_activate", false);
 	obs_data_set_bool(settings, "close_when_inactive", false);
-	obs_data_set_bool(settings, "hw_decode", s->hw_decode);
-	obs_data_set_bool(settings, "linear_alpha", s->is_linear_alpha);
-	obs_data_set_int(settings, "color_range", s->range);
-	obs_data_set_int(settings, "speed_percent", s->base_speed);
+	obs_data_set_bool(settings, "hw_decode", cfg->hw_decode);
+	obs_data_set_bool(settings, "linear_alpha", cfg->is_linear_alpha);
+	obs_data_set_int(settings, "color_range", cfg->range);
+	obs_data_set_int(settings, "speed_percent", cfg->speed);
 	/* one settings dump per playlist item would drown the log */
 	obs_data_set_bool(settings, "log_changes", false);
 
@@ -250,11 +456,12 @@ static void warp_pl_call_item_proc(obs_source_t *item, const char *proc, const c
 	calldata_free(&cd);
 }
 
+/* expects s->mutex to be held */
 static void warp_pl_drop_preloaded(struct warp_playlist_source *s)
 {
 	if (s->preloaded) {
 		obs_source_media_stop(s->preloaded);
-		obs_source_release(s->preloaded);
+		warp_pl_retire(s, s->preloaded);
 		s->preloaded = NULL;
 	}
 
@@ -263,20 +470,20 @@ static void warp_pl_drop_preloaded(struct warp_playlist_source *s)
 	s->preload_armed = false;
 }
 
-/* Hands 'item' (which may be NULL, to show nothing) to the transition and
- * retires whatever was shown before it. */
+/* Puts 'item' (which may be NULL, to show nothing) on screen and retires
+ * whatever was shown before it, taking over the caller's reference to 'item'.
+ * The transition is told about the change by warp_pl_unlock(). Expects
+ * s->mutex to be held. */
 static void warp_pl_show(struct warp_playlist_source *s, obs_source_t *item, bool use_transition)
 {
-	if (s->transition)
-		obs_transition_start(s->transition, OBS_TRANSITION_MODE_AUTO, use_transition ? s->transition_ms : 0,
-				     item);
+	warp_pl_arm_transition(s, item, use_transition);
 
 	/* the outgoing item stays alive until its transition has played out;
 	 * the transition holds its own reference, this one just keeps it
 	 * around long enough to be stopped cleanly in the tick */
 	if (s->prev) {
 		obs_source_media_stop(s->prev);
-		obs_source_release(s->prev);
+		warp_pl_retire(s, s->prev);
 	}
 
 	s->prev = s->current;
@@ -284,47 +491,22 @@ static void warp_pl_show(struct warp_playlist_source *s, obs_source_t *item, boo
 	s->showing_nothing = item == NULL;
 }
 
+/* Asks for the item at 'order_pos' to be played. The file is opened, and the
+ * item put on screen, by warp_pl_start() once the lock has been dropped.
+ * Expects s->mutex to be held. */
 static void warp_pl_play_pos(struct warp_playlist_source *s, size_t order_pos, bool use_transition)
 {
-	const char *path = warp_pl_path_at(s, order_pos);
-
-	if (!path)
+	if (!warp_pl_path_at(s, order_pos))
 		return;
 
-	obs_source_t *item = NULL;
-
-	/* reuse the preloaded item when it is the one being played */
-	if (s->preloaded && s->preloaded_path && strcmp(s->preloaded_path, path) == 0) {
-		item = s->preloaded;
-		s->preloaded = NULL;
-		obs_source_media_play_pause(item, false);
-	}
-
-	/* anything still preloaded is not what is being played */
-	warp_pl_drop_preloaded(s);
-
-	if (!item)
-		item = warp_pl_create_item(s, path);
-
-	if (!item)
-		return;
-
-	s->pos = order_pos;
-	s->cur_age = 0.0f;
-	/* every item starts at the configured speed, whatever the previous
-	 * item was being played back at */
-	s->speed = s->base_speed;
-	warp_pl_call_item_proc(item, "warp_set_speed", "speed", s->base_speed);
-
-	warp_pl_show(s, item, use_transition);
-
-	s->state = OBS_MEDIA_STATE_PLAYING;
-	obs_source_media_started(s->source);
-
-	WARP_PL_LOG(LOG_INFO, "playing %d/%d: %s", (int)(order_pos + 1), (int)s->order.num, path);
+	s->play_gen++;
+	s->play_armed = true;
+	s->play_order_pos = order_pos;
+	s->play_transition = use_transition;
 }
 
-/* end of the playlist, or end of an item with auto advance turned off */
+/* end of the playlist, or end of an item with auto advance turned off;
+ * expects s->mutex to be held */
 static void warp_pl_end(struct warp_playlist_source *s)
 {
 	if (s->state == OBS_MEDIA_STATE_ENDED)
@@ -332,15 +514,17 @@ static void warp_pl_end(struct warp_playlist_source *s)
 
 	/* the item that ended is kept, so it can be restarted or resumed;
 	 * it is only taken off screen */
-	if (s->clear_on_media_end && s->transition) {
-		obs_transition_start(s->transition, OBS_TRANSITION_MODE_AUTO, s->transition_ms, NULL);
+	if (s->clear_on_media_end) {
+		warp_pl_arm_transition(s, NULL, true);
 		s->showing_nothing = true;
 	}
 
+	s->play_gen++;
 	s->state = OBS_MEDIA_STATE_ENDED;
-	obs_source_media_ended(s->source);
+	s->signal_ended = true;
 }
 
+/* expects s->mutex to be held */
 static void warp_pl_advance(struct warp_playlist_source *s, int dir)
 {
 	size_t target;
@@ -359,26 +543,34 @@ static void warp_pl_advance(struct warp_playlist_source *s, int dir)
 	warp_pl_play_pos(s, target, true);
 }
 
+/* expects s->mutex to be held */
 static void warp_pl_stop(struct warp_playlist_source *s)
 {
 	warp_pl_drop_preloaded(s);
 
+	/* nothing queued up, or already being opened, is wanted any more */
+	s->play_gen++;
+	s->play_armed = false;
+	s->preload_requested = false;
+
 	if (s->current)
 		obs_source_media_stop(s->current);
-
-	warp_pl_show(s, NULL, false);
-
-	if (s->prev) {
+	if (s->prev)
 		obs_source_media_stop(s->prev);
-		obs_source_release(s->prev);
-		s->prev = NULL;
-	}
+
+	warp_pl_arm_transition(s, NULL, false);
+
+	warp_pl_retire(s, s->prev);
+	warp_pl_retire(s, s->current);
+	s->prev = NULL;
+	s->current = NULL;
+	s->showing_nothing = true;
 
 	s->pos = s->order.num;
 	s->state = OBS_MEDIA_STATE_STOPPED;
 }
 
-/* starts the playlist over from its first item */
+/* starts the playlist over from its first item; expects s->mutex to be held */
 static void warp_pl_restart_playlist(struct warp_playlist_source *s)
 {
 	if (!s->order.num)
@@ -391,7 +583,8 @@ static void warp_pl_restart_playlist(struct warp_playlist_source *s)
 	warp_pl_play_pos(s, 0, true);
 }
 
-/* restarts the item that is playing right now, at the configured speed */
+/* restarts the item that is playing right now, at the configured speed;
+ * expects s->mutex to be held */
 static void warp_pl_restart_current(struct warp_playlist_source *s)
 {
 	if (!s->current) {
@@ -401,21 +594,27 @@ static void warp_pl_restart_current(struct warp_playlist_source *s)
 
 	/* the item is not held by the transition once the playlist has ended
 	 * with "show nothing", so put it back before restarting it */
-	if (s->showing_nothing && s->transition) {
-		obs_transition_start(s->transition, OBS_TRANSITION_MODE_AUTO, s->transition_ms, s->current);
+	if (s->showing_nothing) {
+		warp_pl_arm_transition(s, s->current, true);
 		s->showing_nothing = false;
 	}
 
 	warp_pl_drop_preloaded(s);
+
+	/* an item that is still being opened is not wanted: the one on screen
+	 * is the one being restarted */
+	s->play_gen++;
+	s->play_armed = false;
 
 	s->speed = s->base_speed;
 	warp_pl_call_item_proc(s->current, "warp_set_speed", "speed", s->base_speed);
 	obs_source_media_restart(s->current);
 
 	s->state = OBS_MEDIA_STATE_PLAYING;
-	obs_source_media_started(s->source);
+	s->signal_started = true;
 }
 
+/* expects s->mutex to be held */
 static void warp_pl_apply_speed(struct warp_playlist_source *s, int speed)
 {
 	if (speed < MP_SPEED_MIN)
@@ -432,17 +631,150 @@ static void warp_pl_apply_speed(struct warp_playlist_source *s, int speed)
 	WARP_PL_LOG(LOG_INFO, "speed set to %d%%", speed);
 }
 
+/* Opens the item warp_pl_play_pos() asked for and puts it on screen. Expects
+ * s->mutex NOT to be held: opening a file means creating a source. */
+static void warp_pl_start(struct warp_playlist_source *s, size_t order_pos, bool use_transition, uint64_t gen)
+{
+	struct warp_pl_item_config cfg;
+	obs_source_t *item = NULL;
+	const char *at;
+	char *path = NULL;
+
+	pthread_mutex_lock(&s->mutex);
+
+	at = warp_pl_path_at(s, order_pos);
+
+	if (at)
+		path = bstrdup(at);
+
+	/* reuse the preloaded item when it is the one being played */
+	if (path && s->preloaded && s->preloaded_path && strcmp(s->preloaded_path, path) == 0) {
+		item = s->preloaded;
+		s->preloaded = NULL;
+	}
+
+	/* anything still preloaded is not what is being played */
+	warp_pl_drop_preloaded(s);
+	warp_pl_read_item_config(s, &cfg);
+
+	warp_pl_unlock(s);
+
+	if (!path)
+		return;
+
+	if (item)
+		obs_source_media_play_pause(item, false);
+	else
+		item = warp_pl_create_item(s, path, &cfg);
+
+	if (!item) {
+		bfree(path);
+		return;
+	}
+
+	/* every item starts at the configured speed, whatever the previous
+	 * item was being played back at */
+	warp_pl_call_item_proc(item, "warp_set_speed", "speed", cfg.speed);
+
+	pthread_mutex_lock(&s->mutex);
+
+	at = warp_pl_path_at(s, order_pos);
+
+	/* the playlist can be edited, or stopped, while the file is opening */
+	if (s->play_gen != gen || !at || strcmp(at, path) != 0) {
+		warp_pl_retire(s, item);
+		warp_pl_unlock(s);
+		bfree(path);
+		return;
+	}
+
+	s->pos = order_pos;
+	s->cur_age = 0.0f;
+	s->speed = cfg.speed;
+
+	warp_pl_show(s, item, use_transition);
+
+	s->state = OBS_MEDIA_STATE_PLAYING;
+	s->signal_started = true;
+
+	WARP_PL_LOG(LOG_INFO, "playing %d/%d: %s", (int)(order_pos + 1), (int)s->order.num, path);
+
+	warp_pl_unlock(s);
+	bfree(path);
+}
+
+/* Opens the item warp_pl_preload_next() asked for, ahead of the switch point.
+ * Expects s->mutex NOT to be held. */
+static void warp_pl_open_preload(struct warp_playlist_source *s, size_t order_pos, uint64_t gen)
+{
+	struct warp_pl_item_config cfg;
+	const char *at;
+	char *path = NULL;
+
+	pthread_mutex_lock(&s->mutex);
+
+	at = warp_pl_path_at(s, order_pos);
+
+	if (at && !s->preloaded && s->play_gen == gen)
+		path = bstrdup(at);
+
+	warp_pl_read_item_config(s, &cfg);
+
+	pthread_mutex_unlock(&s->mutex);
+
+	if (!path)
+		return;
+
+	obs_source_t *item = warp_pl_create_item(s, path, &cfg);
+
+	if (!item) {
+		bfree(path);
+		return;
+	}
+
+	pthread_mutex_lock(&s->mutex);
+
+	at = warp_pl_path_at(s, order_pos);
+
+	if (s->preloaded || s->play_gen != gen || !at || strcmp(at, path) != 0) {
+		/* the playlist moved on while the file was opening */
+		obs_source_media_stop(item);
+		warp_pl_retire(s, item);
+	} else {
+		s->preloaded = item;
+		s->preloaded_path = path;
+		s->preload_armed = false;
+		path = NULL;
+	}
+
+	warp_pl_unlock(s);
+	bfree(path);
+}
+
 /* ------------------------------------------------------------------------- */
 /* transition */
 
 /* Creates the transition the settings ask for and moves whatever is on screen
- * over to it. This runs from the tick, on the graphics thread, so it cannot
- * race with the render that reads s->transition. */
+ * over to it. Runs from the tick, so it cannot race with another swap, and
+ * with s->mutex dropped, so that creating and releasing the transition does
+ * not take libobs' global source lock from under it. */
 static void warp_pl_swap_transition(struct warp_playlist_source *s)
 {
-	char *id = s->pending_transition_id;
+	obs_source_t *carry = NULL;
+	obs_source_t *old;
+	uint32_t cx;
+	uint32_t cy;
+	char *id;
 
+	pthread_mutex_lock(&s->mutex);
+	id = s->pending_transition_id;
 	s->pending_transition_id = NULL;
+	cx = s->cx;
+	cy = s->cy;
+	pthread_mutex_unlock(&s->mutex);
+
+	if (!id)
+		return;
 
 	obs_source_t *tr = obs_source_create_private(id, id, NULL);
 
@@ -454,15 +786,27 @@ static void warp_pl_swap_transition(struct warp_playlist_source *s)
 
 	obs_transition_set_alignment(tr, OBS_ALIGN_CENTER);
 	obs_transition_set_scale_type(tr, OBS_TRANSITION_SCALE_ASPECT);
-	obs_transition_set_size(tr, s->cx, s->cy);
+	obs_transition_set_size(tr, cx, cy);
 
-	/* carry whatever is on screen over to the new transition */
+	pthread_mutex_lock(&s->mutex);
 	if (s->current && !s->showing_nothing)
-		obs_transition_set(tr, s->current);
+		carry = obs_source_get_ref(s->current);
+	pthread_mutex_unlock(&s->mutex);
 
-	obs_source_t *old = s->transition;
+	/* carry whatever is on screen over, before anything can render the
+	 * new transition and find it empty */
+	if (carry) {
+		obs_transition_set(tr, carry);
+		obs_source_release(carry);
+	}
 
+	pthread_mutex_lock(&s->mutex);
+	old = s->transition;
 	s->transition = tr;
+	bfree(s->transition_id);
+	s->transition_id = id;
+	pthread_mutex_unlock(&s->mutex);
+
 	obs_source_add_active_child(s->source, tr);
 
 	if (old) {
@@ -470,9 +814,6 @@ static void warp_pl_swap_transition(struct warp_playlist_source *s)
 		obs_source_remove_active_child(s->source, old);
 		obs_source_release(old);
 	}
-
-	bfree(s->transition_id);
-	s->transition_id = id;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -675,6 +1016,12 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 		warp_pl_build_order(s);
 		warp_pl_drop_preloaded(s);
 
+		/* an item still being opened was picked out of the order that
+		 * has just been thrown away */
+		s->play_gen++;
+		s->play_armed = false;
+		s->preload_requested = false;
+
 		/* keep playing the current file if it survived the edit */
 		s->pos = s->order.num;
 		if (playing) {
@@ -710,7 +1057,7 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 
 	int speed_now = s->speed;
 
-	pthread_mutex_unlock(&s->mutex);
+	warp_pl_unlock(s);
 
 	/* the Speed property applies to the file that is playing, so it is a
 	 * speed change like any hotkey-driven one */
@@ -733,7 +1080,7 @@ static bool warp_playlist_play_hotkey(void *data, obs_hotkey_pair_id id, obs_hot
 	if (!pressed || !obs_source_showing(s->source))
 		return false;
 
-	if (s->state == OBS_MEDIA_STATE_PLAYING)
+	if (warp_pl_state(s) == OBS_MEDIA_STATE_PLAYING)
 		return false;
 
 	obs_source_media_play_pause(s->source, false);
@@ -750,7 +1097,7 @@ static bool warp_playlist_pause_hotkey(void *data, obs_hotkey_pair_id id, obs_ho
 	if (!pressed || !obs_source_showing(s->source))
 		return false;
 
-	if (s->state != OBS_MEDIA_STATE_PLAYING)
+	if (warp_pl_state(s) != OBS_MEDIA_STATE_PLAYING)
 		return false;
 
 	obs_source_media_play_pause(s->source, true);
@@ -782,7 +1129,7 @@ static void warp_playlist_next_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t
 
 	pthread_mutex_lock(&s->mutex);
 	warp_pl_advance(s, 1);
-	pthread_mutex_unlock(&s->mutex);
+	warp_pl_unlock(s);
 }
 
 static void warp_playlist_prev_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -797,7 +1144,7 @@ static void warp_playlist_prev_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t
 
 	pthread_mutex_lock(&s->mutex);
 	warp_pl_advance(s, -1);
-	pthread_mutex_unlock(&s->mutex);
+	warp_pl_unlock(s);
 }
 
 static void warp_playlist_first_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -812,7 +1159,7 @@ static void warp_playlist_first_hotkey(void *data, obs_hotkey_id id, obs_hotkey_
 
 	pthread_mutex_lock(&s->mutex);
 	warp_pl_restart_playlist(s);
-	pthread_mutex_unlock(&s->mutex);
+	warp_pl_unlock(s);
 }
 
 static void warp_playlist_restart_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -827,7 +1174,7 @@ static void warp_playlist_restart_hotkey(void *data, obs_hotkey_id id, obs_hotke
 
 	pthread_mutex_lock(&s->mutex);
 	warp_pl_restart_current(s);
-	pthread_mutex_unlock(&s->mutex);
+	warp_pl_unlock(s);
 }
 
 static void warp_playlist_clear_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -843,7 +1190,7 @@ static void warp_playlist_clear_hotkey(void *data, obs_hotkey_id id, obs_hotkey_
 	pthread_mutex_lock(&s->mutex);
 
 	if (!s->paths.num) {
-		pthread_mutex_unlock(&s->mutex);
+		warp_pl_unlock(s);
 		return;
 	}
 
@@ -856,7 +1203,7 @@ static void warp_playlist_clear_hotkey(void *data, obs_hotkey_id id, obs_hotkey_
 
 	warp_pl_stop(s);
 
-	pthread_mutex_unlock(&s->mutex);
+	warp_pl_unlock(s);
 
 	obs_data_t *settings = obs_source_get_settings(s->source);
 	obs_data_array_t *empty = obs_data_array_create();
@@ -880,7 +1227,7 @@ static void warp_pl_speed_hotkey(struct warp_playlist_source *s, int value, bool
 	prev_speed = s->speed;
 	warp_pl_apply_speed(s, absolute ? value : s->speed + value);
 	speed = s->speed;
-	pthread_mutex_unlock(&s->mutex);
+	warp_pl_unlock(s);
 
 	if (speed != prev_speed)
 		warp_signal_speed_changed(s->source, speed, prev_speed, change);
@@ -962,7 +1309,7 @@ static void warp_playlist_step_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t
 		stepped = true;
 	}
 
-	pthread_mutex_unlock(&s->mutex);
+	warp_pl_unlock(s);
 
 	if (stepped)
 		warp_signal_frames_stepped(s->source, b->value);
@@ -1059,6 +1406,7 @@ static void *warp_playlist_create(obs_data_t *settings, obs_source_t *source)
 
 	da_init(s->paths);
 	da_init(s->order);
+	da_init(s->retired);
 
 	signal_handler_add_array(obs_source_get_signal_handler(source), signals);
 	warp_playlist_register_hotkeys(s, source);
@@ -1070,24 +1418,36 @@ static void *warp_playlist_create(obs_data_t *settings, obs_source_t *source)
 static void warp_playlist_destroy(void *data)
 {
 	struct warp_playlist_source *s = data;
+	DARRAY(obs_source_t *) retired;
+	obs_source_t *transition;
+	obs_source_t *target;
+	obs_source_t *current;
+	obs_source_t *prev;
 
 	pthread_mutex_lock(&s->mutex);
+
 	warp_pl_drop_preloaded(s);
 
-	if (s->current) {
-		obs_source_release(s->current);
-		s->current = NULL;
-	}
-	if (s->prev) {
-		obs_source_release(s->prev);
-		s->prev = NULL;
-	}
-	if (s->transition) {
-		obs_transition_clear(s->transition);
-		obs_source_remove_active_child(s->source, s->transition);
-		obs_source_release(s->transition);
-		s->transition = NULL;
-	}
+	/* nothing queued matters any more, but everything it holds a
+	 * reference to still has to be let go of */
+	s->play_armed = false;
+	s->preload_requested = false;
+	s->transition_armed = false;
+	s->signal_started = false;
+	s->signal_ended = false;
+
+	retired.da = s->retired.da;
+	da_init(s->retired);
+
+	target = s->transition_target;
+	current = s->current;
+	prev = s->prev;
+	transition = s->transition;
+
+	s->transition_target = NULL;
+	s->current = NULL;
+	s->prev = NULL;
+	s->transition = NULL;
 
 	for (size_t i = 0; i < s->paths.num; i++)
 		bfree(s->paths.array[i]);
@@ -1096,7 +1456,25 @@ static void warp_playlist_destroy(void *data)
 
 	bfree(s->transition_id);
 	bfree(s->pending_transition_id);
+
 	pthread_mutex_unlock(&s->mutex);
+
+	for (size_t i = 0; i < retired.num; i++)
+		obs_source_release(retired.array[i]);
+	da_free(retired);
+
+	if (target)
+		obs_source_release(target);
+	if (current)
+		obs_source_release(current);
+	if (prev)
+		obs_source_release(prev);
+
+	if (transition) {
+		obs_transition_clear(transition);
+		obs_source_remove_active_child(s->source, transition);
+		obs_source_release(transition);
+	}
 
 	pthread_mutex_destroy(&s->mutex);
 	bfree(s);
@@ -1107,9 +1485,12 @@ static void warp_playlist_video_render(void *data, gs_effect_t *effect)
 	UNUSED_PARAMETER(effect);
 
 	struct warp_playlist_source *s = data;
+	obs_source_t *transition = warp_pl_get_transition(s);
 
-	if (s->transition)
-		obs_source_video_render(s->transition);
+	if (transition) {
+		obs_source_video_render(transition);
+		obs_source_release(transition);
+	}
 }
 
 static bool warp_playlist_audio_render(void *data, uint64_t *ts_out, struct obs_source_audio_mix *audio_output,
@@ -1118,15 +1499,25 @@ static bool warp_playlist_audio_render(void *data, uint64_t *ts_out, struct obs_
 	UNUSED_PARAMETER(sample_rate);
 
 	struct warp_playlist_source *s = data;
-	obs_source_t *transition = s->transition;
+	/* the tick swaps the transition out, so the audio thread needs a
+	 * reference of its own rather than the bare pointer */
+	obs_source_t *transition = warp_pl_get_transition(s);
+	uint64_t timestamp;
 
-	if (!transition || obs_source_audio_pending(transition))
+	if (!transition)
 		return false;
 
-	uint64_t timestamp = obs_source_get_audio_timestamp(transition);
-
-	if (!timestamp)
+	if (obs_source_audio_pending(transition)) {
+		obs_source_release(transition);
 		return false;
+	}
+
+	timestamp = obs_source_get_audio_timestamp(transition);
+
+	if (!timestamp) {
+		obs_source_release(transition);
+		return false;
+	}
 
 	struct obs_source_audio_mix child_audio;
 
@@ -1144,6 +1535,8 @@ static bool warp_playlist_audio_render(void *data, uint64_t *ts_out, struct obs_
 		}
 	}
 
+	obs_source_release(transition);
+
 	*ts_out = timestamp;
 	return true;
 }
@@ -1151,9 +1544,12 @@ static bool warp_playlist_audio_render(void *data, uint64_t *ts_out, struct obs_
 static void warp_playlist_enum_active_sources(void *data, obs_source_enum_proc_t cb, void *param)
 {
 	struct warp_playlist_source *s = data;
+	obs_source_t *transition = warp_pl_get_transition(s);
 
-	if (s->transition)
-		cb(s->source, s->transition, param);
+	if (transition) {
+		cb(s->source, transition, param);
+		obs_source_release(transition);
+	}
 }
 
 /* how much wall-clock time is left of the item that is playing, in
@@ -1179,25 +1575,21 @@ static int64_t warp_pl_remaining_ms(struct warp_playlist_source *s)
 	return remaining * 100 / speed;
 }
 
+/* Asks for the item after the current one to be opened. The file is opened by
+ * warp_pl_open_preload() once the lock has been dropped. Expects s->mutex to
+ * be held. */
 static void warp_pl_preload_next(struct warp_playlist_source *s)
 {
 	size_t target;
 
-	if (s->preloaded || !warp_pl_step_pos(s, 1, &target))
+	if (s->preloaded || s->preload_requested || !warp_pl_step_pos(s, 1, &target))
 		return;
 
-	const char *path = warp_pl_path_at(s, target);
-
-	if (!path)
+	if (!warp_pl_path_at(s, target))
 		return;
 
-	s->preloaded = warp_pl_create_item(s, path);
-
-	if (!s->preloaded)
-		return;
-
-	s->preloaded_path = bstrdup(path);
-	s->preload_armed = false;
+	s->preload_requested = true;
+	s->preload_order_pos = target;
 }
 
 /* Once the preloaded item has decoded picture, park it on its first frame so
@@ -1219,15 +1611,19 @@ static void warp_playlist_tick(void *data, float seconds)
 {
 	struct warp_playlist_source *s = data;
 
+	/* creates and releases sources, so it runs with the lock dropped */
+	warp_pl_swap_transition(s);
+
+	obs_source_t *transition = warp_pl_get_transition(s);
+	float transition_time = transition ? obs_transition_get_time(transition) : 1.0f;
+	bool resized = false;
+
 	pthread_mutex_lock(&s->mutex);
 
-	if (s->pending_transition_id)
-		warp_pl_swap_transition(s);
-
 	/* retire the outgoing item once its transition has played out */
-	if (s->prev && (!s->transition || obs_transition_get_time(s->transition) >= 1.0f)) {
+	if (s->prev && transition_time >= 1.0f) {
 		obs_source_media_stop(s->prev);
-		obs_source_release(s->prev);
+		warp_pl_retire(s, s->prev);
 		s->prev = NULL;
 	}
 
@@ -1248,9 +1644,7 @@ static void warp_playlist_tick(void *data, float seconds)
 	if (cx && cy && (cx != s->cx || cy != s->cy)) {
 		s->cx = cx;
 		s->cy = cy;
-
-		if (s->transition)
-			obs_transition_set_size(s->transition, cx, cy);
+		resized = true;
 	}
 
 	warp_pl_arm_preloaded(s);
@@ -1291,7 +1685,14 @@ static void warp_playlist_tick(void *data, float seconds)
 		}
 	}
 
-	pthread_mutex_unlock(&s->mutex);
+	warp_pl_unlock(s);
+
+	if (transition) {
+		if (resized)
+			obs_transition_set_size(transition, cx, cy);
+
+		obs_source_release(transition);
+	}
 }
 
 static uint32_t warp_playlist_getwidth(void *data)
@@ -1312,24 +1713,20 @@ static void warp_playlist_activate(void *data)
 {
 	struct warp_playlist_source *s = data;
 
-	if (!s->restart_on_activate)
-		return;
-
 	pthread_mutex_lock(&s->mutex);
-	warp_pl_restart_playlist(s);
-	pthread_mutex_unlock(&s->mutex);
+	if (s->restart_on_activate)
+		warp_pl_restart_playlist(s);
+	warp_pl_unlock(s);
 }
 
 static void warp_playlist_deactivate(void *data)
 {
 	struct warp_playlist_source *s = data;
 
-	if (!s->restart_on_activate)
-		return;
-
 	pthread_mutex_lock(&s->mutex);
-	warp_pl_stop(s);
-	pthread_mutex_unlock(&s->mutex);
+	if (s->restart_on_activate)
+		warp_pl_stop(s);
+	warp_pl_unlock(s);
 }
 
 static void warp_playlist_play_pause(void *data, bool pause)
@@ -1352,10 +1749,10 @@ static void warp_playlist_play_pause(void *data, bool pause)
 		s->state = pause ? OBS_MEDIA_STATE_PAUSED : OBS_MEDIA_STATE_PLAYING;
 
 		if (!pause)
-			obs_source_media_started(s->source);
+			s->signal_started = true;
 	}
 
-	pthread_mutex_unlock(&s->mutex);
+	warp_pl_unlock(s);
 }
 
 /* the media controls' restart button starts the whole playlist over, the way
@@ -1367,7 +1764,7 @@ static void warp_playlist_restart(void *data)
 
 	pthread_mutex_lock(&s->mutex);
 	warp_pl_restart_playlist(s);
-	pthread_mutex_unlock(&s->mutex);
+	warp_pl_unlock(s);
 }
 
 static void warp_playlist_stop_media(void *data)
@@ -1376,7 +1773,7 @@ static void warp_playlist_stop_media(void *data)
 
 	pthread_mutex_lock(&s->mutex);
 	warp_pl_stop(s);
-	pthread_mutex_unlock(&s->mutex);
+	warp_pl_unlock(s);
 }
 
 static void warp_playlist_next(void *data)
@@ -1385,7 +1782,7 @@ static void warp_playlist_next(void *data)
 
 	pthread_mutex_lock(&s->mutex);
 	warp_pl_advance(s, 1);
-	pthread_mutex_unlock(&s->mutex);
+	warp_pl_unlock(s);
 }
 
 static void warp_playlist_previous(void *data)
@@ -1394,7 +1791,7 @@ static void warp_playlist_previous(void *data)
 
 	pthread_mutex_lock(&s->mutex);
 	warp_pl_advance(s, -1);
-	pthread_mutex_unlock(&s->mutex);
+	warp_pl_unlock(s);
 }
 
 static int64_t warp_playlist_get_duration(void *data)
@@ -1435,9 +1832,7 @@ static void warp_playlist_set_time(void *data, int64_t ms)
 
 static enum obs_media_state warp_playlist_get_state(void *data)
 {
-	struct warp_playlist_source *s = data;
-
-	return s->state;
+	return warp_pl_state(data);
 }
 
 static void missing_file_callback(void *src, const char *new_path, void *data)
