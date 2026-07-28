@@ -1177,16 +1177,9 @@ static void warp_playlist_restart_hotkey(void *data, obs_hotkey_id id, obs_hotke
 	warp_pl_unlock(s);
 }
 
-static void warp_playlist_clear_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
+/* empties the source's file list for good */
+static void warp_pl_clear_playlist(struct warp_playlist_source *s)
 {
-	UNUSED_PARAMETER(id);
-	UNUSED_PARAMETER(hotkey);
-
-	struct warp_playlist_source *s = data;
-
-	if (!pressed || !obs_source_showing(s->source))
-		return;
-
 	pthread_mutex_lock(&s->mutex);
 
 	if (!s->paths.num) {
@@ -1214,11 +1207,24 @@ static void warp_playlist_clear_hotkey(void *data, obs_hotkey_id id, obs_hotkey_
 	obs_data_release(settings);
 }
 
-/* Applies a speed hotkey and reports what it did. 'value' is the speed to play
- * at when 'absolute' is set, and the number of points to move by otherwise.
- * The signal is emitted with the mutex released: whatever reacts to it is free
- * to drive this playlist straight back. */
-static void warp_pl_speed_hotkey(struct warp_playlist_source *s, int value, bool absolute, const char *change)
+static void warp_playlist_clear_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
+{
+	UNUSED_PARAMETER(id);
+	UNUSED_PARAMETER(hotkey);
+
+	struct warp_playlist_source *s = data;
+
+	if (!pressed || !obs_source_showing(s->source))
+		return;
+
+	warp_pl_clear_playlist(s);
+}
+
+/* Changes the speed of the file that is playing and reports what it did.
+ * 'value' is the speed to play at when 'absolute' is set, and the number of
+ * points to move by otherwise. The signal is emitted with the mutex released:
+ * whatever reacts to it is free to drive this playlist straight back. */
+static void warp_pl_change_speed(struct warp_playlist_source *s, int value, bool absolute, const char *change)
 {
 	int prev_speed;
 	int speed;
@@ -1243,7 +1249,7 @@ static void warp_playlist_speed_up_hotkey(void *data, obs_hotkey_id id, obs_hotk
 	if (!pressed || !obs_source_showing(s->source))
 		return;
 
-	warp_pl_speed_hotkey(s, WARP_SPEED_STEP, false, WARP_SPEED_CHANGE_INCREASED);
+	warp_pl_change_speed(s, WARP_SPEED_STEP, false, WARP_SPEED_CHANGE_INCREASED);
 }
 
 static void warp_playlist_speed_down_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -1256,7 +1262,7 @@ static void warp_playlist_speed_down_hotkey(void *data, obs_hotkey_id id, obs_ho
 	if (!pressed || !obs_source_showing(s->source))
 		return;
 
-	warp_pl_speed_hotkey(s, -WARP_SPEED_STEP, false, WARP_SPEED_CHANGE_DECREASED);
+	warp_pl_change_speed(s, -WARP_SPEED_STEP, false, WARP_SPEED_CHANGE_DECREASED);
 }
 
 static void warp_playlist_speed_reset_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -1269,7 +1275,7 @@ static void warp_playlist_speed_reset_hotkey(void *data, obs_hotkey_id id, obs_h
 	if (!pressed || !obs_source_showing(s->source))
 		return;
 
-	warp_pl_speed_hotkey(s, 100, true, WARP_SPEED_CHANGE_SET);
+	warp_pl_change_speed(s, 100, true, WARP_SPEED_CHANGE_SET);
 }
 
 static void warp_playlist_speed_preset_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -1283,7 +1289,29 @@ static void warp_playlist_speed_preset_hotkey(void *data, obs_hotkey_id id, obs_
 	if (!pressed || !obs_source_showing(s->source))
 		return;
 
-	warp_pl_speed_hotkey(s, b->value, true, WARP_SPEED_CHANGE_SET);
+	warp_pl_change_speed(s, b->value, true, WARP_SPEED_CHANGE_SET);
+}
+
+/* Steps the file that is playing by 'frames', negative to step backward. The
+ * signal is emitted with the mutex released, for the reason above. */
+static void warp_pl_step_frames(struct warp_playlist_source *s, int frames)
+{
+	bool stepped = false;
+
+	pthread_mutex_lock(&s->mutex);
+
+	if (s->current) {
+		/* the item pauses itself before stepping; auto advance must not
+		 * kick in while the operator is stepping around */
+		warp_pl_call_item_proc(s->current, "warp_step_frames", "frames", frames);
+		s->state = obs_source_media_get_state(s->current);
+		stepped = true;
+	}
+
+	warp_pl_unlock(s);
+
+	if (stepped)
+		warp_signal_frames_stepped(s->source, frames);
 }
 
 static void warp_playlist_step_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -1297,22 +1325,7 @@ static void warp_playlist_step_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t
 	if (!pressed || !obs_source_showing(s->source))
 		return;
 
-	bool stepped = false;
-
-	pthread_mutex_lock(&s->mutex);
-
-	if (s->current) {
-		/* the item pauses itself before stepping; auto advance must not
-		 * kick in while the operator is stepping around */
-		warp_pl_call_item_proc(s->current, "warp_step_frames", "frames", b->value);
-		s->state = obs_source_media_get_state(s->current);
-		stepped = true;
-	}
-
-	warp_pl_unlock(s);
-
-	if (stepped)
-		warp_signal_frames_stepped(s->source, b->value);
+	warp_pl_step_frames(s, b->value);
 }
 
 static void warp_playlist_register_hotkeys(struct warp_playlist_source *s, obs_source_t *source)
@@ -1383,6 +1396,111 @@ static void warp_playlist_register_hotkeys(struct warp_playlist_source *s, obs_s
 }
 
 /* ------------------------------------------------------------------------- */
+/* procs
+ *
+ * The playlist actions that have no counterpart in the media control API, made
+ * callable from outside the source: the obs-websocket vendor requests drive
+ * the playlist through these, and scripts can call them too. They do what the
+ * matching hotkeys do, and report it the same way, except that they do not
+ * require the source to be on screen. */
+
+static void warp_pl_set_speed_proc(void *data, calldata_t *cd)
+{
+	long long speed;
+
+	if (calldata_get_int(cd, "speed", &speed))
+		warp_pl_change_speed(data, (int)speed, true, WARP_SPEED_CHANGE_SET);
+}
+
+static void warp_pl_adjust_speed_proc(void *data, calldata_t *cd)
+{
+	long long delta;
+
+	if (!calldata_get_int(cd, "delta", &delta) || !delta)
+		return;
+
+	warp_pl_change_speed(data, (int)delta, false,
+			     delta > 0 ? WARP_SPEED_CHANGE_INCREASED : WARP_SPEED_CHANGE_DECREASED);
+}
+
+static void warp_pl_get_speed_proc(void *data, calldata_t *cd)
+{
+	struct warp_playlist_source *s = data;
+
+	pthread_mutex_lock(&s->mutex);
+	calldata_set_int(cd, "speed", s->speed);
+	pthread_mutex_unlock(&s->mutex);
+}
+
+static void warp_pl_step_frames_proc(void *data, calldata_t *cd)
+{
+	long long frames;
+
+	if (calldata_get_int(cd, "frames", &frames))
+		warp_pl_step_frames(data, (int)frames);
+}
+
+static void warp_pl_first_proc(void *data, calldata_t *cd)
+{
+	struct warp_playlist_source *s = data;
+
+	UNUSED_PARAMETER(cd);
+
+	pthread_mutex_lock(&s->mutex);
+	warp_pl_restart_playlist(s);
+	warp_pl_unlock(s);
+}
+
+static void warp_pl_restart_current_proc(void *data, calldata_t *cd)
+{
+	struct warp_playlist_source *s = data;
+
+	UNUSED_PARAMETER(cd);
+
+	pthread_mutex_lock(&s->mutex);
+	warp_pl_restart_current(s);
+	warp_pl_unlock(s);
+}
+
+static void warp_pl_clear_proc(void *data, calldata_t *cd)
+{
+	UNUSED_PARAMETER(cd);
+
+	warp_pl_clear_playlist(data);
+}
+
+/* where in the playlist playback is; 'index' is -1 when nothing is playing */
+static void warp_pl_status_proc(void *data, calldata_t *cd)
+{
+	struct warp_playlist_source *s = data;
+
+	pthread_mutex_lock(&s->mutex);
+
+	const char *path = warp_pl_path_at(s, s->pos);
+
+	calldata_set_int(cd, "index", s->pos < s->order.num ? (long long)s->pos : -1);
+	calldata_set_int(cd, "count", (long long)s->order.num);
+	calldata_set_string(cd, "current_file", path ? path : "");
+
+	pthread_mutex_unlock(&s->mutex);
+}
+
+static void warp_playlist_register_procs(struct warp_playlist_source *s, obs_source_t *source)
+{
+	proc_handler_t *ph = obs_source_get_proc_handler(source);
+
+	proc_handler_add(ph, "void warp_set_speed(int speed)", warp_pl_set_speed_proc, s);
+	proc_handler_add(ph, "void warp_adjust_speed(int delta)", warp_pl_adjust_speed_proc, s);
+	proc_handler_add(ph, "void warp_get_speed(out int speed)", warp_pl_get_speed_proc, s);
+	proc_handler_add(ph, "void warp_step_frames(int frames)", warp_pl_step_frames_proc, s);
+	proc_handler_add(ph, "void warp_playlist_first()", warp_pl_first_proc, s);
+	proc_handler_add(ph, "void warp_playlist_restart_current()", warp_pl_restart_current_proc, s);
+	proc_handler_add(ph, "void warp_playlist_clear()", warp_pl_clear_proc, s);
+	proc_handler_add(ph, "void warp_playlist_status(out int index, out int count, out string current_file)",
+			 warp_pl_status_proc, s);
+}
+
+/* ------------------------------------------------------------------------- */
 
 static void *warp_playlist_create(obs_data_t *settings, obs_source_t *source)
 {
@@ -1410,6 +1528,7 @@ static void *warp_playlist_create(obs_data_t *settings, obs_source_t *source)
 
 	signal_handler_add_array(obs_source_get_signal_handler(source), signals);
 	warp_playlist_register_hotkeys(s, source);
+	warp_playlist_register_procs(s, source);
 
 	warp_playlist_update(s, settings);
 	return s;

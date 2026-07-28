@@ -14,7 +14,7 @@ A media source based on OBS Studio's built-in Media Source, with the same proper
   * The Speed property in the source settings also applies live
 * **Frame stepping** hotkeys: step 1, 5, 10, or 20 frames forward or backward. Stepping while the video is playing pauses it first; stepping is frame-accurate, including backward steps.
 
-All hotkeys are per-source and are bound in OBS under Settings → Hotkeys.
+All hotkeys are per-source and are bound in OBS under Settings → Hotkeys. Every one of these actions can also be driven from outside OBS — see [obs-websocket control](#obs-websocket-control).
 
 ### Warp Playlist source
 
@@ -30,6 +30,8 @@ A playlist source in the spirit of the VLC video source, built on the same playb
 Clear Playlist empties the source's file list for good — it is written to the scene collection like any other settings change. The cleared file paths are written to the OBS log first, so a playlist cleared by a mis-hit during a show can be rebuilt from there.
 
 Media controls (the ones in the OBS media controls dock) apply to the playlist: restart starts the playlist over from its first file, next and previous move through the list, and the time and duration shown are those of the file that is playing.
+
+Every playlist action can also be driven from outside OBS — see [obs-websocket control](#obs-websocket-control).
 
 ### Warp Detection filter
 
@@ -61,6 +63,78 @@ warp_frames_stepped(ptr source, int frames)
 
 `change` is `set`, `increased` or `decreased`; `frames` is negative when stepping backward. The speed a file starts at is not a change: a playlist moving to its next file resets the speed without emitting anything.
 
+### obs-websocket control
+
+Every action of the Warp Media and Warp Playlist sources is also an [obs-websocket](https://github.com/obsproject/obs-websocket) vendor request, so replay playback can be driven from a Stream Deck, a Companion button, a tablet, or any other client outside OBS Studio. The requests are registered when the plugin loads, if obs-websocket is installed; nothing has to be turned on for them.
+
+Clients send them with obs-websocket's `CallVendorRequest`, under the vendor name `warp`:
+
+```json
+{
+  "vendorName": "warp",
+  "requestType": "SpeedUp",
+  "requestData": { "sourceName": "Replay" }
+}
+```
+
+Every request names the source it applies to, with `sourceName` or `sourceUuid`.
+
+| Request | Fields | What it does |
+| --- | --- | --- |
+| `Play` | | Plays, or resumes a paused source |
+| `Pause` | | Pauses |
+| `TogglePlayPause` | | Pauses when playing, plays otherwise |
+| `Stop` | | Stops |
+| `Restart` | | Media: plays the file from the top. Playlist: starts the playlist over from its first file, like the restart button in the media controls |
+| `SetCursor` | `cursor` | Seeks to a position in the file, in milliseconds |
+| `SetSpeed` | `speed` | Plays at `speed` percent (10 to 400) |
+| `SpeedUp` | `amount` | Speeds up, by 10 percentage points unless `amount` says otherwise |
+| `SlowDown` | `amount` | Slows down, by 10 percentage points unless `amount` says otherwise |
+| `ResetSpeed` | | Back to 100% |
+| `StepForward` | `frames` | Steps forward, by 1 frame unless `frames` says otherwise |
+| `StepBackward` | `frames` | Steps backward |
+| `GetStatus` | | Changes nothing, and answers with where playback stands |
+
+Five more apply to a Warp Playlist source, and answer with an error when they are sent to a Warp Media source:
+
+| Request | What it does |
+| --- | --- |
+| `Next` | Next video |
+| `Previous` | Previous video |
+| `First` | Back to the first video |
+| `RestartCurrent` | Restarts the video that is playing |
+| `ClearPlaylist` | Clears the playlist, exactly as the hotkey does — the file list is emptied for good, and written to the log first |
+
+Every response says whether the request was carried out, and reports where playback stands afterwards, so a control surface can follow the source without asking again:
+
+```json
+{
+  "success": true,
+  "sourceName": "Replay",
+  "sourceUuid": "…",
+  "sourceKind": "warp_media_source",
+  "mediaState": "OBS_MEDIA_STATE_PLAYING",
+  "cursor": 4200,
+  "duration": 30000,
+  "speed": 110
+}
+```
+
+A Warp Playlist source also reports `playlistIndex` (-1 when nothing is playing), `playlistLength` and `currentFile`. A request that could not be carried out — no such source, a source that is not a Warp source, or a value outside the range the action takes — answers with `"success": false` and an `error` saying what was wrong, and changes nothing.
+
+The requests do exactly what the matching hotkeys do, including emitting the signals above, so a Warp Detection filter reacts to a speed change driven over the websocket the same way it reacts to the hotkey. The one difference is that a hotkey only applies to a source that is on screen, while a request names the source it means and is carried out whether or not it is being shown.
+
+The playlist actions that have no counterpart in OBS's media control API are proc handlers on the source, so scripts can call them too, and so can anything else that can reach the source:
+
+```
+warp_set_speed(int speed)          warp_playlist_first()
+warp_adjust_speed(int delta)       warp_playlist_restart_current()
+warp_get_speed(out int speed)      warp_playlist_clear()
+warp_step_frames(int frames)       warp_playlist_status(out int index, out int count, out string current_file)
+```
+
+The first four are on the Warp Media source as well. Play, pause, stop, restart, next, previous and seeking are OBS's own media controls on both sources, so obs-websocket's built-in `TriggerMediaInputAction`, `SetMediaInputCursor` and `GetMediaInputStatus` requests work on them too.
+
 ### Warp window
 
 A Warp entry in the Tools menu opens the Warp window (currently an empty placeholder for upcoming replay tooling).
@@ -82,4 +156,4 @@ GitHub Actions workflows build the plugin for Windows, macOS, and Ubuntu on ever
 
 ## License
 
-GNU General Public License v2.0 (or later). The `src/media-playback` directory is adapted from [obs-studio](https://github.com/obsproject/obs-studio)'s `deps/media-playback` library (see `src/media-playback/LICENSE`), extended with on-the-fly speed changes and frame stepping. `src/warp-source.c` is adapted from obs-studio's Media Source (`plugins/obs-ffmpeg/obs-ffmpeg-source.c`).
+GNU General Public License v2.0 (or later). `src/obs-websocket-api.h` is the header [obs-websocket](https://github.com/obsproject/obs-websocket) ships for plugins that add vendor requests, taken as-is (GPL v2.0 or later). The `src/media-playback` directory is adapted from [obs-studio](https://github.com/obsproject/obs-studio)'s `deps/media-playback` library (see `src/media-playback/LICENSE`), extended with on-the-fly speed changes and frame stepping. `src/warp-source.c` is adapted from obs-studio's Media Source (`plugins/obs-ffmpeg/obs-ffmpeg-source.c`).
