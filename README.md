@@ -122,7 +122,7 @@ Every response says whether the request was carried out, and reports where playb
 
 A Warp Playlist source also reports `playlistIndex` (-1 when nothing is playing), `playlistLength` and `currentFile`. A request that could not be carried out — no such source, a source that is not a Warp source, or a value outside the range the action takes — answers with `"success": false` and an `error` saying what was wrong, and changes nothing.
 
-The requests do exactly what the matching hotkeys do, including emitting the signals above, so a Warp Detection filter reacts to a speed change driven over the websocket the same way it reacts to the hotkey. The one difference is that a hotkey only applies to a source that is on screen, while a request names the source it means and is carried out whether or not it is being shown.
+The requests do exactly what the matching hotkeys do, including emitting the signals above, so a Warp Detection filter reacts to a speed change driven over the websocket the same way it reacts to the hotkey. The difference is that a hotkey only applies to a source that is on screen, because the operator is pressing it at whatever is in front of them, while a request names the source it means and is carried out whether or not it is being shown. `Restart` on a Warp Media source is the exception: the source only restarts playback while it is being shown, over the websocket as from the hotkey.
 
 The playlist actions that have no counterpart in OBS's media control API are proc handlers on the source, so scripts can call them too, and so can anything else that can reach the source:
 

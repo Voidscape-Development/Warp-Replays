@@ -242,7 +242,9 @@ static void warp_ws_add_status(obs_source_t *source, obs_data_t *response)
  * The requests do what the hotkeys do, with one difference: a hotkey only
  * applies to a source that is on screen, because the operator is pressing it
  * at whatever is in front of them, while a request names the source it means
- * and so is carried out whether or not it is being shown. */
+ * and so is carried out whether or not it is being shown. Restarting a Warp
+ * Media source is the exception, as the source itself only restarts playback
+ * while it is being shown. */
 static bool warp_ws_run(const struct warp_ws_request *req, obs_source_t *source, obs_data_t *request,
 			obs_data_t *response)
 {
