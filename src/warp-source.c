@@ -733,13 +733,29 @@ static void warp_source_step_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *
 	warp_source_do_step(s, b->value);
 }
 
-/* procs used by the Warp Playlist source to drive its private media items */
+/* Procs used by the Warp Playlist source to drive its private media items, and
+ * by the obs-websocket vendor requests to drive the source from outside OBS.
+ * They apply the same changes the hotkeys do, and report them the same way. */
 static void set_speed_proc(void *data, calldata_t *cd)
 {
 	long long speed;
 
 	if (calldata_get_int(cd, "speed", &speed))
 		warp_source_apply_speed(data, (int)speed, WARP_SPEED_CHANGE_SET);
+}
+
+/* moves the speed by 'delta' points, the way the speed up and slow down
+ * hotkeys do */
+static void adjust_speed_proc(void *data, calldata_t *cd)
+{
+	struct warp_source *s = data;
+	long long delta;
+
+	if (!calldata_get_int(cd, "delta", &delta) || !delta)
+		return;
+
+	warp_source_apply_speed(s, s->speed_percent + (int)delta,
+				delta > 0 ? WARP_SPEED_CHANGE_INCREASED : WARP_SPEED_CHANGE_DECREASED);
 }
 
 static void get_speed_proc(void *data, calldata_t *cd)
@@ -845,6 +861,7 @@ static void *warp_source_create(obs_data_t *settings, obs_source_t *source)
 	proc_handler_add(ph, "void get_duration(out int duration)", get_duration, s);
 	proc_handler_add(ph, "void get_nb_frames(out int num_frames)", get_nb_frames, s);
 	proc_handler_add(ph, "void warp_set_speed(int speed)", set_speed_proc, s);
+	proc_handler_add(ph, "void warp_adjust_speed(int delta)", adjust_speed_proc, s);
 	proc_handler_add(ph, "void warp_get_speed(out int speed)", get_speed_proc, s);
 	proc_handler_add(ph, "void warp_step_frames(int frames)", step_frames_proc, s);
 
