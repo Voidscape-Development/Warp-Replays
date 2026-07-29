@@ -821,7 +821,8 @@ static void warp_source_register_warp_hotkeys(struct warp_source *s, obs_source_
 
 static void *warp_source_create(obs_data_t *settings, obs_source_t *source)
 {
-	static const char *signals[] = {WARP_SIGNAL_DECL_SPEED_CHANGED, WARP_SIGNAL_DECL_FRAMES_STEPPED, NULL};
+	static const char *signals[] = {WARP_SIGNAL_DECL_SPEED_CHANGED, WARP_SIGNAL_DECL_FRAMES_STEPPED,
+					WARP_SIGNAL_DECL_MEDIA_ACTION, NULL};
 
 	struct warp_source *s = bzalloc(sizeof(struct warp_source));
 	s->source = source;
@@ -930,6 +931,8 @@ static void warp_source_play_pause(void *data, bool pause)
 		set_media_state(s, OBS_MEDIA_STATE_PLAYING);
 		obs_source_media_started(s->source);
 	}
+
+	warp_signal_media_action(s->source, pause ? WARP_MEDIA_ACTION_PAUSE : WARP_MEDIA_ACTION_PLAY);
 }
 
 static void warp_source_stop(void *data)
@@ -951,6 +954,8 @@ static void warp_source_restart(void *data)
 		warp_source_start(s);
 
 	set_media_state(s, OBS_MEDIA_STATE_PLAYING);
+
+	warp_signal_media_action(s->source, WARP_MEDIA_ACTION_RESTART);
 }
 
 static int64_t warp_source_get_duration(void *data)
