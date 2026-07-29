@@ -1162,6 +1162,22 @@ static void warp_playlist_first_hotkey(void *data, obs_hotkey_id id, obs_hotkey_
 	warp_pl_unlock(s);
 }
 
+/* Restarts the file that is playing, the way Restart Current Video does. The
+ * signal is emitted with the mutex released, as the speed and stepping ones
+ * are: whatever reacts to it is free to drive this playlist straight back. */
+static void warp_pl_restart_current_command(struct warp_playlist_source *s)
+{
+	bool restarted;
+
+	pthread_mutex_lock(&s->mutex);
+	warp_pl_restart_current(s);
+	restarted = s->current || s->play_armed;
+	warp_pl_unlock(s);
+
+	if (restarted)
+		warp_signal_media_action(s->source, WARP_MEDIA_ACTION_RESTART);
+}
+
 static void warp_playlist_restart_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
 {
 	UNUSED_PARAMETER(id);
@@ -1172,9 +1188,7 @@ static void warp_playlist_restart_hotkey(void *data, obs_hotkey_id id, obs_hotke
 	if (!pressed || !obs_source_showing(s->source))
 		return;
 
-	pthread_mutex_lock(&s->mutex);
-	warp_pl_restart_current(s);
-	warp_pl_unlock(s);
+	warp_pl_restart_current_command(s);
 }
 
 /* empties the source's file list for good */
@@ -1453,13 +1467,9 @@ static void warp_pl_first_proc(void *data, calldata_t *cd)
 
 static void warp_pl_restart_current_proc(void *data, calldata_t *cd)
 {
-	struct warp_playlist_source *s = data;
-
 	UNUSED_PARAMETER(cd);
 
-	pthread_mutex_lock(&s->mutex);
-	warp_pl_restart_current(s);
-	warp_pl_unlock(s);
+	warp_pl_restart_current_command(data);
 }
 
 static void warp_pl_clear_proc(void *data, calldata_t *cd)
@@ -1504,7 +1514,8 @@ static void warp_playlist_register_procs(struct warp_playlist_source *s, obs_sou
 
 static void *warp_playlist_create(obs_data_t *settings, obs_source_t *source)
 {
-	static const char *signals[] = {WARP_SIGNAL_DECL_SPEED_CHANGED, WARP_SIGNAL_DECL_FRAMES_STEPPED, NULL};
+	static const char *signals[] = {WARP_SIGNAL_DECL_SPEED_CHANGED, WARP_SIGNAL_DECL_FRAMES_STEPPED,
+					WARP_SIGNAL_DECL_MEDIA_ACTION, NULL};
 
 	struct warp_playlist_source *s = bzalloc(sizeof(struct warp_playlist_source));
 
@@ -1855,6 +1866,7 @@ static void warp_playlist_play_pause(void *data, bool pause)
 	pthread_mutex_lock(&s->mutex);
 
 	bool finished = s->state == OBS_MEDIA_STATE_ENDED || s->state == OBS_MEDIA_STATE_STOPPED;
+	bool acted = false;
 
 	if (!pause && (!s->current || finished)) {
 		/* playing again after the playlist ran out replays the file it
@@ -1863,15 +1875,23 @@ static void warp_playlist_play_pause(void *data, bool pause)
 			warp_pl_restart_current(s);
 		else
 			warp_pl_restart_playlist(s);
+
+		/* an empty playlist has nothing to play, so nothing happened */
+		acted = s->current || s->play_armed;
 	} else if (s->current) {
 		obs_source_media_play_pause(s->current, pause);
 		s->state = pause ? OBS_MEDIA_STATE_PAUSED : OBS_MEDIA_STATE_PLAYING;
 
 		if (!pause)
 			s->signal_started = true;
+
+		acted = true;
 	}
 
 	warp_pl_unlock(s);
+
+	if (acted)
+		warp_signal_media_action(s->source, pause ? WARP_MEDIA_ACTION_PAUSE : WARP_MEDIA_ACTION_PLAY);
 }
 
 /* the media controls' restart button starts the whole playlist over, the way
@@ -1880,10 +1900,15 @@ static void warp_playlist_play_pause(void *data, bool pause)
 static void warp_playlist_restart(void *data)
 {
 	struct warp_playlist_source *s = data;
+	bool restarted;
 
 	pthread_mutex_lock(&s->mutex);
 	warp_pl_restart_playlist(s);
+	restarted = s->play_armed;
 	warp_pl_unlock(s);
+
+	if (restarted)
+		warp_signal_media_action(s->source, WARP_MEDIA_ACTION_RESTART);
 }
 
 static void warp_playlist_stop_media(void *data)

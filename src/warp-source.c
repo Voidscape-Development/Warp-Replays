@@ -78,6 +78,13 @@ struct warp_source {
 	obs_hotkey_pair_id play_pause_hotkey;
 	obs_hotkey_id stop_hotkey;
 
+	/* Set while the source drives its own playback instead of carrying out
+	 * a command someone sent: restarting as it goes on screen, and the
+	 * pause a frame step does first. The media action signal is about
+	 * commands, so those are not reported as ones. Only ever set and
+	 * cleared around the synchronous call it covers. */
+	bool internal_command;
+
 	struct warp_hotkey_binding speed_bindings[WARP_NUM_SPEED_PRESETS];
 	struct warp_hotkey_binding step_bindings[WARP_NUM_STEP_HOTKEYS];
 };
@@ -709,10 +716,13 @@ static void warp_source_do_step(struct warp_source *s, int frames)
 		return;
 
 	/* stepping while playing pauses first, then steps */
-	if (s->state == OBS_MEDIA_STATE_PLAYING)
+	if (s->state == OBS_MEDIA_STATE_PLAYING) {
+		s->internal_command = true;
 		obs_source_media_play_pause(s->source, true);
-	else if (s->state != OBS_MEDIA_STATE_PAUSED)
+		s->internal_command = false;
+	} else if (s->state != OBS_MEDIA_STATE_PAUSED) {
 		return;
+	}
 
 	media_playback_step_frames(s->media, frames);
 
@@ -821,7 +831,8 @@ static void warp_source_register_warp_hotkeys(struct warp_source *s, obs_source_
 
 static void *warp_source_create(obs_data_t *settings, obs_source_t *source)
 {
-	static const char *signals[] = {WARP_SIGNAL_DECL_SPEED_CHANGED, WARP_SIGNAL_DECL_FRAMES_STEPPED, NULL};
+	static const char *signals[] = {WARP_SIGNAL_DECL_SPEED_CHANGED, WARP_SIGNAL_DECL_FRAMES_STEPPED,
+					WARP_SIGNAL_DECL_MEDIA_ACTION, NULL};
 
 	struct warp_source *s = bzalloc(sizeof(struct warp_source));
 	s->source = source;
@@ -892,8 +903,15 @@ static void warp_source_activate(void *data)
 {
 	struct warp_source *s = data;
 
-	if (s->restart_on_activate)
-		obs_source_media_restart(s->source);
+	if (!s->restart_on_activate)
+		return;
+
+	/* going on screen restarts playback by itself; obs_source_media_restart
+	 * is still what does it, so OBS's own media_restart signal is emitted
+	 * the way it is for any media source */
+	s->internal_command = true;
+	obs_source_media_restart(s->source);
+	s->internal_command = false;
 }
 
 static void warp_source_deactivate(void *data)
@@ -930,6 +948,9 @@ static void warp_source_play_pause(void *data, bool pause)
 		set_media_state(s, OBS_MEDIA_STATE_PLAYING);
 		obs_source_media_started(s->source);
 	}
+
+	if (!s->internal_command)
+		warp_signal_media_action(s->source, pause ? WARP_MEDIA_ACTION_PAUSE : WARP_MEDIA_ACTION_PLAY);
 }
 
 static void warp_source_stop(void *data)
@@ -951,6 +972,9 @@ static void warp_source_restart(void *data)
 		warp_source_start(s);
 
 	set_media_state(s, OBS_MEDIA_STATE_PLAYING);
+
+	if (!s->internal_command)
+		warp_signal_media_action(s->source, WARP_MEDIA_ACTION_RESTART);
 }
 
 static int64_t warp_source_get_duration(void *data)

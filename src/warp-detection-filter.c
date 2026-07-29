@@ -53,8 +53,13 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define EVENT_SPEED_SET "speed_set"
 #define EVENT_SPEED_UP "speed_up"
 #define EVENT_SPEED_DOWN "speed_down"
+#define EVENT_SPEED_INCREASE "speed_increase"
+#define EVENT_SPEED_DECREASE "speed_decrease"
 #define EVENT_STEP_FORWARD "step_forward"
 #define EVENT_STEP_BACKWARD "step_backward"
+#define EVENT_MEDIA_PLAY "media_play"
+#define EVENT_MEDIA_PAUSE "media_pause"
+#define EVENT_MEDIA_RESTART "media_restart"
 
 /* the speed Reset Speed sets, which has an event like the presets do */
 #define WARP_DETECT_RESET_SPEED 100
@@ -64,8 +69,13 @@ enum warp_detect_kind {
 	WARP_DETECT_KIND_SPEED_SET,
 	WARP_DETECT_KIND_SPEED_UP,
 	WARP_DETECT_KIND_SPEED_DOWN,
+	WARP_DETECT_KIND_SPEED_INCREASE,
+	WARP_DETECT_KIND_SPEED_DECREASE,
 	WARP_DETECT_KIND_STEP_FORWARD,
 	WARP_DETECT_KIND_STEP_BACKWARD,
+	WARP_DETECT_KIND_MEDIA_PLAY,
+	WARP_DETECT_KIND_MEDIA_PAUSE,
+	WARP_DETECT_KIND_MEDIA_RESTART,
 };
 
 /* what is done about it */
@@ -402,6 +412,21 @@ static enum warp_detect_kind warp_detect_event_kind(obs_data_t *settings, int *v
 	if (strcmp(event, EVENT_SPEED_DOWN) == 0)
 		return WARP_DETECT_KIND_SPEED_DOWN;
 
+	if (strcmp(event, EVENT_SPEED_INCREASE) == 0)
+		return WARP_DETECT_KIND_SPEED_INCREASE;
+
+	if (strcmp(event, EVENT_SPEED_DECREASE) == 0)
+		return WARP_DETECT_KIND_SPEED_DECREASE;
+
+	if (strcmp(event, EVENT_MEDIA_PLAY) == 0)
+		return WARP_DETECT_KIND_MEDIA_PLAY;
+
+	if (strcmp(event, EVENT_MEDIA_PAUSE) == 0)
+		return WARP_DETECT_KIND_MEDIA_PAUSE;
+
+	if (strcmp(event, EVENT_MEDIA_RESTART) == 0)
+		return WARP_DETECT_KIND_MEDIA_RESTART;
+
 	if (warp_detect_event_is(event, EVENT_STEP_FORWARD, &hotkey_value)) {
 		*value = hotkey_value ? hotkey_value : (int)obs_data_get_int(settings, S_FRAME_VALUE);
 		*any = !hotkey_value && obs_data_get_bool(settings, S_ANY_VALUE);
@@ -417,7 +442,7 @@ static enum warp_detect_kind warp_detect_event_kind(obs_data_t *settings, int *v
 	return WARP_DETECT_KIND_NONE;
 }
 
-static bool warp_detect_speed_matches(obs_data_t *settings, int speed, const char *change)
+static bool warp_detect_speed_matches(obs_data_t *settings, int speed, int prev_speed, const char *change)
 {
 	int value;
 	bool any;
@@ -427,6 +452,13 @@ static bool warp_detect_speed_matches(obs_data_t *settings, int speed, const cha
 		return strcmp(change, WARP_SPEED_CHANGE_INCREASED) == 0;
 	case WARP_DETECT_KIND_SPEED_DOWN:
 		return strcmp(change, WARP_SPEED_CHANGE_DECREASED) == 0;
+	/* the speed going up whichever way it got there: a speed up press, or
+	 * a value - a preset, Reset Speed, the Speed property - set above the
+	 * speed being played at */
+	case WARP_DETECT_KIND_SPEED_INCREASE:
+		return speed > prev_speed;
+	case WARP_DETECT_KIND_SPEED_DECREASE:
+		return speed < prev_speed;
 	case WARP_DETECT_KIND_SPEED_SET:
 		/* "set to X%" is the speed being put at a value outright: a
 		 * preset hotkey, Reset Speed, or the Speed property. Landing on
@@ -453,6 +485,23 @@ static bool warp_detect_frames_match(obs_data_t *settings, int frames)
 	return any || (frames < 0 ? -frames : frames) == value;
 }
 
+static bool warp_detect_media_matches(obs_data_t *settings, const char *action)
+{
+	int value;
+	bool any;
+
+	switch (warp_detect_event_kind(settings, &value, &any)) {
+	case WARP_DETECT_KIND_MEDIA_PLAY:
+		return strcmp(action, WARP_MEDIA_ACTION_PLAY) == 0;
+	case WARP_DETECT_KIND_MEDIA_PAUSE:
+		return strcmp(action, WARP_MEDIA_ACTION_PAUSE) == 0;
+	case WARP_DETECT_KIND_MEDIA_RESTART:
+		return strcmp(action, WARP_MEDIA_ACTION_RESTART) == 0;
+	default:
+		return false;
+	}
+}
+
 static void warp_detect_speed_signal(void *param, calldata_t *cd)
 {
 	struct warp_detect_filter *f = param;
@@ -470,7 +519,7 @@ static void warp_detect_speed_signal(void *param, calldata_t *cd)
 		return;
 
 	obs_data_t *settings = obs_source_get_settings(f->source);
-	bool matched = warp_detect_speed_matches(settings, (int)speed, change);
+	bool matched = warp_detect_speed_matches(settings, (int)speed, (int)prev_speed, change);
 
 	obs_data_release(settings);
 
@@ -509,6 +558,31 @@ static void warp_detect_frames_signal(void *param, calldata_t *cd)
 	warp_detect_fire(f, event);
 }
 
+static void warp_detect_media_signal(void *param, calldata_t *cd)
+{
+	struct warp_detect_filter *f = param;
+	const char *action = NULL;
+
+	if (!obs_source_enabled(f->source))
+		return;
+
+	if (!calldata_get_string(cd, "action", &action) || !action)
+		return;
+
+	obs_data_t *settings = obs_source_get_settings(f->source);
+	bool matched = warp_detect_media_matches(settings, action);
+
+	obs_data_release(settings);
+
+	if (!matched)
+		return;
+
+	char event[sizeof(f->event_desc)];
+
+	snprintf(event, sizeof(event), "media %s", action);
+	warp_detect_fire(f, event);
+}
+
 static bool warp_detect_is_warp_source(obs_source_t *source)
 {
 	const char *id = obs_source_get_id(source);
@@ -531,6 +605,7 @@ static void warp_detect_disconnect(struct warp_detect_filter *f)
 
 		signal_handler_disconnect(handler, WARP_SIGNAL_SPEED_CHANGED, warp_detect_speed_signal, f);
 		signal_handler_disconnect(handler, WARP_SIGNAL_FRAMES_STEPPED, warp_detect_frames_signal, f);
+		signal_handler_disconnect(handler, WARP_SIGNAL_MEDIA_ACTION, warp_detect_media_signal, f);
 		obs_source_release(source);
 	}
 
@@ -582,6 +657,7 @@ static void warp_detect_resolve(struct warp_detect_filter *f)
 
 	signal_handler_connect(handler, WARP_SIGNAL_SPEED_CHANGED, warp_detect_speed_signal, f);
 	signal_handler_connect(handler, WARP_SIGNAL_FRAMES_STEPPED, warp_detect_frames_signal, f);
+	signal_handler_connect(handler, WARP_SIGNAL_MEDIA_ACTION, warp_detect_media_signal, f);
 	f->listening_to = obs_source_get_weak_source(wanted);
 
 	WARP_DETECT_LOG(LOG_INFO, "listening to '%s'", obs_source_get_name(wanted));
@@ -802,6 +878,10 @@ static void warp_detect_add_events(obs_property_t *list)
 	obs_property_list_add_string(list, obs_module_text("Warp.Hotkey.Speed.Up"), EVENT_SPEED_UP);
 	obs_property_list_add_string(list, obs_module_text("Warp.Hotkey.Speed.Down"), EVENT_SPEED_DOWN);
 
+	/* the speed moving in a direction, however it was asked to */
+	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.SpeedIncrease"), EVENT_SPEED_INCREASE);
+	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.SpeedDecrease"), EVENT_SPEED_DECREASE);
+
 	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.StepForward"), EVENT_STEP_FORWARD);
 
 	for (size_t i = 0; i < WARP_NUM_STEP_COUNTS; i++)
@@ -811,6 +891,10 @@ static void warp_detect_add_events(obs_property_t *list)
 
 	for (size_t i = 0; i < WARP_NUM_STEP_COUNTS; i++)
 		warp_detect_add_step_event(list, EVENT_STEP_BACKWARD, "Backward", step_counts[i]);
+
+	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.MediaPlay"), EVENT_MEDIA_PLAY);
+	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.MediaPause"), EVENT_MEDIA_PAUSE);
+	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.MediaRestart"), EVENT_MEDIA_RESTART);
 }
 
 static bool warp_detect_modified(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
@@ -820,6 +904,7 @@ static bool warp_detect_modified(obs_properties_t *props, obs_property_t *proper
 	const char *filter_mode = obs_data_get_string(settings, S_FILTER_MODE);
 	bool speed_value = strcmp(event, EVENT_SPEED_SET) == 0;
 	bool frame_value = strcmp(event, EVENT_STEP_FORWARD) == 0 || strcmp(event, EVENT_STEP_BACKWARD) == 0;
+	bool any_value = obs_data_get_bool(settings, S_ANY_VALUE);
 	bool global_hotkey = strcmp(action, ACTION_GLOBAL_HOTKEY) == 0;
 	bool source_hotkey = strcmp(action, ACTION_SOURCE_HOTKEY) == 0;
 	bool filter = strcmp(action, ACTION_FILTER) == 0;
@@ -828,8 +913,9 @@ static bool warp_detect_modified(obs_properties_t *props, obs_property_t *proper
 
 	UNUSED_PARAMETER(property);
 
-	obs_property_set_visible(obs_properties_get(props, S_SPEED_VALUE), speed_value);
-	obs_property_set_visible(obs_properties_get(props, S_FRAME_VALUE), frame_value);
+	/* reacting to any value leaves nothing for the value to do */
+	obs_property_set_visible(obs_properties_get(props, S_SPEED_VALUE), speed_value && !any_value);
+	obs_property_set_visible(obs_properties_get(props, S_FRAME_VALUE), frame_value && !any_value);
 	obs_property_set_visible(obs_properties_get(props, S_ANY_VALUE), speed_value || frame_value);
 
 	obs_property_set_visible(obs_properties_get(props, S_GLOBAL_HOTKEY), global_hotkey);
@@ -898,7 +984,8 @@ static obs_properties_t *warp_detect_getproperties(void *data)
 
 	obs_properties_add_int(props, S_FRAME_VALUE, obs_module_text("Warp.Detect.Frames"), 1, 10000, 1);
 
-	obs_properties_add_bool(props, S_ANY_VALUE, obs_module_text("Warp.Detect.AnyValue"));
+	prop = obs_properties_add_bool(props, S_ANY_VALUE, obs_module_text("Warp.Detect.AnyValue"));
+	obs_property_set_modified_callback(prop, warp_detect_modified);
 
 	prop = obs_properties_add_list(props, S_ACTION, obs_module_text("Warp.Detect.Action"), OBS_COMBO_TYPE_LIST,
 				       OBS_COMBO_FORMAT_STRING);
