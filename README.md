@@ -52,8 +52,10 @@ A filter that watches a Warp Media or Warp Playlist source and triggers somethin
 
   Three cover the playback commands themselves, whether they came from the media controls, a hotkey or the websocket:
   * *Media Play*, when playback is started or resumed. On a playlist that has ended or been stopped, pressing play replays it, and counts here.
-  * *Media Pause*, when playback is paused. Stepping frames while playing pauses first, so it fires that too.
-  * *Media Restart*, when the file or playlist is restarted from the top — the media controls' restart button, the Warp Media *Restart* hotkey (including restarting on activate), the playlist's *Restart Current Video*, and the `Restart` and `RestartCurrent` websocket requests. Moving through a playlist with next, previous or *Back to First Video* is not a restart.
+  * *Media Pause*, when playback is paused.
+  * *Media Restart*, when the file or playlist is restarted from the top — the media controls' restart button, the Warp Media *Restart* hotkey, the playlist's *Restart Current Video*, and the `Restart` and `RestartCurrent` websocket requests. Moving through a playlist with next, previous or *Back to First Video* is not a restart.
+
+  These three are about commands, so they only fire for playback someone asked for. Playback the source drives by itself does not report one: a Warp Media source restarting as it goes on screen is not a *Media Restart*, and the pause a frame step does before it steps is not a *Media Pause*. Nor is a playlist reaching its next file a *Media Play*.
 
   The event list is built from the same tables the sources register their hotkeys from, so a preset speed or step size added to the sources turns up here as well.
 * **Then Trigger**:
@@ -73,7 +75,7 @@ warp_frames_stepped(ptr source, int frames)
 warp_media_action(ptr source, string action)
 ```
 
-`change` is `set`, `increased` or `decreased`; `frames` is negative when stepping backward; `action` is `play`, `pause` or `restart`. The speed a file starts at is not a change: a playlist moving to its next file resets the speed without emitting anything, and neither does a playlist reaching its next file on its own.
+`change` is `set`, `increased` or `decreased`; `frames` is negative when stepping backward; `action` is `play`, `pause` or `restart`. The speed a file starts at is not a change: a playlist moving to its next file resets the speed without emitting anything. `warp_media_action` reports commands, so playback a source drives by itself — restarting as it goes on screen, the pause a frame step does first, a playlist rolling on to its next file — emits nothing.
 
 ### obs-websocket control
 
