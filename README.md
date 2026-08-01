@@ -21,9 +21,14 @@ All hotkeys are per-source and are bound in OBS under Settings → Hotkeys. Ever
 A playlist source in the spirit of the VLC video source, built on the same playback engine as the Warp Media source, so every clip in the list gets the same replay controls:
 
 * **Playlist** of local media files, played in order or shuffled. Shuffled playlists are reshuffled on every pass.
-* **Automatic advance**: the next file starts as the current one is about to end. The transition is started one transition-duration early, so it finishes at the moment the current file runs out instead of freezing on its last frame. The next file is opened and parked on its first frame ahead of time, so the incoming half of the transition has picture from the start.
+* **Automatic advance**: the next file starts as the current one is about to end. An overlapping transition is started early enough that it finishes at the moment the current file runs out instead of freezing on its last frame. The next file is opened and parked on its first frame ahead of time, so the incoming half of the transition has picture from the start.
 * **Loop the playlist** when the last file ends.
-* **Transition between videos**, picked from every transition registered in OBS (Cut, Fade, Swipe, Slide, Fade to Color, Luma Wipe, and any transition plugins installed), with a configurable duration.
+* **Transition between videos**, picked from every transition registered in OBS (Cut, Fade, Swipe, Slide, Fade to Color, Luma Wipe, and any transition plugins installed), configured in the Transition group of the source settings:
+  * **Duration**, and **timing**: whether the transition overlaps the end of the file, so the file plays out in full underneath it, or runs once the file has played to its last frame.
+  * **Direction** and **swipe in** for Swipe and Slide.
+  * **Color** and **switch point** for Fade to Color.
+  * **Stinger video file**, **transition point** and hardware decoding for the Stinger transition. The playlist moves on a transition point early, so the swap behind the stinger still lands on the last frame of the outgoing file. A stinger video that has gone missing is reported to the OBS missing files dialog along with the playlist's own files.
+  * **Scaling** and **alignment**, for playlists whose files are not all the same size.
 * **Playback speed and frame stepping** for the file that is playing, with the same hotkeys as the Warp Media source. The speed resets to the configured Speed value whenever the playlist moves to another file.
 * **Hotkeys**: Next Video, Previous Video, Back to First Video, Restart Current Video, Clear Playlist, plus Play/Pause, Stop, the speed hotkeys, and the frame stepping hotkeys.
 
