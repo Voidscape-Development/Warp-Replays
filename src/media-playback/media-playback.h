@@ -25,6 +25,13 @@ typedef void (*mp_video_cb)(void *opaque, struct obs_source_frame *frame);
 typedef void (*mp_audio_cb)(void *opaque, struct obs_source_audio *audio);
 typedef void (*mp_stop_cb)(void *opaque);
 
+/* Warp addition: called once playback has resumed and the timestamps the media
+ * is handed out with have been re-anchored to the current clock, right after
+ * the frame that is on screen has been handed over again through v_seek_cb.
+ * Whatever the frontend times playback against has to be brought to the same
+ * anchor, or the offset the pause introduced stays for the rest of the file. */
+typedef void (*mp_resume_cb)(void *opaque);
+
 struct mp_media_info {
 	void *opaque;
 
@@ -33,6 +40,7 @@ struct mp_media_info {
 	mp_video_cb v_seek_cb;
 	mp_audio_cb a_cb;
 	mp_stop_cb stop_cb;
+	mp_resume_cb resume_cb;
 
 	const char *path;
 	const char *format;

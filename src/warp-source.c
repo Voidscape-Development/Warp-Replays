@@ -296,6 +296,19 @@ static void get_audio(void *opaque, struct obs_source_audio *a)
 		FF_BLOG(LOG_INFO, "Reconnected.");
 }
 
+/* Playback has resumed and its timestamps have been re-anchored to the current
+ * clock; the frame seek_frame() was just handed is the one the source times
+ * everything that follows against. Bring the audio clock to the same anchor:
+ * it is timed against the frames rather than against a sample of its own, so
+ * without this the audio keeps the offset the pause introduced for the rest of
+ * the file. */
+static void media_resumed(void *opaque)
+{
+	struct warp_source *s = opaque;
+
+	obs_source_show_preloaded_video(s->source);
+}
+
 static void media_stopped(void *opaque)
 {
 	struct warp_source *s = opaque;
@@ -322,6 +335,7 @@ static void warp_source_open(struct warp_source *s)
 			.v_seek_cb = seek_frame,
 			.a_cb = get_audio,
 			.stop_cb = media_stopped,
+			.resume_cb = media_resumed,
 			.path = s->input,
 			.format = s->input_format,
 			.buffering = s->buffering_mb * 1024 * 1024,

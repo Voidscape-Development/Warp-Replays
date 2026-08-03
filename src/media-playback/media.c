@@ -743,6 +743,40 @@ static void reset_ts(mp_media_t *m)
 	m->next_ns = 0;
 }
 
+/* Warp addition: hand the frame that is on screen over again once playback has
+ * been re-anchored to the current clock.
+ *
+ * reset_ts() moves the anchor the timestamps are built from to the current
+ * wall clock, so the first frame handed out after a resume can be a long way
+ * ahead of the last one the frontend saw: everything the file spent paused,
+ * on top of the position it was paused at. libobs only treats a jump of more
+ * than two seconds as a clock that has been invalidated; anything short of
+ * that it takes at face value and holds the frames back until its own clock
+ * has caught up with them, which stalls playback for as long as the jump
+ * lasted. Handing the frame that is ready over under the new anchor closes the
+ * gap: it is the frame that is already being displayed, so nothing changes on
+ * screen, but everything that follows it is timed from there. */
+static void mp_media_resume(mp_media_t *m)
+{
+	bool seeking;
+
+	if (!m->has_video || !m->v.frame_ready || !m->v_seek_cb)
+		return;
+
+	seeking = m->seek_next_ts;
+
+	/* the seek callback is the one that hands a frame over as the one the
+	 * frames that follow are timed against */
+	m->seek_next_ts = true;
+	mp_media_next_video(m, true);
+	m->seek_next_ts = seeking;
+
+	/* the audio is timed against that same frame, and has nothing of its
+	 * own to be handed over with */
+	if (m->resume_cb)
+		m->resume_cb(m->opaque);
+}
+
 /* Warp addition: apply a speed change without restarting playback.
  * Decoded frame timestamps are scaled by 100/speed at decode time
  * (see mp_decode_next), so rescale the pending decoder state to the
@@ -1024,6 +1058,7 @@ static inline bool mp_media_thread(mp_media_t *m)
 
 		if (reset_time) {
 			reset_ts(m);
+			mp_media_resume(m);
 			continue;
 		}
 
@@ -1108,6 +1143,7 @@ bool mp_media_init(mp_media_t *media, const struct mp_media_info *info)
 	media->v_cb = info->v_cb;
 	media->a_cb = info->a_cb;
 	media->stop_cb = info->stop_cb;
+	media->resume_cb = info->resume_cb;
 	media->ffmpeg_options = info->ffmpeg_options;
 	media->v_seek_cb = info->v_seek_cb;
 	media->v_preload_cb = info->v_preload_cb;
