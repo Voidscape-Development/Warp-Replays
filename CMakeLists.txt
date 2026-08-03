@@ -29,6 +29,7 @@ target_link_libraries(
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
+  target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE WARP_HAVE_FRONTEND_API)
 endif()
 
 if(ENABLE_QT)

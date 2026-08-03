@@ -27,6 +27,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <media-playback/media-playback.h>
 
+#ifdef WARP_HAVE_FRONTEND_API
+/* the transition's own properties are shown in the window OBS opens for the
+ * transitions in its own list */
+#include <obs-frontend-api.h>
+#endif
+
 #include "warp-events.h"
 
 #define WARP_PL_LOG(level, format, ...) \
@@ -52,13 +58,23 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 /* where a stinger swaps the incoming file in by default, in milliseconds */
 #define WARP_PL_DEFAULT_STINGER_MS 1000
 
-/* libobs ids of the transitions that have settings of their own; every other
- * registered transition is offered as well, it just has nothing to adjust */
+/* libobs ids of the two transitions the playlist has to know something about:
+ * a cut is instant, and a stinger swaps the incoming file in partway through
+ * its video rather than at the end. What either of them, or any other
+ * transition, is configured with is left to the transition itself. */
 #define WARP_PL_TR_CUT "cut_transition"
+#define WARP_PL_TR_STINGER "obs_stinger_transition"
+
+/* the transitions the playlist used to keep settings of its own for, read once
+ * more when a playlist saved with them is loaded */
 #define WARP_PL_TR_SWIPE "swipe_transition"
 #define WARP_PL_TR_SLIDE "slide_transition"
 #define WARP_PL_TR_FADE_TO_COLOR "fade_to_color_transition"
-#define WARP_PL_TR_STINGER "obs_stinger_transition"
+
+/* tp_type values of the stinger transition: its transition point is given
+ * either in milliseconds or in frames of the stinger video */
+#define WARP_PL_STINGER_TP_TIME 0
+#define WARP_PL_STINGER_TP_FRAME 1
 
 /* transition_timing values: overlap the end of the file, or run once it is
  * over */
@@ -145,11 +161,20 @@ struct warp_playlist_source {
 	char *transition_id;
 	/* transition the settings ask for, picked up by the next tick */
 	char *pending_transition_id;
-	/* settings for the transition itself, handed to it by the next tick,
-	 * and the ones it is running with, to tell a real change from an
-	 * unrelated property being edited */
+	/* settings for the transition itself, handed to it by the next tick */
 	obs_data_t *pending_transition_settings;
-	char *transition_settings_json;
+	/* What every transition that has been used is configured with, keyed by
+	 * libobs id. A transition is configured through its own properties,
+	 * which write to the transition rather than to this source, so this is
+	 * read back from the one that is running rather than the other way
+	 * round. Keeping the ones that are not running means picking a
+	 * transition back up brings its settings with it. */
+	obs_data_t *transition_store;
+	/* the store as it last stood in the source settings, to tell settings
+	 * being loaded, or set from the outside, from the copy this source
+	 * wrote there itself */
+	char *transition_store_json;
+	bool transition_store_loaded;
 	/* alignment and scaling wait for the next tick along with them */
 	bool pending_transition_layout;
 	uint32_t transition_alignment;
@@ -803,24 +828,208 @@ static void warp_pl_open_preload(struct warp_playlist_source *s, size_t order_po
 /* ------------------------------------------------------------------------- */
 /* transition */
 
-/* The settings a transition of its own kind is configured with; the ones that
- * have nothing to adjust are handed an empty set and keep their defaults. */
-static obs_data_t *warp_pl_build_transition_settings(const char *id, obs_data_t *settings)
+/* whether 'data' holds nothing at all */
+static bool warp_pl_data_empty(obs_data_t *data)
+{
+	obs_data_item_t *first = obs_data_first(data);
+	bool empty = !first;
+
+	obs_data_item_release(&first);
+
+	return empty;
+}
+
+/* a copy of 'data' that nothing else holds on to, or NULL for NULL */
+static obs_data_t *warp_pl_data_copy(obs_data_t *data)
+{
+	obs_data_t *copy;
+
+	if (!data)
+		return NULL;
+
+	copy = obs_data_create();
+	obs_data_apply(copy, data);
+
+	return copy;
+}
+
+/* The settings the playlist used to keep flat in its own, one property per
+ * transition it knew about. They are moved into the store the first time a
+ * playlist saved with them is loaded, so a transition that was set up before
+ * the transitions were given their own properties stays set up. The properties
+ * themselves are left where they are, so going back to an older build finds
+ * them. Returns NULL when none of them were ever set. */
+static obs_data_t *warp_pl_legacy_transition_settings(const char *id, obs_data_t *settings)
 {
 	obs_data_t *tr_settings = obs_data_create();
 
 	if (strcmp(id, WARP_PL_TR_SWIPE) == 0 || strcmp(id, WARP_PL_TR_SLIDE) == 0) {
-		obs_data_set_string(tr_settings, "direction", obs_data_get_string(settings, "transition_direction"));
-		obs_data_set_bool(tr_settings, "swipe_in", obs_data_get_bool(settings, "transition_swipe_in"));
+		if (obs_data_has_user_value(settings, "transition_direction"))
+			obs_data_set_string(tr_settings, "direction",
+					    obs_data_get_string(settings, "transition_direction"));
+
+		if (obs_data_has_user_value(settings, "transition_swipe_in"))
+			obs_data_set_bool(tr_settings, "swipe_in", obs_data_get_bool(settings, "transition_swipe_in"));
 	} else if (strcmp(id, WARP_PL_TR_FADE_TO_COLOR) == 0) {
-		obs_data_set_int(tr_settings, "color", obs_data_get_int(settings, "transition_color"));
-		obs_data_set_int(tr_settings, "switch_point", obs_data_get_int(settings, "transition_switch_point"));
+		if (obs_data_has_user_value(settings, "transition_color"))
+			obs_data_set_int(tr_settings, "color", obs_data_get_int(settings, "transition_color"));
+
+		if (obs_data_has_user_value(settings, "transition_switch_point"))
+			obs_data_set_int(tr_settings, "switch_point",
+					 obs_data_get_int(settings, "transition_switch_point"));
 	} else if (strcmp(id, WARP_PL_TR_STINGER) == 0) {
-		obs_data_set_string(tr_settings, "path", obs_data_get_string(settings, "stinger_path"));
-		obs_data_set_int(tr_settings, "tp_type", 0 /* transition point in milliseconds */);
-		obs_data_set_int(tr_settings, "transition_point",
-				 obs_data_get_int(settings, "stinger_transition_point"));
-		obs_data_set_bool(tr_settings, "hw_decode", obs_data_get_bool(settings, "stinger_hw_decode"));
+		if (obs_data_has_user_value(settings, "stinger_path"))
+			obs_data_set_string(tr_settings, "path", obs_data_get_string(settings, "stinger_path"));
+
+		if (obs_data_has_user_value(settings, "stinger_transition_point")) {
+			obs_data_set_int(tr_settings, "tp_type", WARP_PL_STINGER_TP_TIME);
+			obs_data_set_int(tr_settings, "transition_point",
+					 obs_data_get_int(settings, "stinger_transition_point"));
+		}
+
+		if (obs_data_has_user_value(settings, "stinger_hw_decode"))
+			obs_data_set_bool(tr_settings, "hw_decode", obs_data_get_bool(settings, "stinger_hw_decode"));
+	}
+
+	if (warp_pl_data_empty(tr_settings)) {
+		obs_data_release(tr_settings);
+		return NULL;
+	}
+
+	return tr_settings;
+}
+
+/* How far into a stinger video the incoming file is swapped in, in
+ * milliseconds. The transition takes the point either in milliseconds or in
+ * frames; a frame count is turned into a time with the OBS frame rate, which is
+ * the one a stinger cut for the stream runs at. */
+static uint32_t warp_pl_stinger_point_ms(obs_data_t *tr_settings)
+{
+	struct obs_video_info ovi;
+	int64_t point;
+
+	if (!tr_settings)
+		return 0;
+
+	point = obs_data_get_int(tr_settings, "transition_point");
+
+	if (point <= 0)
+		return 0;
+
+	if (obs_data_get_int(tr_settings, "tp_type") != WARP_PL_STINGER_TP_FRAME)
+		return (uint32_t)point;
+
+	if (!obs_get_video_info(&ovi) || !ovi.fps_num)
+		return 0;
+
+	return (uint32_t)(point * 1000 * ovi.fps_den / ovi.fps_num);
+}
+
+/* Reads back what the transition that is running is configured with: its own
+ * properties write to the transition itself, so the store, and with it the
+ * settings the source is saved with, only catch up when they are read off it.
+ * Expects s->mutex NOT to be held. */
+static void warp_pl_capture_transition_settings(struct warp_playlist_source *s)
+{
+	obs_source_t *tr = warp_pl_get_transition(s);
+	obs_data_t *live;
+	obs_data_t *copy;
+	char *id;
+
+	if (!tr)
+		return;
+
+	pthread_mutex_lock(&s->mutex);
+	id = bstrdup(s->transition_id);
+	pthread_mutex_unlock(&s->mutex);
+
+	if (id) {
+		live = obs_source_get_settings(tr);
+		copy = warp_pl_data_copy(live);
+
+		pthread_mutex_lock(&s->mutex);
+
+		/* the transitions that have nothing to configure are left out
+		 * of the settings the source is saved with entirely */
+		if (!warp_pl_data_empty(copy))
+			obs_data_set_obj(s->transition_store, id, copy);
+
+		/* where a stinger swaps the incoming file in is one of its own
+		 * settings, so the playlist picks it up along with them */
+		if (strcmp(id, WARP_PL_TR_STINGER) == 0)
+			s->stinger_point_ms = warp_pl_stinger_point_ms(copy);
+
+		pthread_mutex_unlock(&s->mutex);
+
+		obs_data_release(copy);
+		obs_data_release(live);
+		bfree(id);
+	}
+
+	obs_source_release(tr);
+}
+
+/* Takes the transition settings the source was saved, or set from the outside,
+ * with over the store, and returns whether it did, so that the transition that
+ * is running is handed them. The store is where the transitions' own properties
+ * end up, so the copy this source wrote to the settings itself is left alone.
+ * Expects s->mutex NOT to be held. */
+static bool warp_pl_load_transition_store(struct warp_playlist_source *s, obs_data_t *settings, const char *id)
+{
+	obs_data_t *stored = obs_data_get_obj(settings, "transition_settings");
+	const char *json = stored ? obs_data_get_json(stored) : NULL;
+	bool loaded = false;
+
+	pthread_mutex_lock(&s->mutex);
+
+	if (json && (!s->transition_store_json || strcmp(s->transition_store_json, json) != 0)) {
+		obs_data_t *store = obs_data_create_from_json(json);
+
+		if (store) {
+			obs_data_release(s->transition_store);
+			s->transition_store = store;
+
+			bfree(s->transition_store_json);
+			s->transition_store_json = bstrdup(json);
+
+			loaded = true;
+		}
+	} else if (!stored && !s->transition_store_loaded) {
+		obs_data_t *legacy = warp_pl_legacy_transition_settings(id, settings);
+
+		if (legacy) {
+			obs_data_set_obj(s->transition_store, id, legacy);
+			obs_data_release(legacy);
+
+			loaded = true;
+		}
+	}
+
+	s->transition_store_loaded = true;
+
+	pthread_mutex_unlock(&s->mutex);
+
+	obs_data_release(stored);
+
+	return loaded;
+}
+
+/* The settings a transition is created with: the ones it was last configured
+ * with, or, for a stinger that has never been configured, a transition point
+ * that leaves room for the swap behind it rather than the zero it would
+ * otherwise start out at. The caller owns the reference. Expects s->mutex to be
+ * held. */
+static obs_data_t *warp_pl_transition_settings(struct warp_playlist_source *s, const char *id)
+{
+	obs_data_t *tr_settings = obs_data_get_obj(s->transition_store, id);
+
+	if (!tr_settings && strcmp(id, WARP_PL_TR_STINGER) == 0) {
+		tr_settings = obs_data_create();
+
+		obs_data_set_int(tr_settings, "tp_type", WARP_PL_STINGER_TP_TIME);
+		obs_data_set_int(tr_settings, "transition_point", WARP_PL_DEFAULT_STINGER_MS);
+
+		obs_data_set_obj(s->transition_store, id, tr_settings);
 	}
 
 	return tr_settings;
@@ -974,12 +1183,6 @@ static void warp_playlist_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "transition", WARP_PL_DEFAULT_TRANSITION);
 	obs_data_set_default_int(settings, "transition_duration", WARP_PL_DEFAULT_TRANSITION_MS);
 	obs_data_set_default_string(settings, "transition_timing", WARP_PL_TIMING_OVERLAP);
-	obs_data_set_default_string(settings, "transition_direction", "left");
-	obs_data_set_default_bool(settings, "transition_swipe_in", false);
-	obs_data_set_default_int(settings, "transition_color", 0xFF000000);
-	obs_data_set_default_int(settings, "transition_switch_point", 50);
-	obs_data_set_default_int(settings, "stinger_transition_point", WARP_PL_DEFAULT_STINGER_MS);
-	obs_data_set_default_bool(settings, "stinger_hw_decode", true);
 	obs_data_set_default_string(settings, "transition_scale", WARP_PL_SCALE_FIT);
 	obs_data_set_default_string(settings, "transition_alignment", "center");
 	obs_data_set_default_int(settings, "speed_percent", 100);
@@ -993,38 +1196,56 @@ static const char *media_filter =
 static const char *video_filter = " (*.mp4 *.m4v *.ts *.mov *.mxf *.flv *.mkv *.avi *.gif *.webm);;";
 static const char *audio_filter = " (*.mp3 *.aac *.ogg *.wav);;";
 
-/* Only the settings the transition that is picked knows about are shown. The
- * transitions that are not in the curated list have none of their own, so they
- * are left with the duration and the timing. */
+/* Only what the playlist puts around the transition is shown here; what the
+ * transition itself is configured with belongs to the transition. */
 static bool warp_pl_transition_changed(obs_properties_t *props, obs_property_t *prop, obs_data_t *settings)
 {
 	const char *id = obs_data_get_string(settings, "transition");
 	bool is_cut = strcmp(id, WARP_PL_TR_CUT) == 0;
-	bool is_swipe = strcmp(id, WARP_PL_TR_SWIPE) == 0;
 	bool is_stinger = strcmp(id, WARP_PL_TR_STINGER) == 0;
-	bool directional = is_swipe || strcmp(id, WARP_PL_TR_SLIDE) == 0;
-	bool to_color = strcmp(id, WARP_PL_TR_FADE_TO_COLOR) == 0;
 
 	UNUSED_PARAMETER(prop);
 
 	/* a cut is instant, and a stinger runs for as long as its video */
 	obs_property_set_visible(obs_properties_get(props, "transition_duration"), !is_cut && !is_stinger);
 	obs_property_set_visible(obs_properties_get(props, "transition_timing"), !is_cut);
-	obs_property_set_visible(obs_properties_get(props, "transition_direction"), directional);
-	obs_property_set_visible(obs_properties_get(props, "transition_swipe_in"), is_swipe);
-	obs_property_set_visible(obs_properties_get(props, "transition_color"), to_color);
-	obs_property_set_visible(obs_properties_get(props, "transition_switch_point"), to_color);
-	obs_property_set_visible(obs_properties_get(props, "stinger_path"), is_stinger);
-	obs_property_set_visible(obs_properties_get(props, "stinger_transition_point"), is_stinger);
-	obs_property_set_visible(obs_properties_get(props, "stinger_hw_decode"), is_stinger);
 
 	return true;
 }
 
-static obs_properties_t *warp_pl_transition_properties(void)
+#ifdef WARP_HAVE_FRONTEND_API
+/* Opens the properties of the transition that is running, the same window OBS
+ * opens for the transitions in its own list, preview and all. What is changed
+ * there is applied to the transition on the spot, and read back into the
+ * settings this source is saved with. */
+static bool warp_pl_transition_props_clicked(obs_properties_t *props, obs_property_t *prop, void *data)
+{
+	struct warp_playlist_source *s = data;
+	obs_source_t *transition;
+
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(prop);
+
+	/* no source of its own to configure: the properties were asked for by
+	 * id rather than for a playlist that exists */
+	if (!s)
+		return false;
+
+	transition = warp_pl_get_transition(s);
+
+	if (!transition)
+		return false;
+
+	obs_frontend_open_source_properties(transition);
+	obs_source_release(transition);
+
+	return false;
+}
+#endif
+
+static obs_properties_t *warp_pl_transition_properties(struct warp_playlist_source *s)
 {
 	obs_properties_t *props = obs_properties_create();
-	struct dstr filter = {0};
 	obs_property_t *prop;
 	const char *id;
 
@@ -1039,6 +1260,15 @@ static obs_properties_t *warp_pl_transition_properties(void)
 
 	obs_property_set_modified_callback(prop, warp_pl_transition_changed);
 
+#ifdef WARP_HAVE_FRONTEND_API
+	prop = obs_properties_add_button2(props, "transition_properties",
+					  obs_module_text("Warp.Playlist.Transition.Properties"),
+					  warp_pl_transition_props_clicked, s);
+	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.Transition.Properties.Desc"));
+#else
+	UNUSED_PARAMETER(s);
+#endif
+
 	prop = obs_properties_add_int_slider(props, "transition_duration",
 					     obs_module_text("Warp.Playlist.TransitionDuration"), 0, 10000, 50);
 	obs_property_int_set_suffix(prop, " ms");
@@ -1050,40 +1280,6 @@ static obs_properties_t *warp_pl_transition_properties(void)
 	obs_property_list_add_string(prop, obs_module_text("Warp.Playlist.TransitionTiming.After"),
 				     WARP_PL_TIMING_AFTER);
 	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.TransitionTiming.Desc"));
-
-	prop = obs_properties_add_list(props, "transition_direction",
-				       obs_module_text("Warp.Playlist.Transition.Direction"), OBS_COMBO_TYPE_LIST,
-				       OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(prop, obs_module_text("Warp.Playlist.Direction.Left"), "left");
-	obs_property_list_add_string(prop, obs_module_text("Warp.Playlist.Direction.Right"), "right");
-	obs_property_list_add_string(prop, obs_module_text("Warp.Playlist.Direction.Up"), "up");
-	obs_property_list_add_string(prop, obs_module_text("Warp.Playlist.Direction.Down"), "down");
-
-	obs_properties_add_bool(props, "transition_swipe_in", obs_module_text("Warp.Playlist.Transition.SwipeIn"));
-
-	obs_properties_add_color(props, "transition_color", obs_module_text("Warp.Playlist.Transition.Color"));
-	prop = obs_properties_add_int_slider(props, "transition_switch_point",
-					     obs_module_text("Warp.Playlist.Transition.SwitchPoint"), 0, 100, 1);
-	obs_property_int_set_suffix(prop, " %");
-
-	dstr_copy(&filter, obs_module_text("Warp.FileFilter.Video"));
-	dstr_cat(&filter, video_filter);
-	dstr_cat(&filter, obs_module_text("Warp.FileFilter.All"));
-	dstr_cat(&filter, " (*.*)");
-
-	obs_properties_add_path(props, "stinger_path", obs_module_text("Warp.Playlist.Transition.Stinger.Path"),
-				OBS_PATH_FILE, filter.array, NULL);
-	dstr_free(&filter);
-
-	prop = obs_properties_add_int(props, "stinger_transition_point",
-				      obs_module_text("Warp.Playlist.Transition.Stinger.TransitionPoint"), 0, 120000,
-				      50);
-	obs_property_int_set_suffix(prop, " ms");
-	obs_property_set_long_description(prop,
-					  obs_module_text("Warp.Playlist.Transition.Stinger.TransitionPoint.Desc"));
-
-	obs_properties_add_bool(props, "stinger_hw_decode",
-				obs_module_text("Warp.Playlist.Transition.Stinger.HardwareDecode"));
 
 	prop = obs_properties_add_list(props, "transition_scale", obs_module_text("Warp.Playlist.Transition.Scale"),
 				       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
@@ -1156,7 +1352,7 @@ static obs_properties_t *warp_playlist_getproperties(void *data)
 	obs_properties_add_bool(props, "loop_playlist", obs_module_text("Warp.Playlist.Loop"));
 
 	obs_properties_add_group(props, "transition_group", obs_module_text("Warp.Playlist.Group.Transition"),
-				 OBS_GROUP_NORMAL, warp_pl_transition_properties());
+				 OBS_GROUP_NORMAL, warp_pl_transition_properties(s));
 
 	prop = obs_properties_add_int_slider(props, "speed_percent", obs_module_text("Warp.Video.Speed"), MP_SPEED_MIN,
 					     MP_SPEED_MAX, 1);
@@ -1243,9 +1439,13 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 	if (speed < MP_SPEED_MIN || speed > MP_SPEED_MAX)
 		speed = 100;
 
-	/* what the transition itself is configured with; the tick is what hands
-	 * it over, all this has to do is have it ready */
-	obs_data_t *tr_settings = warp_pl_build_transition_settings(transition_id, settings);
+	/* the transition's own properties write to the transition rather than
+	 * to these settings, so what it is running with is read back before the
+	 * settings it was saved with are looked at */
+	warp_pl_capture_transition_settings(s);
+
+	bool store_loaded = warp_pl_load_transition_store(s, settings, transition_id);
+
 	uint32_t alignment = warp_pl_alignment_from_string(obs_data_get_string(settings, "transition_alignment"));
 	enum obs_transition_scale_type scale =
 		warp_pl_scale_from_string(obs_data_get_string(settings, "transition_scale"));
@@ -1271,7 +1471,6 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 	s->auto_advance = obs_data_get_bool(settings, "auto_advance");
 	s->loop_playlist = obs_data_get_bool(settings, "loop_playlist");
 	s->transition_ms = (uint32_t)obs_data_get_int(settings, "transition_duration");
-	s->stinger_point_ms = (uint32_t)obs_data_get_int(settings, "stinger_transition_point");
 	s->transition_is_cut = strcmp(transition_id, WARP_PL_TR_CUT) == 0;
 	s->transition_is_stinger = strcmp(transition_id, WARP_PL_TR_STINGER) == 0;
 	s->transition_overlap = overlap;
@@ -1331,22 +1530,22 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 			s->pending_transition_id = bstrdup(transition_id);
 	}
 
-	/* A transition is only handed its settings when they really did change:
-	 * a stinger reloads its video every time it is updated, which is not
-	 * something an unrelated property being edited should set off. */
-	const char *tr_json = obs_data_get_json(tr_settings);
-	bool tr_settings_changed = !s->transition_settings_json || !tr_json ||
-				   strcmp(s->transition_settings_json, tr_json) != 0;
+	/* What the transition is configured with only has to be handed over
+	 * when a transition is about to be created, or when settings were just
+	 * loaded: everything else that configures one goes through the
+	 * transition's own properties, which apply to it directly. A stinger
+	 * reloads its video every time it is updated, which is not something an
+	 * unrelated property being edited should set off. */
+	obs_data_t *tr_settings = warp_pl_transition_settings(s, transition_id);
 
-	if (type_changed || tr_settings_changed) {
-		bfree(s->transition_settings_json);
-		s->transition_settings_json = bstrdup(tr_json);
+	s->stinger_point_ms = s->transition_is_stinger ? warp_pl_stinger_point_ms(tr_settings) : 0;
 
+	if (type_changed || store_loaded) {
 		obs_data_release(s->pending_transition_settings);
-		s->pending_transition_settings = tr_settings;
-	} else {
-		obs_data_release(tr_settings);
+		s->pending_transition_settings = warp_pl_data_copy(tr_settings);
 	}
+
+	obs_data_release(tr_settings);
 
 	if (s->transition_alignment != alignment || s->transition_scale != scale)
 		s->pending_transition_layout = true;
@@ -1374,6 +1573,33 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 		warp_signal_speed_changed(s->source, speed_now, prev_speed, WARP_SPEED_CHANGE_SET);
 
 	bfree(playing);
+}
+
+/* The transitions are created and dropped as the type is picked, so what they
+ * are configured with is written out with the playlist rather than left in the
+ * transition that happens to be running. */
+static void warp_playlist_save(void *data, obs_data_t *settings)
+{
+	struct warp_playlist_source *s = data;
+	obs_data_t *store = obs_data_create();
+
+	/* the transition's own properties write to the transition, so what it
+	 * is running with is read back before it is written out */
+	warp_pl_capture_transition_settings(s);
+
+	pthread_mutex_lock(&s->mutex);
+
+	obs_data_apply(store, s->transition_store);
+
+	/* what the settings are left holding, so that the next update tells
+	 * settings being loaded from the copy written here */
+	bfree(s->transition_store_json);
+	s->transition_store_json = bstrdup(obs_data_get_json(store));
+
+	pthread_mutex_unlock(&s->mutex);
+
+	obs_data_set_obj(settings, "transition_settings", store);
+	obs_data_release(store);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1834,7 +2060,7 @@ static void *warp_playlist_create(obs_data_t *settings, obs_source_t *source)
 	/* s->speed is left at zero: the update below fills it in, and a speed
 	 * that was never played at is not a change to report */
 	s->transition_ms = WARP_PL_DEFAULT_TRANSITION_MS;
-	s->stinger_point_ms = WARP_PL_DEFAULT_STINGER_MS;
+	s->transition_store = obs_data_create();
 	s->transition_overlap = true;
 	s->transition_alignment = OBS_ALIGN_CENTER;
 	s->transition_scale = OBS_TRANSITION_SCALE_ASPECT;
@@ -1842,6 +2068,7 @@ static void *warp_playlist_create(obs_data_t *settings, obs_source_t *source)
 
 	if (pthread_mutex_init(&s->mutex, NULL)) {
 		blog(LOG_ERROR, "[Warp Playlist]: failed to initialize mutex");
+		obs_data_release(s->transition_store);
 		bfree(s);
 		return NULL;
 	}
@@ -1902,7 +2129,9 @@ static void warp_playlist_destroy(void *data)
 
 	obs_data_release(s->pending_transition_settings);
 	s->pending_transition_settings = NULL;
-	bfree(s->transition_settings_json);
+	obs_data_release(s->transition_store);
+	s->transition_store = NULL;
+	bfree(s->transition_store_json);
 
 	pthread_mutex_unlock(&s->mutex);
 
@@ -2333,24 +2562,58 @@ static void missing_file_callback(void *src, const char *new_path, void *data)
 	obs_data_release(settings);
 }
 
+/* 'data' is the setting of the stinger transition the file was found under */
 static void missing_stinger_callback(void *src, const char *new_path, void *data)
 {
 	struct warp_playlist_source *s = src;
-	obs_data_t *settings = obs_source_get_settings(s->source);
+	const char *key = data;
+	obs_data_t *fix = obs_data_create();
+	obs_data_t *stored;
 
-	UNUSED_PARAMETER(data);
+	obs_data_set_string(fix, key, new_path);
 
-	obs_data_set_string(settings, "stinger_path", new_path);
-	obs_source_update(s->source, settings);
-	obs_data_release(settings);
+	pthread_mutex_lock(&s->mutex);
+
+	/* into the settings the stinger is saved with, and to the stinger that
+	 * is running, which the tick hands it to */
+	stored = obs_data_get_obj(s->transition_store, WARP_PL_TR_STINGER);
+
+	if (stored) {
+		obs_data_set_string(stored, key, new_path);
+		obs_data_release(stored);
+	}
+
+	if (s->pending_transition_settings) {
+		obs_data_apply(s->pending_transition_settings, fix);
+		obs_data_release(fix);
+	} else {
+		s->pending_transition_settings = fix;
+	}
+
+	pthread_mutex_unlock(&s->mutex);
+}
+
+/* reports the file 'key' of the stinger settings when it has gone missing */
+static void warp_pl_add_missing_stinger(struct warp_playlist_source *s, obs_missing_files_t *files,
+					obs_data_t *tr_settings, const char *key)
+{
+	const char *path = obs_data_get_string(tr_settings, key);
+	obs_missing_file_t *file;
+
+	if (!path || !*path || os_file_exists(path))
+		return;
+
+	file = obs_missing_file_create(path, missing_stinger_callback, OBS_MISSING_FILE_SOURCE, s->source, (void *)key);
+
+	obs_missing_files_add_file(files, file);
 }
 
 static obs_missing_files_t *warp_playlist_missingfiles(void *data)
 {
 	struct warp_playlist_source *s = data;
 	obs_missing_files_t *files = obs_missing_files_create();
+	obs_data_t *tr_settings = NULL;
 	obs_data_t *settings;
-	const char *stinger;
 
 	pthread_mutex_lock(&s->mutex);
 
@@ -2367,20 +2630,29 @@ static obs_missing_files_t *warp_playlist_missingfiles(void *data)
 
 	pthread_mutex_unlock(&s->mutex);
 
-	/* the stinger video is a file the playlist plays as much as the ones in
-	 * the list, so a missing one is worth reporting too */
+	/* The stinger's videos are files the playlist plays as much as the ones
+	 * in the list, so missing ones are worth reporting too. The transition
+	 * belongs to this source alone, so nothing else reports them. */
+	warp_pl_capture_transition_settings(s);
+
 	settings = obs_source_get_settings(s->source);
-	stinger = obs_data_get_string(settings, "stinger_path");
 
-	if (strcmp(obs_data_get_string(settings, "transition"), WARP_PL_TR_STINGER) == 0 && stinger && *stinger &&
-	    !os_file_exists(stinger)) {
-		obs_missing_file_t *file = obs_missing_file_create(stinger, missing_stinger_callback,
-								   OBS_MISSING_FILE_SOURCE, s->source, NULL);
-
-		obs_missing_files_add_file(files, file);
+	if (strcmp(obs_data_get_string(settings, "transition"), WARP_PL_TR_STINGER) == 0) {
+		pthread_mutex_lock(&s->mutex);
+		tr_settings = obs_data_get_obj(s->transition_store, WARP_PL_TR_STINGER);
+		pthread_mutex_unlock(&s->mutex);
 	}
 
 	obs_data_release(settings);
+
+	if (tr_settings) {
+		warp_pl_add_missing_stinger(s, files, tr_settings, "path");
+
+		if (obs_data_get_bool(tr_settings, "track_matte_enabled"))
+			warp_pl_add_missing_stinger(s, files, tr_settings, "track_matte_path");
+
+		obs_data_release(tr_settings);
+	}
 
 	return files;
 }
@@ -2401,6 +2673,7 @@ struct obs_source_info warp_playlist_source_info = {
 	.get_defaults = warp_playlist_defaults,
 	.get_properties = warp_playlist_getproperties,
 	.update = warp_playlist_update,
+	.save = warp_playlist_save,
 	.activate = warp_playlist_activate,
 	.deactivate = warp_playlist_deactivate,
 	.video_render = warp_playlist_video_render,
