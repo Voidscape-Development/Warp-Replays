@@ -721,8 +721,11 @@ static void warp_pl_start(struct warp_playlist_source *s, size_t order_pos, bool
 	if (at)
 		path = bstrdup(at);
 
-	/* reuse the preloaded item when it is the one being played */
-	if (path && s->preloaded && s->preloaded_path && strcmp(s->preloaded_path, path) == 0) {
+	/* Reuse the preloaded item when it is the one being played and it has
+	 * been parked at its first frame. One that has not been armed yet is
+	 * still running from wherever it got to while it was being opened, so
+	 * the file is opened again rather than played from partway in. */
+	if (path && s->preloaded && s->preload_armed && s->preloaded_path && strcmp(s->preloaded_path, path) == 0) {
 		item = s->preloaded;
 		s->preloaded = NULL;
 	}

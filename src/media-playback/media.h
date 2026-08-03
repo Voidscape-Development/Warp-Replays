@@ -54,6 +54,7 @@ struct mp_media {
 	mp_stop_cb stop_cb;
 	mp_video_cb v_cb;
 	mp_audio_cb a_cb;
+	mp_resume_cb resume_cb;
 	void *opaque;
 
 	char *path;
