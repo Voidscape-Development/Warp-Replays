@@ -141,6 +141,29 @@ A Warp Playlist source also reports `playlistIndex` (-1 when nothing is playing)
 
 The requests do exactly what the matching hotkeys do, including emitting the signals above, so a Warp Detection filter reacts to a speed change driven over the websocket the same way it reacts to the hotkey. The difference is that a hotkey only applies to a source that is on screen, because the operator is pressing it at whatever is in front of them, while a request names the source it means and is carried out whether or not it is being shown. `Restart` on a Warp Media source is the exception: the source only restarts playback while it is being shown, over the websocket as from the hotkey.
 
+Three more work on a [Warp flow](#warp-flows) rather than on a source, and name it with `flowName` (or `flowId`) instead of `sourceName`:
+
+| Request | What it does |
+| --- | --- |
+| `SaveToFlow` | Saves the replay buffer and keeps the clip for that flow, exactly as its Save Replay hotkey does. Answers with an error when the replay buffer is not running |
+| `AddLastReplayToFlow` | Puts the replay that was saved last in that flow, as its Add Last Saved Clip hotkey does |
+| `GetFlows` | Changes nothing, and answers with every flow in the scene collection |
+
+They answer with the flow they applied to, and how much is in the playlist it feeds:
+
+```json
+{
+  "success": true,
+  "flowId": "flow_…",
+  "flowName": "Match Replays",
+  "flowKind": "replay",
+  "targetName": "Replay Feed",
+  "clipCount": 4
+}
+```
+
+`GetFlows` answers with `flows`, an array of those same objects, and takes no fields.
+
 The playlist actions that have no counterpart in OBS's media control API are proc handlers on the source, so scripts can call them too, and so can anything else that can reach the source:
 
 ```
@@ -152,9 +175,41 @@ warp_step_frames(int frames)       warp_playlist_status(out int index, out int c
 
 The first four are on the Warp Media source as well. Play, pause, stop, restart, next, previous and seeking are OBS's own media controls on both sources, so obs-websocket's built-in `TriggerMediaInputAction`, `SetMediaInputCursor` and `GetMediaInputStatus` requests work on them too.
 
-### Warp window
+### Warp flows
 
-A Warp entry in the Tools menu opens the Warp window (currently an empty placeholder for upcoming replay tooling).
+A **Warp** entry in the Tools menu opens the Warp window: the flows of the scene collection, what each one feeds, and how much is in it.
+
+A flow takes the clips the OBS replay buffer saves and puts them in a Warp Playlist source, so a list builds itself as an event goes on. Adding one opens a dialog laid out like OBS's own Add Source: the kinds down the left, what the one that is picked does on the right, and the settings it needs underneath.
+
+* **Replay List** — a list that fills itself with the clips the replay buffer saves.
+* **Highlight List** — a list that keeps the clips worth keeping. It works the same way, and is usually fed by a replay list rather than by the replay buffer directly.
+* **Combo List** — a replay list and a highlight list, made and linked in one go. The replay list takes the saves and hands every clip it takes to the highlight list as well. Each has its own playlist source and its own order, so the replay feed can run newest first while the highlights stay in the order they happened.
+
+Every flow is:
+
+* **Feeds**: the Warp Playlist source clips are added to, picked from the ones already in the scene collection or made on the spot. A new one is put in the current scene, since a source no scene holds on to is not saved with the scene collection.
+* **Takes**: where its clips come from.
+  * *Only what its own hotkey saves* — the flow's own Save Replay hotkey saves the replay buffer and keeps the clip for that flow. Saves made any other way go past it, so two flows with two hotkeys feed two different lists.
+  * *Every replay buffer save* — the flow takes those as well as the saves nobody claimed: OBS's own Save Replay hotkey, obs-websocket, a script.
+
+  A flow's Save Replay hotkey works either way. What the setting decides is whether saves the flow did not ask for land in it too.
+* **Order**: *oldest first*, added to the end, so the list plays in the order the clips were saved; or *newest first*, added to the top, so the clip that was just saved is the next one up.
+* **Limit**: drop the oldest clip once the list is longer than a number you set. The oldest is the one that would be played last, whichever way round the list is built. Off by default, and not offered for highlight lists: what is in one was put there on purpose.
+* **Also feeds**: the flows this one hands every clip it takes on to, so a highlight reel builds itself alongside a replay feed. Links are followed through further links, and a flow already being fed is not fed twice.
+* **Take clips**: a flow that is switched off takes nothing itself, but still passes clips on to the flows it is linked to.
+
+Each flow registers two hotkeys of its own, named after it in Settings → Hotkeys:
+
+* **Warp: Save Replay to *flow*** — saves the replay buffer and keeps the clip for that flow. It does nothing when the replay buffer is not running.
+* **Warp: Add Last Saved Clip to *flow*** — puts the replay that was saved last in that flow without saving a new one, for a clip worth keeping that nobody knew about in advance.
+
+The keys they are bound to are saved with the flow, so a flow loads with its hotkey the way it was left.
+
+A clip landing in a playlist disturbs nothing about playback: the file list is edited the way the playlist's own Clear Playlist edits it, so whatever is on screen plays out untouched and the new clip is reached in its turn. A clip that is already in the list is not added a second time, and a flow whose playlist source has gone says so in the OBS log rather than losing the clip quietly.
+
+Flows are saved with the scene collection, alongside the playlist sources they feed, so an event day's collection carries its own feed setup and switching collections switches flows.
+
+Every flow action can also be driven from outside OBS — see [obs-websocket control](#obs-websocket-control).
 
 ## Building
 
