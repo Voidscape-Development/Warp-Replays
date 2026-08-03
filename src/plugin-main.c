@@ -21,6 +21,10 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "warp-websocket.h"
 
+#ifdef WARP_HAVE_FRONTEND_API
+#include "warp-flow.h"
+#endif
+
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
@@ -50,10 +54,21 @@ bool obs_module_load(void)
  * requests are registered from here rather than from obs_module_load() */
 void obs_module_post_load(void)
 {
+#ifdef WARP_HAVE_FRONTEND_API
+	/* The flows listen to the frontend, which is ready by the time every
+	 * module has loaded, and are read out of the scene collection, which
+	 * the frontend only loads once that has happened. */
+	warp_flow_init();
+#endif
+
 	warp_websocket_register();
 }
 
 void obs_module_unload(void)
 {
+#ifdef WARP_HAVE_FRONTEND_API
+	warp_flow_shutdown();
+#endif
+
 	obs_log(LOG_INFO, "plugin unloaded");
 }

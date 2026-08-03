@@ -30,6 +30,10 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "warp-events.h"
 #include "warp-websocket.h"
 
+#ifdef WARP_HAVE_FRONTEND_API
+#include "warp-flow.h"
+#endif
+
 /* The vendor obs-websocket clients name in a CallVendorRequest, alongside one
  * of the request types below:
  *
@@ -337,6 +341,130 @@ static bool warp_ws_run(const struct warp_ws_request *req, obs_source_t *source,
 	return true;
 }
 
+#ifdef WARP_HAVE_FRONTEND_API
+
+/* ------------------------------------------------------------------------- */
+/* the flows
+ *
+ * These name a flow rather than a source, with "flowName" or "flowId", and do
+ * what its hotkeys do:
+ *
+ *   {"vendorName": "warp", "requestType": "SaveToFlow",
+ *    "requestData": {"flowName": "Match Replays"}} */
+
+enum warp_ws_flow_action {
+	WARP_WS_FLOW_SAVE,
+	WARP_WS_FLOW_ADD_LAST,
+	WARP_WS_FLOW_LIST,
+};
+
+struct warp_ws_flow_request {
+	const char *type;
+	enum warp_ws_flow_action action;
+};
+
+static struct warp_ws_flow_request warp_ws_flow_requests[] = {
+	{"SaveToFlow", WARP_WS_FLOW_SAVE},
+	{"AddLastReplayToFlow", WARP_WS_FLOW_ADD_LAST},
+	{"GetFlows", WARP_WS_FLOW_LIST},
+};
+
+/* the flow the request names, which the caller releases, or NULL with the
+ * response saying what was wrong with it */
+static obs_data_t *warp_ws_get_flow(obs_data_t *request, obs_data_t *response)
+{
+	const char *id = obs_data_get_string(request, "flowId");
+	const char *name = obs_data_get_string(request, "flowName");
+	obs_data_t *flow;
+
+	if (id && *id) {
+		flow = warp_flow_get(id);
+	} else if (name && *name) {
+		flow = warp_flow_get_by_name(name);
+	} else {
+		warp_ws_fail(response, "flowName or flowId is required");
+		return NULL;
+	}
+
+	if (!flow) {
+		warp_ws_fail(response, "there is no flow called '%s'", (id && *id) ? id : name);
+		return NULL;
+	}
+
+	return flow;
+}
+
+static void warp_ws_add_flow_status(obs_data_t *flow, obs_data_t *response)
+{
+	const char *id = obs_data_get_string(flow, WARP_FLOW_ID);
+
+	obs_data_set_string(response, "flowId", id);
+	obs_data_set_string(response, "flowName", obs_data_get_string(flow, WARP_FLOW_NAME));
+	obs_data_set_string(response, "flowKind", obs_data_get_string(flow, WARP_FLOW_KIND));
+	obs_data_set_string(response, "targetName", obs_data_get_string(flow, WARP_FLOW_TARGET_NAME));
+	obs_data_set_int(response, "clipCount", warp_flow_clip_count(id));
+}
+
+static void warp_ws_flow_cb(obs_data_t *request, obs_data_t *response, void *priv_data)
+{
+	const struct warp_ws_flow_request *req = priv_data;
+
+	if (req->action == WARP_WS_FLOW_LIST) {
+		obs_data_array_t *flows = warp_flow_list();
+		obs_data_array_t *listed = obs_data_array_create();
+		size_t count = obs_data_array_count(flows);
+
+		for (size_t i = 0; i < count; i++) {
+			obs_data_t *flow = obs_data_array_item(flows, i);
+			obs_data_t *entry = obs_data_create();
+
+			warp_ws_add_flow_status(flow, entry);
+			obs_data_array_push_back(listed, entry);
+
+			obs_data_release(entry);
+			obs_data_release(flow);
+		}
+
+		obs_data_set_array(response, "flows", listed);
+		obs_data_set_bool(response, "success", true);
+
+		obs_data_array_release(listed);
+		obs_data_array_release(flows);
+		return;
+	}
+
+	obs_data_t *flow = warp_ws_get_flow(request, response);
+
+	if (!flow)
+		return;
+
+	const char *id = obs_data_get_string(flow, WARP_FLOW_ID);
+	bool carried_out;
+
+	if (req->action == WARP_WS_FLOW_SAVE) {
+		carried_out = warp_flow_save_replay(id);
+
+		if (!carried_out)
+			warp_ws_fail(response, "the replay buffer is not running");
+	} else {
+		carried_out = warp_flow_promote_last(id);
+
+		if (!carried_out)
+			warp_ws_fail(response, "there is no saved replay to add");
+	}
+
+	if (carried_out) {
+		obs_data_set_bool(response, "success", true);
+		warp_ws_add_flow_status(flow, response);
+	}
+
+	obs_data_release(flow);
+}
+
+#endif /* WARP_HAVE_FRONTEND_API */
+
+/* ------------------------------------------------------------------------- */
+
 static void warp_ws_request_cb(obs_data_t *request, obs_data_t *response, void *priv_data)
 {
 	const struct warp_ws_request *req = priv_data;
@@ -381,6 +509,17 @@ void warp_websocket_register(void)
 		else
 			obs_log(LOG_WARNING, "could not register the '%s' vendor request", req->type);
 	}
+
+#ifdef WARP_HAVE_FRONTEND_API
+	for (size_t i = 0; i < sizeof(warp_ws_flow_requests) / sizeof(*warp_ws_flow_requests); i++) {
+		struct warp_ws_flow_request *req = &warp_ws_flow_requests[i];
+
+		if (obs_websocket_vendor_register_request(warp_ws_vendor, req->type, warp_ws_flow_cb, req))
+			registered++;
+		else
+			obs_log(LOG_WARNING, "could not register the '%s' vendor request", req->type);
+	}
+#endif
 
 	/* The requests are left registered at unload: obs-websocket drops its
 	 * vendors itself, and its proc handler may already be gone by the time
