@@ -593,6 +593,31 @@ static void get_nb_frames(void *data, calldata_t *cd)
 	calldata_set_int(cd, "num_frames", frames);
 }
 
+/* Whether the source has something to put on screen yet. Opening a file is
+ * asynchronous: the source exists as soon as it is created, but its media
+ * thread still has to read the header and decode a frame before anything can
+ * be rendered from it, and until then the source draws nothing at all. The
+ * Warp Playlist waits for this before handing an item to its transition, so a
+ * switch never starts against a source that is still empty. */
+static void media_ready_proc(void *data, calldata_t *cd)
+{
+	struct warp_source *s = data;
+	bool ready;
+
+	if (!s->media)
+		ready = false;
+	else if (media_playback_has_video(s->media))
+		/* the video stream is only known once the file is open, and
+		 * the width only once a frame has reached the source */
+		ready = obs_source_get_width(s->source) != 0;
+	else
+		/* audio only, or not open yet: a file that is open is one that
+		 * has a duration to report */
+		ready = media_playback_get_duration(s->media) > 0;
+
+	calldata_set_bool(cd, "ready", ready);
+}
+
 static bool warp_source_play_hotkey(void *data, obs_hotkey_pair_id id, obs_hotkey_t *hotkey, bool pressed)
 {
 	UNUSED_PARAMETER(id);
@@ -885,6 +910,7 @@ static void *warp_source_create(obs_data_t *settings, obs_source_t *source)
 	proc_handler_add(ph, "void preload_first_frame()", preload_first_frame_proc, s);
 	proc_handler_add(ph, "void get_duration(out int duration)", get_duration, s);
 	proc_handler_add(ph, "void get_nb_frames(out int num_frames)", get_nb_frames, s);
+	proc_handler_add(ph, "void warp_media_ready(out bool ready)", media_ready_proc, s);
 	proc_handler_add(ph, "void warp_set_speed(int speed)", set_speed_proc, s);
 	proc_handler_add(ph, "void warp_adjust_speed(int delta)", adjust_speed_proc, s);
 	proc_handler_add(ph, "void warp_get_speed(out int speed)", get_speed_proc, s);
