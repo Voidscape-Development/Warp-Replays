@@ -76,6 +76,14 @@ struct mp_media {
 	bool reconnecting;
 	bool has_video;
 	bool has_audio;
+	/* Warp addition: whether the file is open and its streams have been
+	 * worked out. Opening happens on the media thread, so anything read out
+	 * of the media before this is set may be describing nothing yet: not
+	 * has_video, and not the duration either, which a container reports as
+	 * soon as its header has been read and well before its streams have been
+	 * identified. Anything that has to tell "no video" from "not open yet"
+	 * has to consult this first. */
+	volatile bool opened;
 	bool is_file;
 	bool eof;
 	bool hw;

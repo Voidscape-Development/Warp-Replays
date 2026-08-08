@@ -579,6 +579,9 @@ bool mp_cache_init(mp_cache_t *c, const struct mp_media_info *info)
 		return false;
 	}
 
+	/* Warp addition: see the note on mp_media::opened */
+	os_atomic_set_bool(&c->opened, true);
+
 	return true;
 }
 
