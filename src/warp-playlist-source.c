@@ -549,8 +549,13 @@ static void warp_pl_call_item_proc(obs_source_t *item, const char *proc, const c
 }
 
 /* Whether 'item' has something to put on screen: its file is open and, when it
- * has video, a frame has reached the source. An item that has only just been
- * created has neither, however long the playlist has held a reference to it. */
+ * has video, a decoded frame has been written into the source's texture. An
+ * item that has only just been created has neither, however long the playlist
+ * has held a reference to it. Note that a frame having reached the source is
+ * not the same as there being picture in it to composite: libobs uploads an
+ * async frame to the texture only while the source is being rendered, which an
+ * item waiting for its switch is not, so the item reports this itself rather
+ * than being measured from the outside. */
 static bool warp_pl_item_ready(obs_source_t *item)
 {
 	calldata_t cd = {0};
@@ -2439,7 +2444,20 @@ static void warp_playlist_tick(void *data, float seconds)
 		s->prev = NULL;
 	}
 
-	/* size the transition to the item on screen */
+	warp_pl_arm_preloaded(s);
+
+	/* the item a switch is waiting on goes up as soon as it has picture */
+	s->pending_age += seconds;
+	warp_pl_promote_pending(s);
+
+	/* Size the transition, and this source, to the item on screen. This is
+	 * measured after the switch above rather than before it, so that an item
+	 * going up is sized on the tick it goes up: the transition renders on
+	 * this tick, and one whose size is still zero, or still that of a file
+	 * of another resolution, lays its halves out against the wrong bounds
+	 * for a frame. The first item of all is the case that showed: nothing
+	 * had ever set a size, so the playlist reported none and its very first
+	 * frame was drawn as nothing. */
 	uint32_t cx = s->current ? obs_source_get_width(s->current) : 0;
 	uint32_t cy = s->current ? obs_source_get_height(s->current) : 0;
 
@@ -2458,12 +2476,6 @@ static void warp_playlist_tick(void *data, float seconds)
 		s->cy = cy;
 		resized = true;
 	}
-
-	warp_pl_arm_preloaded(s);
-
-	/* the item a switch is waiting on goes up as soon as it has picture */
-	s->pending_age += seconds;
-	warp_pl_promote_pending(s);
 
 	/* Nothing is asked for while a switch is waiting to land: the item on
 	 * screen is the one being transitioned away from, and running its
