@@ -69,6 +69,7 @@ extern int64_t media_playback_get_current_time(media_playback_t *mp);
 extern void media_playback_seek(media_playback_t *mp, int64_t pos);
 extern int64_t media_playback_get_frames(media_playback_t *mp);
 extern int64_t media_playback_get_duration(media_playback_t *mp);
+extern bool media_playback_is_open(media_playback_t *mp);
 extern bool media_playback_has_video(media_playback_t *mp);
 extern bool media_playback_has_audio(media_playback_t *mp);
 

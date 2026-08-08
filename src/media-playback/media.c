@@ -732,6 +732,10 @@ static bool init_avformat(mp_media_t *m)
 		return false;
 	}
 
+	/* Warp addition: last, so that nothing outside the media thread can
+	 * conclude the file is open until everything read out of it is true */
+	os_atomic_set_bool(&m->opened, true);
+
 	return true;
 }
 

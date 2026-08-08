@@ -666,19 +666,24 @@ static void media_ready_proc(void *data, calldata_t *cd)
 	struct warp_source *s = data;
 	bool ready;
 
-	if (!s->media)
+	if (!s->media || !media_playback_is_open(s->media))
+		/* Nothing the media says about itself means anything until its
+		 * streams have been worked out. In particular it reports no
+		 * video, because it does not know yet that it has any, and a
+		 * duration, because a container gives that up as soon as its
+		 * header has been read -- which together used to read as "an
+		 * audio-only file, ready to go" for the first few frames of
+		 * every video file that was opened. */
 		ready = false;
 	else if (media_playback_has_video(s->media))
-		/* The video stream is only known once the file is open, and the
-		 * picture only once a decoded frame has been written into the
-		 * source's texture. A non-zero width is not enough on its own:
-		 * a source that is off screen reports the size of a frame it
-		 * has decoded while its texture is still empty. */
+		/* The picture is there once a decoded frame has been written
+		 * into the source's texture. A non-zero width is not enough on
+		 * its own: a source that is off screen reports the size of a
+		 * frame it has decoded while its texture is still empty. */
 		ready = os_atomic_load_bool(&s->has_picture);
 	else
-		/* audio only, or not open yet: a file that is open is one that
-		 * has a duration to report */
-		ready = media_playback_get_duration(s->media) > 0;
+		/* audio only: there is no picture to wait for */
+		ready = true;
 
 	calldata_set_bool(cd, "ready", ready);
 }

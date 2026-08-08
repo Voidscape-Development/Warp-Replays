@@ -153,6 +153,20 @@ int64_t media_playback_get_duration(media_playback_t *mp)
 		return mp_media_get_duration(&mp->media);
 }
 
+/* Warp addition: whether the file is open and its streams have been worked out,
+ * so that what the media reports about itself can be relied on. See the note on
+ * mp_media::opened. */
+bool media_playback_is_open(media_playback_t *mp)
+{
+	if (!mp)
+		return false;
+
+	if (mp->is_cached)
+		return os_atomic_load_bool(&mp->cache.opened);
+	else
+		return os_atomic_load_bool(&mp->media.opened);
+}
+
 bool media_playback_has_video(media_playback_t *mp)
 {
 	if (!mp)

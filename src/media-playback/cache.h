@@ -32,6 +32,10 @@ struct mp_cache {
 	bool request_preload;
 	bool has_video;
 	bool has_audio;
+	/* Warp addition: see the note on mp_media::opened. A cached file is
+	 * opened before mp_cache_init() returns, so this is only ever false
+	 * while that call is still running. */
+	volatile bool opened;
 
 	char *path;
 	char *format_name;
