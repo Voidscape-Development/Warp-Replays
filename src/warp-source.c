@@ -74,6 +74,21 @@ struct warp_source {
 	volatile bool reconnecting;
 	int reconnect_delay_sec;
 
+	/* Whether there is picture in the source's texture right now. libobs
+	 * uploads a decoded frame to the texture only while the source is being
+	 * rendered, so a source that is not on screen holds a texture that has
+	 * been allocated and never written to, however many frames it has
+	 * decoded -- and that texture renders as nothing at all. So "has
+	 * something to show" has to mean the picture is in the texture, not
+	 * that a frame has been handed over. Written from the media thread and
+	 * from the graphics thread, read by warp_media_ready. */
+	volatile bool has_picture;
+	/* Whether the source is holding a frame handed to it ahead of being
+	 * shown, so that obs_source_show_preloaded_video() has one to put up.
+	 * Every call that hands one over sets this; clearing the source does not
+	 * take it back, so it stays set once a frame has been handed over. */
+	volatile bool preloaded_frame;
+
 	enum obs_media_state state;
 	obs_hotkey_pair_id play_pause_hotkey;
 	obs_hotkey_id stop_hotkey;
@@ -262,9 +277,36 @@ static void dump_source_info(struct warp_source *s, const char *input, const cha
 		s->close_when_inactive ? "yes" : "no", s->full_decode ? "yes" : "no", s->ffmpeg_options);
 }
 
+/* Drops the picture the source is holding. Every place that clears the source
+ * goes through here, so that s->has_picture cannot drift from what is actually
+ * in the source's texture. */
+static void clear_video(struct warp_source *s)
+{
+	os_atomic_set_bool(&s->has_picture, false);
+	obs_source_output_video(s->source, NULL);
+}
+
 static void get_frame(void *opaque, struct obs_source_frame *f)
 {
 	struct warp_source *s = opaque;
+
+	/* The first frame of a run is written into the source's texture here
+	 * rather than left to the render path. libobs uploads an async frame
+	 * only while the source is being rendered, and only on a tick that has
+	 * a frame ready for it, so a source that has decoded picture but has
+	 * not been rendered yet still has an empty texture -- and libobs draws
+	 * that texture all the same, because the source counts as having video.
+	 * The Warp Playlist opens the file it is switching to off screen and
+	 * hands it straight to its transition, so an item has to have real
+	 * picture in it before it is composited, not merely a frame that has
+	 * been handed over. Only the first frame pays for this; every one after
+	 * it is uploaded by the render path as usual. */
+	if (!os_atomic_load_bool(&s->has_picture)) {
+		obs_source_set_video_frame(s->source, f);
+		os_atomic_set_bool(&s->preloaded_frame, true);
+		os_atomic_set_bool(&s->has_picture, true);
+	}
+
 	obs_source_output_video(s->source, f);
 }
 
@@ -274,8 +316,10 @@ static void preload_frame(void *opaque, struct obs_source_frame *f)
 	if (s->close_when_inactive)
 		return;
 
-	if (s->is_clear_on_media_end || s->is_looping)
+	if (s->is_clear_on_media_end || s->is_looping) {
 		obs_source_preload_video(s->source, f);
+		os_atomic_set_bool(&s->preloaded_frame, true);
+	}
 
 	if (!s->is_local_file && os_atomic_set_bool(&s->reconnecting, false))
 		FF_BLOG(LOG_INFO, "Reconnected.");
@@ -284,7 +328,12 @@ static void preload_frame(void *opaque, struct obs_source_frame *f)
 static void seek_frame(void *opaque, struct obs_source_frame *f)
 {
 	struct warp_source *s = opaque;
+
+	/* a seek puts its frame straight into the texture, and leaves it with the
+	 * source as the one to put back up when playback resumes */
 	obs_source_set_video_frame(s->source, f);
+	os_atomic_set_bool(&s->preloaded_frame, true);
+	os_atomic_set_bool(&s->has_picture, true);
 }
 
 static void get_audio(void *opaque, struct obs_source_audio *a)
@@ -313,7 +362,7 @@ static void media_stopped(void *opaque)
 {
 	struct warp_source *s = opaque;
 	if (s->is_clear_on_media_end && !s->is_track_matte) {
-		obs_source_output_video(s->source, NULL);
+		clear_video(s);
 	}
 
 	if ((s->close_when_inactive || !s->is_local_file) && s->media)
@@ -363,10 +412,23 @@ static void warp_source_start(struct warp_source *s)
 		return;
 
 	media_playback_play(s->media, s->is_looping, s->reconnecting);
-	if (s->is_local_file && media_playback_has_video(s->media) && (s->is_clear_on_media_end || s->is_looping))
-		obs_source_show_preloaded_video(s->source);
-	else
-		obs_source_output_video(s->source, NULL);
+
+	if (s->is_local_file && media_playback_has_video(s->media) && (s->is_clear_on_media_end || s->is_looping)) {
+		/* the frame decoded when the file was opened, so there is
+		 * picture from the moment playback starts */
+		if (os_atomic_load_bool(&s->preloaded_frame)) {
+			obs_source_show_preloaded_video(s->source);
+			os_atomic_set_bool(&s->has_picture, true);
+		}
+	} else if (!s->is_local_file || !os_atomic_load_bool(&s->has_picture)) {
+		/* Nothing to put up yet, and nothing worth keeping. A local file
+		 * that is holding picture keeps it instead: a source set not to
+		 * clear at the end of a file has no reason to blank while the
+		 * file is reopened and its first frame decoded, which is what
+		 * restarting an item the playlist is showing used to do. */
+		clear_video(s);
+	}
+
 	set_media_state(s, OBS_MEDIA_STATE_PLAYING);
 	obs_source_media_started(s->source);
 }
@@ -571,7 +633,7 @@ static void preload_first_frame_proc(void *data, calldata_t *cd)
 {
 	struct warp_source *s = data;
 	if (s->is_track_matte)
-		obs_source_output_video(s->source, NULL);
+		clear_video(s);
 	media_playback_preload_frame(s->media);
 	UNUSED_PARAMETER(cd);
 }
@@ -607,9 +669,12 @@ static void media_ready_proc(void *data, calldata_t *cd)
 	if (!s->media)
 		ready = false;
 	else if (media_playback_has_video(s->media))
-		/* the video stream is only known once the file is open, and
-		 * the width only once a frame has reached the source */
-		ready = obs_source_get_width(s->source) != 0;
+		/* The video stream is only known once the file is open, and the
+		 * picture only once a decoded frame has been written into the
+		 * source's texture. A non-zero width is not enough on its own:
+		 * a source that is off screen reports the size of a frame it
+		 * has decoded while its texture is still empty. */
+		ready = os_atomic_load_bool(&s->has_picture);
 	else
 		/* audio only, or not open yet: a file that is open is one that
 		 * has a duration to report */
@@ -963,7 +1028,7 @@ static void warp_source_deactivate(void *data)
 			media_playback_stop(s->media);
 
 			if (s->is_clear_on_media_end)
-				obs_source_output_video(s->source, NULL);
+				clear_video(s);
 		}
 	}
 }
@@ -999,7 +1064,7 @@ static void warp_source_stop(void *data)
 
 	if (s->media) {
 		media_playback_stop(s->media);
-		obs_source_output_video(s->source, NULL);
+		clear_video(s);
 		set_media_state(s, OBS_MEDIA_STATE_STOPPED);
 	}
 }
