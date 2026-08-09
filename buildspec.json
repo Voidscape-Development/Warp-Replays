@@ -30,7 +30,7 @@
     },
     "platformConfig": {
         "macos": {
-            "bundleId": "com.voidscape-development.warp"
+            "bundleId": "dev.voidscape.warp"
         }
     },
     "name": "warp",
