@@ -56,7 +56,7 @@ runs:
         print ::group::Install clang-format-19
         brew update --quiet
         brew tap --quiet obsproject/tools
-        brew trust obsproject/tools 2>/dev/null || true
+        brew trust obsproject/tools
         brew install --quiet obsproject/tools/clang-format@19
         print ::endgroup::
 
