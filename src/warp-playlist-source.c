@@ -97,6 +97,13 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  * the outgoing half of the transition still has a picture to work with. */
 #define WARP_PL_END_GUARD_MS 50
 
+/* Which way through the playlist a switch is going. A playlist may be set up
+ * with a transition of its own for going back, in which case both are live at
+ * once; with that off, everything runs through the forward one. */
+#define WARP_PL_DIR_FORWARD 0
+#define WARP_PL_DIR_BACKWARD 1
+#define WARP_PL_NUM_DIRS 2
+
 struct warp_playlist_source;
 
 /* per-hotkey context for parametrized hotkeys: 'value' is a signed frame
@@ -106,11 +113,82 @@ struct warp_pl_hotkey_binding {
 	int value;
 };
 
+/* The settings one direction's transition is configured through. The forward
+ * ones are the keys the playlist has always used, so a playlist saved before
+ * going back could have a transition of its own loads unchanged. 'timing' is
+ * NULL for going back: only automatic advance is placed against the end of a
+ * file, and that only ever moves forward. */
+struct warp_pl_transition_keys {
+	const char *id;
+	const char *duration;
+	const char *timing;
+	const char *scale;
+	const char *alignment;
+	const char *store;
+	const char *properties;
+};
+
+static const struct warp_pl_transition_keys warp_pl_keys[WARP_PL_NUM_DIRS] = {
+	{"transition", "transition_duration", "transition_timing", "transition_scale", "transition_alignment",
+	 "transition_settings", "transition_properties"},
+	{"back_transition", "back_transition_duration", NULL, "back_transition_scale", "back_transition_alignment",
+	 "back_transition_settings", "back_transition_properties"},
+};
+
+/* A transition the playlist renders through, and everything it is set up with.
+ * There is one of these per direction. */
+struct warp_pl_transition {
+	/* the live transition, and the libobs id it was created with */
+	obs_source_t *source;
+	char *id;
+	/* transition the settings ask for, picked up by the next tick */
+	char *pending_id;
+	/* settings for the transition itself, handed to it by the next tick */
+	obs_data_t *pending_settings;
+	/* alignment and scaling wait for the next tick along with them */
+	bool pending_layout;
+	/* the transition is not wanted any more; the next tick drops it */
+	bool pending_release;
+
+	/* What every transition that has been used is configured with, keyed by
+	 * libobs id. A transition is configured through its own properties,
+	 * which write to the transition rather than to this source, so this is
+	 * read back from the one that is running rather than the other way
+	 * round. Keeping the ones that are not running means picking a
+	 * transition back up brings its settings with it. */
+	obs_data_t *store;
+	/* the store as it last stood in the source settings, to tell settings
+	 * being loaded, or set from the outside, from the copy this source
+	 * wrote there itself */
+	char *store_json;
+	bool store_loaded;
+
+	uint32_t alignment;
+	enum obs_transition_scale_type scale;
+
+	uint32_t ms;
+	/* where a stinger swaps the incoming file in, in milliseconds */
+	uint32_t stinger_point_ms;
+	bool is_cut;
+	bool is_stinger;
+	/* Whether the transition overlaps the end of the file or runs once it
+	 * is over. Only read for the forward transition: it places automatic
+	 * advance, and a move back through the playlist is always asked for. */
+	bool overlap;
+};
+
 struct warp_playlist_source {
 	obs_source_t *source;
 
-	/* the transition renders the playlist; every item is handed to it */
-	obs_source_t *transition;
+	/* The transitions render the playlist; every item is handed to one of
+	 * them. There is one per direction, and only the one a switch calls for
+	 * is on screen; the other holds nothing until it is switched to. */
+	struct warp_pl_transition tr[WARP_PL_NUM_DIRS];
+	/* whether going back through the playlist has a transition of its own,
+	 * rather than running through the forward one like everything else */
+	bool separate_back_transition;
+	/* the transition that is on screen */
+	size_t active_dir;
 	/* item currently played */
 	obs_source_t *current;
 	/* item transitioned away from, kept alive until the transition ends */
@@ -130,6 +208,7 @@ struct warp_playlist_source {
 	obs_source_t *pending;
 	size_t pending_order_pos;
 	bool pending_transition;
+	size_t pending_dir;
 	float pending_age;
 
 	/* Guards everything below it. Creating, releasing and re-parenting a
@@ -142,10 +221,12 @@ struct warp_playlist_source {
 
 	/* sources to release */
 	DARRAY(obs_source_t *) retired;
-	/* an item to open and play, and whether to animate the switch */
+	/* an item to open and play, whether to animate the switch, and which
+	 * direction's transition to animate it with */
 	bool play_armed;
 	size_t play_order_pos;
 	bool play_transition;
+	size_t play_dir;
 	/* an item to open ahead of the switch point */
 	bool preload_requested;
 	size_t preload_order_pos;
@@ -155,10 +236,11 @@ struct warp_playlist_source {
 	 * screen when the count it was opened for is no longer the current
 	 * one. */
 	uint64_t play_gen;
-	/* what to hand the transition; the target holds a reference, and is
-	 * NULL to show nothing */
+	/* what to hand the transition, and which of them; the target holds a
+	 * reference, and is NULL to show nothing */
 	bool transition_armed;
 	bool transition_use;
+	size_t transition_dir;
 	obs_source_t *transition_target;
 	/* media signals: whatever reacts to one is free to drive this playlist
 	 * straight back, so they are never emitted under the lock */
@@ -175,36 +257,6 @@ struct warp_playlist_source {
 
 	uint32_t cx;
 	uint32_t cy;
-
-	char *transition_id;
-	/* transition the settings ask for, picked up by the next tick */
-	char *pending_transition_id;
-	/* settings for the transition itself, handed to it by the next tick */
-	obs_data_t *pending_transition_settings;
-	/* What every transition that has been used is configured with, keyed by
-	 * libobs id. A transition is configured through its own properties,
-	 * which write to the transition rather than to this source, so this is
-	 * read back from the one that is running rather than the other way
-	 * round. Keeping the ones that are not running means picking a
-	 * transition back up brings its settings with it. */
-	obs_data_t *transition_store;
-	/* the store as it last stood in the source settings, to tell settings
-	 * being loaded, or set from the outside, from the copy this source
-	 * wrote there itself */
-	char *transition_store_json;
-	bool transition_store_loaded;
-	/* alignment and scaling wait for the next tick along with them */
-	bool pending_transition_layout;
-	uint32_t transition_alignment;
-	enum obs_transition_scale_type transition_scale;
-
-	uint32_t transition_ms;
-	/* where a stinger swaps the incoming file in, in milliseconds */
-	uint32_t stinger_point_ms;
-	bool transition_is_cut;
-	bool transition_is_stinger;
-	/* whether the transition overlaps the end of the file or runs after it */
-	bool transition_overlap;
 
 	/* speed every item starts at, and the live speed of the current item */
 	int base_speed;
@@ -267,7 +319,8 @@ static const char *warp_playlist_getname(void *unused)
  * libobs' source graph is queued on the struct and run by warp_pl_unlock()
  * once the lock has been dropped. */
 
-static void warp_pl_start(struct warp_playlist_source *s, size_t order_pos, bool use_transition, uint64_t gen);
+static void warp_pl_start(struct warp_playlist_source *s, size_t order_pos, bool use_transition, size_t dir,
+			  uint64_t gen);
 static void warp_pl_open_preload(struct warp_playlist_source *s, size_t order_pos, uint64_t gen);
 
 /* queues 'source' for release; expects s->mutex to be held */
@@ -277,22 +330,31 @@ static void warp_pl_retire(struct warp_playlist_source *s, obs_source_t *source)
 		da_push_back(s->retired, &source);
 }
 
-/* Hands 'item' to the transition once the lock is dropped; 'item' may be NULL,
- * to show nothing. Expects s->mutex to be held. */
-static void warp_pl_arm_transition(struct warp_playlist_source *s, obs_source_t *item, bool use_transition)
+/* Which transition a move in 'dir' runs through: the one of its own when going
+ * back has been given one, and the forward one for everything else. Expects
+ * s->mutex to be held. */
+static inline size_t warp_pl_dir_slot(struct warp_playlist_source *s, size_t dir)
+{
+	return dir == WARP_PL_DIR_BACKWARD && s->separate_back_transition ? WARP_PL_DIR_BACKWARD : WARP_PL_DIR_FORWARD;
+}
+
+/* Hands 'item' to the transition for 'dir' once the lock is dropped; 'item' may
+ * be NULL, to show nothing. Expects s->mutex to be held. */
+static void warp_pl_arm_transition(struct warp_playlist_source *s, obs_source_t *item, bool use_transition, size_t dir)
 {
 	warp_pl_retire(s, s->transition_target);
 
 	s->transition_target = item ? obs_source_get_ref(item) : NULL;
 	s->transition_armed = true;
 	s->transition_use = use_transition;
+	s->transition_dir = warp_pl_dir_slot(s, dir);
 }
 
-/* how long the transition runs for, in milliseconds; a cut is instant whatever
- * the duration property is set to. Expects s->mutex to be held. */
-static inline uint32_t warp_pl_transition_ms(struct warp_playlist_source *s)
+/* how long the transition for 'dir' runs for, in milliseconds; a cut is instant
+ * whatever the duration property is set to. Expects s->mutex to be held. */
+static inline uint32_t warp_pl_transition_ms(struct warp_playlist_source *s, size_t dir)
 {
-	return s->transition_is_cut ? 0 : s->transition_ms;
+	return s->tr[dir].is_cut ? 0 : s->tr[dir].ms;
 }
 
 static enum obs_media_state warp_pl_state(struct warp_playlist_source *s)
@@ -306,14 +368,27 @@ static enum obs_media_state warp_pl_state(struct warp_playlist_source *s)
 	return state;
 }
 
-/* the transition, with a reference held: it is swapped out from the tick, so
- * the callbacks that render and enumerate it cannot use it bare */
+/* the transition for 'dir', with a reference held: they are swapped out from
+ * the tick, so the callbacks that render and enumerate them cannot use them
+ * bare */
+static obs_source_t *warp_pl_get_transition_dir(struct warp_playlist_source *s, size_t dir)
+{
+	obs_source_t *transition;
+
+	pthread_mutex_lock(&s->mutex);
+	transition = obs_source_get_ref(s->tr[dir].source);
+	pthread_mutex_unlock(&s->mutex);
+
+	return transition;
+}
+
+/* the transition that is on screen, with a reference held */
 static obs_source_t *warp_pl_get_transition(struct warp_playlist_source *s)
 {
 	obs_source_t *transition;
 
 	pthread_mutex_lock(&s->mutex);
-	transition = obs_source_get_ref(s->transition);
+	transition = obs_source_get_ref(s->tr[s->active_dir].source);
 	pthread_mutex_unlock(&s->mutex);
 
 	return transition;
@@ -336,13 +411,17 @@ static void warp_pl_unlock(struct warp_playlist_source *s)
 
 		bool transition_armed = s->transition_armed;
 		bool transition_use = s->transition_use;
-		uint32_t transition_ms = warp_pl_transition_ms(s);
+		size_t transition_dir = s->transition_dir;
+		uint32_t transition_ms;
 		obs_source_t *transition = NULL;
+		obs_source_t *handover = NULL;
 		obs_source_t *target = NULL;
+		bool switch_dir = false;
 
 		bool play = s->play_armed;
 		size_t play_order_pos = s->play_order_pos;
 		bool play_transition = s->play_transition;
+		size_t play_dir = s->play_dir;
 
 		bool preload = s->preload_requested;
 		size_t preload_order_pos = s->preload_order_pos;
@@ -355,10 +434,26 @@ static void warp_pl_unlock(struct warp_playlist_source *s)
 		da_init(s->retired);
 
 		if (transition_armed) {
-			transition = obs_source_get_ref(s->transition);
+			/* the transition of the direction being moved in, or
+			 * the forward one when there is none of its own yet */
+			if (!s->tr[transition_dir].source)
+				transition_dir = WARP_PL_DIR_FORWARD;
+
+			transition = obs_source_get_ref(s->tr[transition_dir].source);
+
+			/* A switch that runs through the other transition takes
+			 * what is on screen over to it first, so its outgoing
+			 * half has the picture that is up rather than nothing. */
+			if (transition && transition_dir != s->active_dir) {
+				switch_dir = true;
+				handover = obs_source_get_ref(s->tr[s->active_dir].source);
+			}
+
 			target = s->transition_target;
 			s->transition_target = NULL;
 		}
+
+		transition_ms = warp_pl_transition_ms(s, transition_dir);
 
 		s->transition_armed = false;
 		s->play_armed = false;
@@ -375,11 +470,35 @@ static void warp_pl_unlock(struct warp_playlist_source *s)
 
 		pthread_mutex_unlock(&s->mutex);
 
+		if (switch_dir) {
+			/* handing the picture over is instant, so the swap to
+			 * the other transition costs no frame of its own */
+			if (handover) {
+				obs_source_t *showing = obs_transition_get_active_source(handover);
+
+				if (showing) {
+					obs_transition_set(transition, showing);
+					obs_source_release(showing);
+				}
+			}
+
+			pthread_mutex_lock(&s->mutex);
+			s->active_dir = transition_dir;
+			pthread_mutex_unlock(&s->mutex);
+		}
+
 		/* the transition takes its own references, so it is told about
 		 * the change before the outgoing items are let go of */
 		if (transition)
 			obs_transition_start(transition, OBS_TRANSITION_MODE_AUTO, transition_use ? transition_ms : 0,
 					     target);
+
+		/* whatever the transition that stepped aside was holding is not
+		 * on screen any more */
+		if (handover) {
+			obs_transition_clear(handover);
+			obs_source_release(handover);
+		}
 
 		if (transition)
 			obs_source_release(transition);
@@ -396,7 +515,7 @@ static void warp_pl_unlock(struct warp_playlist_source *s)
 			obs_source_media_started(s->source);
 
 		if (play)
-			warp_pl_start(s, play_order_pos, play_transition, gen);
+			warp_pl_start(s, play_order_pos, play_transition, play_dir, gen);
 		if (preload)
 			warp_pl_open_preload(s, preload_order_pos, gen);
 
@@ -605,11 +724,11 @@ static void warp_pl_drop_pending(struct warp_playlist_source *s)
 
 /* Puts 'item' (which may be NULL, to show nothing) on screen and retires
  * whatever was shown before it, taking over the caller's reference to 'item'.
- * The transition is told about the change by warp_pl_unlock(). Expects
- * s->mutex to be held. */
-static void warp_pl_show(struct warp_playlist_source *s, obs_source_t *item, bool use_transition)
+ * The transition for 'dir' is told about the change by warp_pl_unlock().
+ * Expects s->mutex to be held. */
+static void warp_pl_show(struct warp_playlist_source *s, obs_source_t *item, bool use_transition, size_t dir)
 {
-	warp_pl_arm_transition(s, item, use_transition);
+	warp_pl_arm_transition(s, item, use_transition, dir);
 
 	/* the outgoing item stays alive until its transition has played out;
 	 * the transition holds its own reference, this one just keeps it
@@ -658,7 +777,7 @@ static void warp_pl_promote_pending(struct warp_playlist_source *s)
 	 * was being played back at */
 	warp_pl_call_item_proc(item, "warp_set_speed", "speed", s->base_speed);
 
-	warp_pl_show(s, item, s->pending_transition);
+	warp_pl_show(s, item, s->pending_transition, s->pending_dir);
 
 	s->state = OBS_MEDIA_STATE_PLAYING;
 	s->signal_started = true;
@@ -666,10 +785,11 @@ static void warp_pl_promote_pending(struct warp_playlist_source *s)
 	WARP_PL_LOG(LOG_INFO, "playing %d/%d: %s", (int)(order_pos + 1), (int)s->order.num, path ? path : "");
 }
 
-/* Asks for the item at 'order_pos' to be played. The file is opened, and the
- * item put on screen, by warp_pl_start() once the lock has been dropped.
- * Expects s->mutex to be held. */
-static void warp_pl_play_pos(struct warp_playlist_source *s, size_t order_pos, bool use_transition)
+/* Asks for the item at 'order_pos' to be played, switched to with the
+ * transition for 'dir'. The file is opened, and the item put on screen, by
+ * warp_pl_start() once the lock has been dropped. Expects s->mutex to be
+ * held. */
+static void warp_pl_play_pos(struct warp_playlist_source *s, size_t order_pos, bool use_transition, size_t dir)
 {
 	if (!warp_pl_path_at(s, order_pos))
 		return;
@@ -681,6 +801,7 @@ static void warp_pl_play_pos(struct warp_playlist_source *s, size_t order_pos, b
 	s->play_armed = true;
 	s->play_order_pos = order_pos;
 	s->play_transition = use_transition;
+	s->play_dir = dir;
 }
 
 /* end of the playlist, or end of an item with auto advance turned off;
@@ -693,7 +814,7 @@ static void warp_pl_end(struct warp_playlist_source *s)
 	/* the item that ended is kept, so it can be restarted or resumed;
 	 * it is only taken off screen */
 	if (s->clear_on_media_end) {
-		warp_pl_arm_transition(s, NULL, true);
+		warp_pl_arm_transition(s, NULL, true, WARP_PL_DIR_FORWARD);
 		s->showing_nothing = true;
 	}
 
@@ -720,7 +841,7 @@ static void warp_pl_advance(struct warp_playlist_source *s, int dir)
 		s->pos = s->order.num;
 	}
 
-	warp_pl_play_pos(s, target, true);
+	warp_pl_play_pos(s, target, true, dir >= 0 ? WARP_PL_DIR_FORWARD : WARP_PL_DIR_BACKWARD);
 }
 
 /* expects s->mutex to be held */
@@ -739,7 +860,7 @@ static void warp_pl_stop(struct warp_playlist_source *s)
 	if (s->prev)
 		obs_source_media_stop(s->prev);
 
-	warp_pl_arm_transition(s, NULL, false);
+	warp_pl_arm_transition(s, NULL, false, WARP_PL_DIR_FORWARD);
 
 	warp_pl_retire(s, s->prev);
 	warp_pl_retire(s, s->current);
@@ -761,7 +882,7 @@ static void warp_pl_restart_playlist(struct warp_playlist_source *s)
 		warp_pl_build_order(s);
 
 	warp_pl_drop_preloaded(s);
-	warp_pl_play_pos(s, 0, true);
+	warp_pl_play_pos(s, 0, true, WARP_PL_DIR_FORWARD);
 }
 
 /* restarts the item that is playing right now, at the configured speed;
@@ -776,7 +897,7 @@ static void warp_pl_restart_current(struct warp_playlist_source *s)
 	/* the item is not held by the transition once the playlist has ended
 	 * with "show nothing", so put it back before restarting it */
 	if (s->showing_nothing) {
-		warp_pl_arm_transition(s, s->current, true);
+		warp_pl_arm_transition(s, s->current, true, WARP_PL_DIR_FORWARD);
 		s->showing_nothing = false;
 	}
 
@@ -816,7 +937,8 @@ static void warp_pl_apply_speed(struct warp_playlist_source *s, int speed)
 /* Opens the item warp_pl_play_pos() asked for and hands it to
  * warp_pl_promote_pending(), which puts it on screen once it has picture.
  * Expects s->mutex NOT to be held: opening a file means creating a source. */
-static void warp_pl_start(struct warp_playlist_source *s, size_t order_pos, bool use_transition, uint64_t gen)
+static void warp_pl_start(struct warp_playlist_source *s, size_t order_pos, bool use_transition, size_t dir,
+			  uint64_t gen)
 {
 	struct warp_pl_item_config cfg;
 	obs_source_t *item = NULL;
@@ -880,6 +1002,7 @@ static void warp_pl_start(struct warp_playlist_source *s, size_t order_pos, bool
 	s->pending = item;
 	s->pending_order_pos = order_pos;
 	s->pending_transition = use_transition;
+	s->pending_dir = dir;
 	s->pending_age = 0.0f;
 
 	warp_pl_promote_pending(s);
@@ -1036,13 +1159,13 @@ static uint32_t warp_pl_stinger_point_ms(obs_data_t *tr_settings)
 	return (uint32_t)(point * 1000 * ovi.fps_den / ovi.fps_num);
 }
 
-/* Reads back what the transition that is running is configured with: its own
+/* Reads back what the transition for 'dir' is configured with: its own
  * properties write to the transition itself, so the store, and with it the
  * settings the source is saved with, only catch up when they are read off it.
  * Expects s->mutex NOT to be held. */
-static void warp_pl_capture_transition_settings(struct warp_playlist_source *s)
+static void warp_pl_capture_transition_settings(struct warp_playlist_source *s, size_t dir)
 {
-	obs_source_t *tr = warp_pl_get_transition(s);
+	obs_source_t *tr = warp_pl_get_transition_dir(s, dir);
 	obs_data_t *live;
 	obs_data_t *copy;
 	char *id;
@@ -1051,7 +1174,7 @@ static void warp_pl_capture_transition_settings(struct warp_playlist_source *s)
 		return;
 
 	pthread_mutex_lock(&s->mutex);
-	id = bstrdup(s->transition_id);
+	id = bstrdup(s->tr[dir].id);
 	pthread_mutex_unlock(&s->mutex);
 
 	if (id) {
@@ -1063,12 +1186,12 @@ static void warp_pl_capture_transition_settings(struct warp_playlist_source *s)
 		/* the transitions that have nothing to configure are left out
 		 * of the settings the source is saved with entirely */
 		if (!warp_pl_data_empty(copy))
-			obs_data_set_obj(s->transition_store, id, copy);
+			obs_data_set_obj(s->tr[dir].store, id, copy);
 
 		/* where a stinger swaps the incoming file in is one of its own
 		 * settings, so the playlist picks it up along with them */
 		if (strcmp(id, WARP_PL_TR_STINGER) == 0)
-			s->stinger_point_ms = warp_pl_stinger_point_ms(copy);
+			s->tr[dir].stinger_point_ms = warp_pl_stinger_point_ms(copy);
 
 		pthread_mutex_unlock(&s->mutex);
 
@@ -1080,43 +1203,55 @@ static void warp_pl_capture_transition_settings(struct warp_playlist_source *s)
 	obs_source_release(tr);
 }
 
-/* Takes the transition settings the source was saved, or set from the outside,
- * with over the store, and returns whether it did, so that the transition that
- * is running is handed them. The store is where the transitions' own properties
- * end up, so the copy this source wrote to the settings itself is left alone.
- * Expects s->mutex NOT to be held. */
-static bool warp_pl_load_transition_store(struct warp_playlist_source *s, obs_data_t *settings, const char *id)
+/* reads back what every transition the playlist has is configured with; expects
+ * s->mutex NOT to be held */
+static void warp_pl_capture_transitions(struct warp_playlist_source *s)
 {
-	obs_data_t *stored = obs_data_get_obj(settings, "transition_settings");
+	for (size_t dir = 0; dir < WARP_PL_NUM_DIRS; dir++)
+		warp_pl_capture_transition_settings(s, dir);
+}
+
+/* Takes the transition settings the source was saved, or set from the outside,
+ * with over the store of 'dir', and returns whether it did, so that the
+ * transition that is running is handed them. The store is where the
+ * transitions' own properties end up, so the copy this source wrote to the
+ * settings itself is left alone. Expects s->mutex NOT to be held. */
+static bool warp_pl_load_transition_store(struct warp_playlist_source *s, obs_data_t *settings, size_t dir,
+					  const char *id)
+{
+	struct warp_pl_transition *cfg = &s->tr[dir];
+	obs_data_t *stored = obs_data_get_obj(settings, warp_pl_keys[dir].store);
 	const char *json = stored ? obs_data_get_json(stored) : NULL;
 	bool loaded = false;
 
 	pthread_mutex_lock(&s->mutex);
 
-	if (json && (!s->transition_store_json || strcmp(s->transition_store_json, json) != 0)) {
+	if (json && (!cfg->store_json || strcmp(cfg->store_json, json) != 0)) {
 		obs_data_t *store = obs_data_create_from_json(json);
 
 		if (store) {
-			obs_data_release(s->transition_store);
-			s->transition_store = store;
+			obs_data_release(cfg->store);
+			cfg->store = store;
 
-			bfree(s->transition_store_json);
-			s->transition_store_json = bstrdup(json);
+			bfree(cfg->store_json);
+			cfg->store_json = bstrdup(json);
 
 			loaded = true;
 		}
-	} else if (!stored && !s->transition_store_loaded) {
+	} else if (!stored && !cfg->store_loaded && dir == WARP_PL_DIR_FORWARD) {
+		/* the flat settings were only ever there for the one transition
+		 * the playlist had, which is the one it goes forward with */
 		obs_data_t *legacy = warp_pl_legacy_transition_settings(id, settings);
 
 		if (legacy) {
-			obs_data_set_obj(s->transition_store, id, legacy);
+			obs_data_set_obj(cfg->store, id, legacy);
 			obs_data_release(legacy);
 
 			loaded = true;
 		}
 	}
 
-	s->transition_store_loaded = true;
+	cfg->store_loaded = true;
 
 	pthread_mutex_unlock(&s->mutex);
 
@@ -1125,14 +1260,14 @@ static bool warp_pl_load_transition_store(struct warp_playlist_source *s, obs_da
 	return loaded;
 }
 
-/* The settings a transition is created with: the ones it was last configured
- * with, or, for a stinger that has never been configured, a transition point
- * that leaves room for the swap behind it rather than the zero it would
- * otherwise start out at. The caller owns the reference. Expects s->mutex to be
- * held. */
-static obs_data_t *warp_pl_transition_settings(struct warp_playlist_source *s, const char *id)
+/* The settings the transition for 'dir' is created with: the ones it was last
+ * configured with, or, for a stinger that has never been configured, a
+ * transition point that leaves room for the swap behind it rather than the zero
+ * it would otherwise start out at. The caller owns the reference. Expects
+ * s->mutex to be held. */
+static obs_data_t *warp_pl_transition_settings(struct warp_playlist_source *s, size_t dir, const char *id)
 {
-	obs_data_t *tr_settings = obs_data_get_obj(s->transition_store, id);
+	obs_data_t *tr_settings = obs_data_get_obj(s->tr[dir].store, id);
 
 	if (!tr_settings && strcmp(id, WARP_PL_TR_STINGER) == 0) {
 		tr_settings = obs_data_create();
@@ -1140,7 +1275,7 @@ static obs_data_t *warp_pl_transition_settings(struct warp_playlist_source *s, c
 		obs_data_set_int(tr_settings, "tp_type", WARP_PL_STINGER_TP_TIME);
 		obs_data_set_int(tr_settings, "transition_point", WARP_PL_DEFAULT_STINGER_MS);
 
-		obs_data_set_obj(s->transition_store, id, tr_settings);
+		obs_data_set_obj(s->tr[dir].store, id, tr_settings);
 	}
 
 	return tr_settings;
@@ -1178,18 +1313,18 @@ static enum obs_transition_scale_type warp_pl_scale_from_string(const char *val)
 	return OBS_TRANSITION_SCALE_ASPECT;
 }
 
-/* Brings the live transition up to date with the settings without swapping it
- * out: the type is the one that is already running, only what it is configured
- * with changed. Expects s->mutex NOT to be held. */
-static void warp_pl_configure_transition(struct warp_playlist_source *s, obs_data_t *tr_settings, bool layout,
-					 uint32_t alignment, enum obs_transition_scale_type scale)
+/* Brings the live transition for 'dir' up to date with the settings without
+ * swapping it out: the type is the one that is already running, only what it is
+ * configured with changed. Expects s->mutex NOT to be held. */
+static void warp_pl_configure_transition(struct warp_playlist_source *s, size_t dir, obs_data_t *tr_settings,
+					 bool layout, uint32_t alignment, enum obs_transition_scale_type scale)
 {
 	obs_source_t *tr;
 
 	if (!tr_settings && !layout)
 		return;
 
-	tr = warp_pl_get_transition(s);
+	tr = warp_pl_get_transition_dir(s, dir);
 
 	if (!tr)
 		return;
@@ -1205,13 +1340,64 @@ static void warp_pl_configure_transition(struct warp_playlist_source *s, obs_dat
 	obs_source_release(tr);
 }
 
+/* Drops the transition for 'dir', which is no longer wanted: going back has
+ * been put back on the forward transition. Whatever it is showing goes over to
+ * the forward one, so the picture does not blink out with it. Expects s->mutex
+ * NOT to be held. */
+static void warp_pl_release_transition(struct warp_playlist_source *s, size_t dir)
+{
+	obs_source_t *into = NULL;
+	obs_source_t *old;
+	bool was_active;
+
+	pthread_mutex_lock(&s->mutex);
+
+	old = s->tr[dir].source;
+	s->tr[dir].source = NULL;
+	bfree(s->tr[dir].id);
+	s->tr[dir].id = NULL;
+
+	was_active = old && s->active_dir == dir;
+
+	if (was_active)
+		into = obs_source_get_ref(s->tr[WARP_PL_DIR_FORWARD].source);
+
+	pthread_mutex_unlock(&s->mutex);
+
+	if (!old)
+		return;
+
+	if (into) {
+		obs_source_t *showing = obs_transition_get_active_source(old);
+
+		if (showing) {
+			obs_transition_set(into, showing);
+			obs_source_release(showing);
+		}
+
+		obs_source_release(into);
+	}
+
+	if (was_active) {
+		pthread_mutex_lock(&s->mutex);
+		s->active_dir = WARP_PL_DIR_FORWARD;
+		pthread_mutex_unlock(&s->mutex);
+	}
+
+	obs_transition_clear(old);
+	obs_source_remove_active_child(s->source, old);
+	obs_source_release(old);
+}
+
 /* Creates the transition the settings ask for and moves whatever is on screen
- * over to it, or configures the one already running when only its settings
- * changed. Runs from the tick, so it cannot race with another swap, and with
+ * over to it, configures the one already running when only its settings
+ * changed, or drops it when the direction it belongs to has none of its own any
+ * more. Runs from the tick, so it cannot race with another swap, and with
  * s->mutex dropped, so that creating and releasing the transition does not take
  * libobs' global source lock from under it. */
-static void warp_pl_swap_transition(struct warp_playlist_source *s)
+static void warp_pl_swap_transition(struct warp_playlist_source *s, size_t dir)
 {
+	struct warp_pl_transition *cfg = &s->tr[dir];
 	enum obs_transition_scale_type scale;
 	obs_data_t *tr_settings;
 	obs_source_t *carry = NULL;
@@ -1219,24 +1405,35 @@ static void warp_pl_swap_transition(struct warp_playlist_source *s)
 	uint32_t alignment;
 	uint32_t cx;
 	uint32_t cy;
+	bool release;
 	bool layout;
+	bool active;
 	char *id;
 
 	pthread_mutex_lock(&s->mutex);
-	id = s->pending_transition_id;
-	s->pending_transition_id = NULL;
-	tr_settings = s->pending_transition_settings;
-	s->pending_transition_settings = NULL;
-	layout = s->pending_transition_layout;
-	s->pending_transition_layout = false;
-	alignment = s->transition_alignment;
-	scale = s->transition_scale;
+	id = cfg->pending_id;
+	cfg->pending_id = NULL;
+	tr_settings = cfg->pending_settings;
+	cfg->pending_settings = NULL;
+	layout = cfg->pending_layout;
+	cfg->pending_layout = false;
+	release = cfg->pending_release;
+	cfg->pending_release = false;
+	alignment = cfg->alignment;
+	scale = cfg->scale;
 	cx = s->cx;
 	cy = s->cy;
 	pthread_mutex_unlock(&s->mutex);
 
+	if (release) {
+		obs_data_release(tr_settings);
+		bfree(id);
+		warp_pl_release_transition(s, dir);
+		return;
+	}
+
 	if (!id) {
-		warp_pl_configure_transition(s, tr_settings, layout, alignment, scale);
+		warp_pl_configure_transition(s, dir, tr_settings, layout, alignment, scale);
 		obs_data_release(tr_settings);
 		return;
 	}
@@ -1256,22 +1453,24 @@ static void warp_pl_swap_transition(struct warp_playlist_source *s)
 	obs_transition_set_size(tr, cx, cy);
 
 	pthread_mutex_lock(&s->mutex);
-	if (s->current && !s->showing_nothing)
+	active = s->active_dir == dir;
+	if (active && s->current && !s->showing_nothing)
 		carry = obs_source_get_ref(s->current);
 	pthread_mutex_unlock(&s->mutex);
 
 	/* carry whatever is on screen over, before anything can render the
-	 * new transition and find it empty */
+	 * new transition and find it empty; the one that is not on screen has
+	 * nothing to carry, and is handed the picture when it is switched to */
 	if (carry) {
 		obs_transition_set(tr, carry);
 		obs_source_release(carry);
 	}
 
 	pthread_mutex_lock(&s->mutex);
-	old = s->transition;
-	s->transition = tr;
-	bfree(s->transition_id);
-	s->transition_id = id;
+	old = cfg->source;
+	cfg->source = tr;
+	bfree(cfg->id);
+	cfg->id = id;
 	pthread_mutex_unlock(&s->mutex);
 
 	obs_source_add_active_child(s->source, tr);
@@ -1296,6 +1495,11 @@ static void warp_playlist_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "transition_timing", WARP_PL_TIMING_OVERLAP);
 	obs_data_set_default_string(settings, "transition_scale", WARP_PL_SCALE_FIT);
 	obs_data_set_default_string(settings, "transition_alignment", "center");
+	obs_data_set_default_bool(settings, "separate_back_transition", false);
+	obs_data_set_default_string(settings, "back_transition", WARP_PL_DEFAULT_TRANSITION);
+	obs_data_set_default_int(settings, "back_transition_duration", WARP_PL_DEFAULT_TRANSITION_MS);
+	obs_data_set_default_string(settings, "back_transition_scale", WARP_PL_SCALE_FIT);
+	obs_data_set_default_string(settings, "back_transition_alignment", "center");
 	obs_data_set_default_int(settings, "speed_percent", 100);
 	obs_data_set_default_bool(settings, "restart_on_activate", true);
 	obs_data_set_default_bool(settings, "clear_on_media_end", true);
@@ -1309,40 +1513,71 @@ static const char *audio_filter = " (*.mp3 *.aac *.ogg *.wav);;";
 
 /* Only what the playlist puts around the transition is shown here; what the
  * transition itself is configured with belongs to the transition. */
-static bool warp_pl_transition_changed(obs_properties_t *props, obs_property_t *prop, obs_data_t *settings)
+static bool warp_pl_transition_changed_dir(obs_properties_t *props, obs_data_t *settings, size_t dir)
 {
-	const char *id = obs_data_get_string(settings, "transition");
+	const char *id = obs_data_get_string(settings, warp_pl_keys[dir].id);
 	bool is_cut = strcmp(id, WARP_PL_TR_CUT) == 0;
 	bool is_stinger = strcmp(id, WARP_PL_TR_STINGER) == 0;
 
+	/* a cut is instant, and a stinger runs for as long as its video */
+	obs_property_set_visible(obs_properties_get(props, warp_pl_keys[dir].duration), !is_cut && !is_stinger);
+
+	if (warp_pl_keys[dir].timing)
+		obs_property_set_visible(obs_properties_get(props, warp_pl_keys[dir].timing), !is_cut);
+
+	return true;
+}
+
+static bool warp_pl_transition_changed(obs_properties_t *props, obs_property_t *prop, obs_data_t *settings)
+{
 	UNUSED_PARAMETER(prop);
 
-	/* a cut is instant, and a stinger runs for as long as its video */
-	obs_property_set_visible(obs_properties_get(props, "transition_duration"), !is_cut && !is_stinger);
-	obs_property_set_visible(obs_properties_get(props, "transition_timing"), !is_cut);
+	return warp_pl_transition_changed_dir(props, settings, WARP_PL_DIR_FORWARD);
+}
+
+static bool warp_pl_back_transition_changed(obs_properties_t *props, obs_property_t *prop, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(prop);
+
+	return warp_pl_transition_changed_dir(props, settings, WARP_PL_DIR_BACKWARD);
+}
+
+/* Shows the section that going back through the playlist is configured in, and
+ * says as much in the heading of the one above it: with a transition of its own
+ * for going back, the transition the playlist has always had is the one it goes
+ * forward with. */
+static bool warp_pl_separate_back_changed(obs_properties_t *props, obs_property_t *prop, obs_data_t *settings)
+{
+	bool separate = obs_data_get_bool(settings, "separate_back_transition");
+	obs_property_t *forward = obs_properties_get(props, "transition_group");
+
+	UNUSED_PARAMETER(prop);
+
+	if (forward)
+		obs_property_set_description(forward,
+					     obs_module_text(separate ? "Warp.Playlist.Group.Transition.Forward"
+								      : "Warp.Playlist.Group.Transition"));
+
+	obs_property_set_visible(obs_properties_get(props, "back_transition_group"), separate);
 
 	return true;
 }
 
 #ifdef WARP_HAVE_FRONTEND_API
-/* Opens the properties of the transition that is running, the same window OBS
- * opens for the transitions in its own list, preview and all. What is changed
- * there is applied to the transition on the spot, and read back into the
- * settings this source is saved with. */
-static bool warp_pl_transition_props_clicked(obs_properties_t *props, obs_property_t *prop, void *data)
+/* Opens the properties of the transition for 'dir', the same window OBS opens
+ * for the transitions in its own list, preview and all. What is changed there
+ * is applied to the transition on the spot, and read back into the settings
+ * this source is saved with. */
+static bool warp_pl_open_transition_props(struct warp_playlist_source *s, size_t dir)
 {
-	struct warp_playlist_source *s = data;
 	obs_source_t *transition;
-
-	UNUSED_PARAMETER(props);
-	UNUSED_PARAMETER(prop);
 
 	/* no source of its own to configure: the properties were asked for by
 	 * id rather than for a playlist that exists */
 	if (!s)
 		return false;
 
-	transition = warp_pl_get_transition(s);
+	transition = warp_pl_get_transition_dir(s, dir);
 
 	if (!transition)
 		return false;
@@ -1352,15 +1587,34 @@ static bool warp_pl_transition_props_clicked(obs_properties_t *props, obs_proper
 
 	return false;
 }
+
+static bool warp_pl_transition_props_clicked(obs_properties_t *props, obs_property_t *prop, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(prop);
+
+	return warp_pl_open_transition_props(data, WARP_PL_DIR_FORWARD);
+}
+
+static bool warp_pl_back_transition_props_clicked(obs_properties_t *props, obs_property_t *prop, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(prop);
+
+	return warp_pl_open_transition_props(data, WARP_PL_DIR_BACKWARD);
+}
 #endif
 
-static obs_properties_t *warp_pl_transition_properties(struct warp_playlist_source *s)
+static obs_properties_t *warp_pl_transition_properties(struct warp_playlist_source *s, size_t dir)
 {
+	bool back = dir == WARP_PL_DIR_BACKWARD;
 	obs_properties_t *props = obs_properties_create();
 	obs_property_t *prop;
 	const char *id;
 
-	prop = obs_properties_add_list(props, "transition", obs_module_text("Warp.Playlist.Transition"),
+	prop = obs_properties_add_list(props, warp_pl_keys[dir].id,
+				       obs_module_text(back ? "Warp.Playlist.Transition.Back"
+							    : "Warp.Playlist.Transition"),
 				       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 
 	for (size_t i = 0; obs_enum_transition_types(i, &id); i++) {
@@ -1369,31 +1623,39 @@ static obs_properties_t *warp_pl_transition_properties(struct warp_playlist_sour
 		obs_property_list_add_string(prop, name ? name : id, id);
 	}
 
-	obs_property_set_modified_callback(prop, warp_pl_transition_changed);
+	obs_property_set_modified_callback(prop, back ? warp_pl_back_transition_changed : warp_pl_transition_changed);
 
 #ifdef WARP_HAVE_FRONTEND_API
-	prop = obs_properties_add_button2(props, "transition_properties",
-					  obs_module_text("Warp.Playlist.Transition.Properties"),
-					  warp_pl_transition_props_clicked, s);
-	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.Transition.Properties.Desc"));
+	prop = obs_properties_add_button2(
+		props, warp_pl_keys[dir].properties, obs_module_text("Warp.Playlist.Transition.Properties"),
+		back ? warp_pl_back_transition_props_clicked : warp_pl_transition_props_clicked, s);
+	obs_property_set_long_description(prop, obs_module_text(back ? "Warp.Playlist.Transition.Back.Properties.Desc"
+								     : "Warp.Playlist.Transition.Properties.Desc"));
 #else
 	UNUSED_PARAMETER(s);
 #endif
 
-	prop = obs_properties_add_int_slider(props, "transition_duration",
+	prop = obs_properties_add_int_slider(props, warp_pl_keys[dir].duration,
 					     obs_module_text("Warp.Playlist.TransitionDuration"), 0, 10000, 50);
 	obs_property_int_set_suffix(prop, " ms");
 
-	prop = obs_properties_add_list(props, "transition_timing", obs_module_text("Warp.Playlist.TransitionTiming"),
-				       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(prop, obs_module_text("Warp.Playlist.TransitionTiming.Overlap"),
-				     WARP_PL_TIMING_OVERLAP);
-	obs_property_list_add_string(prop, obs_module_text("Warp.Playlist.TransitionTiming.After"),
-				     WARP_PL_TIMING_AFTER);
-	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.TransitionTiming.Desc"));
+	/* Where the transition sits against the end of the file only applies to
+	 * automatic advance, which only ever moves forward: a move back through
+	 * the playlist is asked for, and runs from the moment it is. */
+	if (warp_pl_keys[dir].timing) {
+		prop = obs_properties_add_list(props, warp_pl_keys[dir].timing,
+					       obs_module_text("Warp.Playlist.TransitionTiming"), OBS_COMBO_TYPE_LIST,
+					       OBS_COMBO_FORMAT_STRING);
+		obs_property_list_add_string(prop, obs_module_text("Warp.Playlist.TransitionTiming.Overlap"),
+					     WARP_PL_TIMING_OVERLAP);
+		obs_property_list_add_string(prop, obs_module_text("Warp.Playlist.TransitionTiming.After"),
+					     WARP_PL_TIMING_AFTER);
+		obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.TransitionTiming.Desc"));
+	}
 
-	prop = obs_properties_add_list(props, "transition_scale", obs_module_text("Warp.Playlist.Transition.Scale"),
-				       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	prop = obs_properties_add_list(props, warp_pl_keys[dir].scale,
+				       obs_module_text("Warp.Playlist.Transition.Scale"), OBS_COMBO_TYPE_LIST,
+				       OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(prop, obs_module_text("Warp.Playlist.Transition.Scale.Fit"), WARP_PL_SCALE_FIT);
 	obs_property_list_add_string(prop, obs_module_text("Warp.Playlist.Transition.Scale.Stretch"),
 				     WARP_PL_SCALE_STRETCH);
@@ -1401,7 +1663,7 @@ static obs_properties_t *warp_pl_transition_properties(struct warp_playlist_sour
 				     WARP_PL_SCALE_DOWN_ONLY);
 	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.Transition.Scale.Desc"));
 
-	prop = obs_properties_add_list(props, "transition_alignment",
+	prop = obs_properties_add_list(props, warp_pl_keys[dir].alignment,
 				       obs_module_text("Warp.Playlist.Transition.Alignment"), OBS_COMBO_TYPE_LIST,
 				       OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(prop, obs_module_text("Warp.Playlist.Align.Center"), "center");
@@ -1463,7 +1725,15 @@ static obs_properties_t *warp_playlist_getproperties(void *data)
 	obs_properties_add_bool(props, "loop_playlist", obs_module_text("Warp.Playlist.Loop"));
 
 	obs_properties_add_group(props, "transition_group", obs_module_text("Warp.Playlist.Group.Transition"),
-				 OBS_GROUP_NORMAL, warp_pl_transition_properties(s));
+				 OBS_GROUP_NORMAL, warp_pl_transition_properties(s, WARP_PL_DIR_FORWARD));
+
+	prop = obs_properties_add_bool(props, "separate_back_transition",
+				       obs_module_text("Warp.Playlist.SeparateBackTransition"));
+	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.SeparateBackTransition.Desc"));
+	obs_property_set_modified_callback(prop, warp_pl_separate_back_changed);
+
+	obs_properties_add_group(props, "back_transition_group", obs_module_text("Warp.Playlist.Group.Transition.Back"),
+				 OBS_GROUP_NORMAL, warp_pl_transition_properties(s, WARP_PL_DIR_BACKWARD));
 
 	prop = obs_properties_add_int_slider(props, "speed_percent", obs_module_text("Warp.Video.Speed"), MP_SPEED_MIN,
 					     MP_SPEED_MAX, 1);
@@ -1536,30 +1806,121 @@ static bool warp_pl_load_playlist(struct warp_playlist_source *s, obs_data_t *se
 	return true;
 }
 
+/* The transition of 'dir' as the settings ask for it. The tick picks the type
+ * and the settings up; everything the playlist itself needs to know is applied
+ * on the spot. Expects s->mutex to be held. */
+static void warp_pl_apply_transition(struct warp_playlist_source *s, size_t dir, const char *id, uint32_t ms,
+				     bool overlap, uint32_t alignment, enum obs_transition_scale_type scale,
+				     bool store_loaded)
+{
+	struct warp_pl_transition *cfg = &s->tr[dir];
+
+	cfg->ms = ms;
+	cfg->is_cut = strcmp(id, WARP_PL_TR_CUT) == 0;
+	cfg->is_stinger = strcmp(id, WARP_PL_TR_STINGER) == 0;
+	cfg->overlap = overlap;
+	/* it is wanted after all */
+	cfg->pending_release = false;
+
+	/* The tick creates the transition when the type changed and hands
+	 * whichever one ends up running its settings. What the settings ask for
+	 * is compared against the transition that is queued for the next tick
+	 * when there is one, so that picking a transition and going back to the
+	 * one that is already running before the tick comes around leaves it
+	 * alone rather than swapping in the one in between. */
+	const char *wanted = cfg->pending_id ? cfg->pending_id : cfg->id;
+	bool type_changed = !wanted || strcmp(wanted, id) != 0;
+
+	if (type_changed) {
+		bfree(cfg->pending_id);
+		cfg->pending_id = NULL;
+
+		/* nothing to swap when it is the one already running */
+		if (!cfg->id || strcmp(cfg->id, id) != 0)
+			cfg->pending_id = bstrdup(id);
+	}
+
+	/* What the transition is configured with only has to be handed over
+	 * when a transition is about to be created, or when settings were just
+	 * loaded: everything else that configures one goes through the
+	 * transition's own properties, which apply to it directly. A stinger
+	 * reloads its video every time it is updated, which is not something an
+	 * unrelated property being edited should set off. */
+	obs_data_t *tr_settings = warp_pl_transition_settings(s, dir, id);
+
+	cfg->stinger_point_ms = cfg->is_stinger ? warp_pl_stinger_point_ms(tr_settings) : 0;
+
+	if (type_changed || store_loaded) {
+		obs_data_release(cfg->pending_settings);
+		cfg->pending_settings = warp_pl_data_copy(tr_settings);
+	}
+
+	obs_data_release(tr_settings);
+
+	if (cfg->alignment != alignment || cfg->scale != scale)
+		cfg->pending_layout = true;
+
+	cfg->alignment = alignment;
+	cfg->scale = scale;
+}
+
+/* Gives up the transition of 'dir': the direction runs through the forward one
+ * from here on, and the tick drops the live transition. What it was configured
+ * with is kept, so turning it back on picks it up again. Expects s->mutex to be
+ * held. */
+static void warp_pl_drop_transition(struct warp_playlist_source *s, size_t dir)
+{
+	struct warp_pl_transition *cfg = &s->tr[dir];
+
+	bfree(cfg->pending_id);
+	cfg->pending_id = NULL;
+
+	obs_data_release(cfg->pending_settings);
+	cfg->pending_settings = NULL;
+
+	cfg->pending_layout = false;
+
+	if (cfg->source)
+		cfg->pending_release = true;
+}
+
 static void warp_playlist_update(void *data, obs_data_t *settings)
 {
 	struct warp_playlist_source *s = data;
 
 	bool active = obs_source_active(s->source);
-	const char *transition_id = obs_data_get_string(settings, "transition");
+	bool separate_back = obs_data_get_bool(settings, "separate_back_transition");
 	int speed = (int)obs_data_get_int(settings, "speed_percent");
-
-	if (!transition_id || !*transition_id)
-		transition_id = WARP_PL_DEFAULT_TRANSITION;
 
 	if (speed < MP_SPEED_MIN || speed > MP_SPEED_MAX)
 		speed = 100;
 
-	/* the transition's own properties write to the transition rather than
-	 * to these settings, so what it is running with is read back before the
-	 * settings it was saved with are looked at */
-	warp_pl_capture_transition_settings(s);
+	/* the transitions' own properties write to the transitions rather than
+	 * to these settings, so what they are running with is read back before
+	 * the settings they were saved with are looked at */
+	warp_pl_capture_transitions(s);
 
-	bool store_loaded = warp_pl_load_transition_store(s, settings, transition_id);
+	const char *transition_id[WARP_PL_NUM_DIRS];
+	bool store_loaded[WARP_PL_NUM_DIRS];
+	uint32_t alignment[WARP_PL_NUM_DIRS];
+	enum obs_transition_scale_type scale[WARP_PL_NUM_DIRS];
 
-	uint32_t alignment = warp_pl_alignment_from_string(obs_data_get_string(settings, "transition_alignment"));
-	enum obs_transition_scale_type scale =
-		warp_pl_scale_from_string(obs_data_get_string(settings, "transition_scale"));
+	for (size_t dir = 0; dir < WARP_PL_NUM_DIRS; dir++) {
+		const char *id = obs_data_get_string(settings, warp_pl_keys[dir].id);
+
+		if (!id || !*id)
+			id = WARP_PL_DEFAULT_TRANSITION;
+
+		transition_id[dir] = id;
+		/* the store of a direction that has no transition of its own is
+		 * loaded all the same, so that turning one on brings back what
+		 * it was set up with */
+		store_loaded[dir] = warp_pl_load_transition_store(s, settings, dir, id);
+		alignment[dir] =
+			warp_pl_alignment_from_string(obs_data_get_string(settings, warp_pl_keys[dir].alignment));
+		scale[dir] = warp_pl_scale_from_string(obs_data_get_string(settings, warp_pl_keys[dir].scale));
+	}
+
 	bool overlap = strcmp(obs_data_get_string(settings, "transition_timing"), WARP_PL_TIMING_AFTER) != 0;
 
 	pthread_mutex_lock(&s->mutex);
@@ -1581,10 +1942,7 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 	s->shuffle = shuffle;
 	s->auto_advance = obs_data_get_bool(settings, "auto_advance");
 	s->loop_playlist = obs_data_get_bool(settings, "loop_playlist");
-	s->transition_ms = (uint32_t)obs_data_get_int(settings, "transition_duration");
-	s->transition_is_cut = strcmp(transition_id, WARP_PL_TR_CUT) == 0;
-	s->transition_is_stinger = strcmp(transition_id, WARP_PL_TR_STINGER) == 0;
-	s->transition_overlap = overlap;
+	s->separate_back_transition = separate_back;
 	s->restart_on_activate = obs_data_get_bool(settings, "restart_on_activate");
 	s->clear_on_media_end = obs_data_get_bool(settings, "clear_on_media_end");
 	s->hw_decode = obs_data_get_bool(settings, "hw_decode");
@@ -1624,46 +1982,17 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 		}
 	}
 
-	/* The tick creates the transition when the type changed and hands
-	 * whichever one ends up running its settings. What the settings ask for
-	 * is compared against the transition that is queued for the next tick
-	 * when there is one, so that picking a transition and going back to the
-	 * one that is already running before the tick comes around leaves it
-	 * alone rather than swapping in the one in between. */
-	const char *wanted = s->pending_transition_id ? s->pending_transition_id : s->transition_id;
-	bool type_changed = !wanted || strcmp(wanted, transition_id) != 0;
+	for (size_t dir = 0; dir < WARP_PL_NUM_DIRS; dir++) {
+		if (dir == WARP_PL_DIR_BACKWARD && !separate_back) {
+			warp_pl_drop_transition(s, dir);
+			continue;
+		}
 
-	if (type_changed) {
-		bfree(s->pending_transition_id);
-		s->pending_transition_id = NULL;
-
-		/* nothing to swap when it is the one already running */
-		if (!s->transition_id || strcmp(s->transition_id, transition_id) != 0)
-			s->pending_transition_id = bstrdup(transition_id);
+		warp_pl_apply_transition(s, dir, transition_id[dir],
+					 (uint32_t)obs_data_get_int(settings, warp_pl_keys[dir].duration),
+					 dir == WARP_PL_DIR_FORWARD ? overlap : true, alignment[dir], scale[dir],
+					 store_loaded[dir]);
 	}
-
-	/* What the transition is configured with only has to be handed over
-	 * when a transition is about to be created, or when settings were just
-	 * loaded: everything else that configures one goes through the
-	 * transition's own properties, which apply to it directly. A stinger
-	 * reloads its video every time it is updated, which is not something an
-	 * unrelated property being edited should set off. */
-	obs_data_t *tr_settings = warp_pl_transition_settings(s, transition_id);
-
-	s->stinger_point_ms = s->transition_is_stinger ? warp_pl_stinger_point_ms(tr_settings) : 0;
-
-	if (type_changed || store_loaded) {
-		obs_data_release(s->pending_transition_settings);
-		s->pending_transition_settings = warp_pl_data_copy(tr_settings);
-	}
-
-	obs_data_release(tr_settings);
-
-	if (s->transition_alignment != alignment || s->transition_scale != scale)
-		s->pending_transition_layout = true;
-
-	s->transition_alignment = alignment;
-	s->transition_scale = scale;
 
 	/* the property applies to the file that is playing as well as to the
 	 * ones that follow it */
@@ -1673,7 +2002,7 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 	/* start at the top when nothing is playing: either the source was just
 	 * created, or the file that was playing is no longer in the list */
 	if (s->order.num && s->pos >= s->order.num && !s->pending && (!s->restart_on_activate || active))
-		warp_pl_play_pos(s, 0, false);
+		warp_pl_play_pos(s, 0, false, WARP_PL_DIR_FORWARD);
 
 	int speed_now = s->speed;
 
@@ -1693,25 +2022,28 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 static void warp_playlist_save(void *data, obs_data_t *settings)
 {
 	struct warp_playlist_source *s = data;
-	obs_data_t *store = obs_data_create();
 
-	/* the transition's own properties write to the transition, so what it
-	 * is running with is read back before it is written out */
-	warp_pl_capture_transition_settings(s);
+	/* the transitions' own properties write to the transitions, so what
+	 * they are running with is read back before they are written out */
+	warp_pl_capture_transitions(s);
 
-	pthread_mutex_lock(&s->mutex);
+	for (size_t dir = 0; dir < WARP_PL_NUM_DIRS; dir++) {
+		obs_data_t *store = obs_data_create();
 
-	obs_data_apply(store, s->transition_store);
+		pthread_mutex_lock(&s->mutex);
 
-	/* what the settings are left holding, so that the next update tells
-	 * settings being loaded from the copy written here */
-	bfree(s->transition_store_json);
-	s->transition_store_json = bstrdup(obs_data_get_json(store));
+		obs_data_apply(store, s->tr[dir].store);
 
-	pthread_mutex_unlock(&s->mutex);
+		/* what the settings are left holding, so that the next update
+		 * tells settings being loaded from the copy written here */
+		bfree(s->tr[dir].store_json);
+		s->tr[dir].store_json = bstrdup(obs_data_get_json(store));
 
-	obs_data_set_obj(settings, "transition_settings", store);
-	obs_data_release(store);
+		pthread_mutex_unlock(&s->mutex);
+
+		obs_data_set_obj(settings, warp_pl_keys[dir].store, store);
+		obs_data_release(store);
+	}
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2171,16 +2503,22 @@ static void *warp_playlist_create(obs_data_t *settings, obs_source_t *source)
 	s->base_speed = 100;
 	/* s->speed is left at zero: the update below fills it in, and a speed
 	 * that was never played at is not a change to report */
-	s->transition_ms = WARP_PL_DEFAULT_TRANSITION_MS;
-	s->transition_store = obs_data_create();
-	s->transition_overlap = true;
-	s->transition_alignment = OBS_ALIGN_CENTER;
-	s->transition_scale = OBS_TRANSITION_SCALE_ASPECT;
 	s->rand_state = os_gettime_ns() | 1;
+
+	for (size_t dir = 0; dir < WARP_PL_NUM_DIRS; dir++) {
+		s->tr[dir].ms = WARP_PL_DEFAULT_TRANSITION_MS;
+		s->tr[dir].store = obs_data_create();
+		s->tr[dir].overlap = true;
+		s->tr[dir].alignment = OBS_ALIGN_CENTER;
+		s->tr[dir].scale = OBS_TRANSITION_SCALE_ASPECT;
+	}
 
 	if (pthread_mutex_init(&s->mutex, NULL)) {
 		blog(LOG_ERROR, "[Warp Playlist]: failed to initialize mutex");
-		obs_data_release(s->transition_store);
+
+		for (size_t dir = 0; dir < WARP_PL_NUM_DIRS; dir++)
+			obs_data_release(s->tr[dir].store);
+
 		bfree(s);
 		return NULL;
 	}
@@ -2201,7 +2539,7 @@ static void warp_playlist_destroy(void *data)
 {
 	struct warp_playlist_source *s = data;
 	DARRAY(obs_source_t *) retired;
-	obs_source_t *transition;
+	obs_source_t *transitions[WARP_PL_NUM_DIRS];
 	obs_source_t *target;
 	obs_source_t *current;
 	obs_source_t *pending;
@@ -2226,27 +2564,34 @@ static void warp_playlist_destroy(void *data)
 	current = s->current;
 	pending = s->pending;
 	prev = s->prev;
-	transition = s->transition;
 
 	s->transition_target = NULL;
 	s->current = NULL;
 	s->pending = NULL;
 	s->prev = NULL;
-	s->transition = NULL;
 
 	for (size_t i = 0; i < s->paths.num; i++)
 		bfree(s->paths.array[i]);
 	da_free(s->paths);
 	da_free(s->order);
 
-	bfree(s->transition_id);
-	bfree(s->pending_transition_id);
+	for (size_t dir = 0; dir < WARP_PL_NUM_DIRS; dir++) {
+		transitions[dir] = s->tr[dir].source;
+		s->tr[dir].source = NULL;
 
-	obs_data_release(s->pending_transition_settings);
-	s->pending_transition_settings = NULL;
-	obs_data_release(s->transition_store);
-	s->transition_store = NULL;
-	bfree(s->transition_store_json);
+		bfree(s->tr[dir].id);
+		s->tr[dir].id = NULL;
+		bfree(s->tr[dir].pending_id);
+		s->tr[dir].pending_id = NULL;
+
+		obs_data_release(s->tr[dir].pending_settings);
+		s->tr[dir].pending_settings = NULL;
+		obs_data_release(s->tr[dir].store);
+		s->tr[dir].store = NULL;
+
+		bfree(s->tr[dir].store_json);
+		s->tr[dir].store_json = NULL;
+	}
 
 	pthread_mutex_unlock(&s->mutex);
 
@@ -2263,10 +2608,13 @@ static void warp_playlist_destroy(void *data)
 	if (prev)
 		obs_source_release(prev);
 
-	if (transition) {
-		obs_transition_clear(transition);
-		obs_source_remove_active_child(s->source, transition);
-		obs_source_release(transition);
+	for (size_t dir = 0; dir < WARP_PL_NUM_DIRS; dir++) {
+		if (!transitions[dir])
+			continue;
+
+		obs_transition_clear(transitions[dir]);
+		obs_source_remove_active_child(s->source, transitions[dir]);
+		obs_source_release(transitions[dir]);
 	}
 
 	pthread_mutex_destroy(&s->mutex);
@@ -2337,11 +2685,14 @@ static bool warp_playlist_audio_render(void *data, uint64_t *ts_out, struct obs_
 static void warp_playlist_enum_active_sources(void *data, obs_source_enum_proc_t cb, void *param)
 {
 	struct warp_playlist_source *s = data;
-	obs_source_t *transition = warp_pl_get_transition(s);
 
-	if (transition) {
-		cb(s->source, transition, param);
-		obs_source_release(transition);
+	for (size_t dir = 0; dir < WARP_PL_NUM_DIRS; dir++) {
+		obs_source_t *transition = warp_pl_get_transition_dir(s, dir);
+
+		if (transition) {
+			cb(s->source, transition, param);
+			obs_source_release(transition);
+		}
 	}
 }
 
@@ -2372,13 +2723,16 @@ static int64_t warp_pl_remaining_ms(struct warp_playlist_source *s)
  * transition to land on its last frame: the whole of the transition for most of
  * them, the point at which the incoming item is swapped in for a stinger, and
  * next to nothing for a cut, or when the transition is set to run after the
- * item rather than overlap it. Expects s->mutex to be held. */
+ * item rather than overlap it. Automatic advance is the only switch placed
+ * against the end of a file, and it only ever moves forward, so this is the
+ * forward transition's. Expects s->mutex to be held. */
 static uint32_t warp_pl_transition_lead_ms(struct warp_playlist_source *s)
 {
+	const struct warp_pl_transition *cfg = &s->tr[WARP_PL_DIR_FORWARD];
 	uint32_t lead = 0;
 
-	if (s->transition_overlap && !s->transition_is_cut)
-		lead = s->transition_is_stinger ? s->stinger_point_ms : s->transition_ms;
+	if (cfg->overlap && !cfg->is_cut)
+		lead = cfg->is_stinger ? cfg->stinger_point_ms : cfg->ms;
 
 	return lead > WARP_PL_END_GUARD_MS ? lead : WARP_PL_END_GUARD_MS;
 }
@@ -2429,7 +2783,8 @@ static void warp_playlist_tick(void *data, float seconds)
 	struct warp_playlist_source *s = data;
 
 	/* creates and releases sources, so it runs with the lock dropped */
-	warp_pl_swap_transition(s);
+	for (size_t dir = 0; dir < WARP_PL_NUM_DIRS; dir++)
+		warp_pl_swap_transition(s, dir);
 
 	obs_source_t *transition = warp_pl_get_transition(s);
 	float transition_time = transition ? obs_transition_get_time(transition) : 1.0f;
@@ -2520,11 +2875,19 @@ static void warp_playlist_tick(void *data, float seconds)
 
 	warp_pl_unlock(s);
 
-	if (transition) {
-		if (resized)
-			obs_transition_set_size(transition, cx, cy);
+	obs_source_release(transition);
 
-		obs_source_release(transition);
+	/* both transitions are sized, so the one that is not on screen is laid
+	 * out against the right bounds the moment it is switched to */
+	if (resized) {
+		for (size_t dir = 0; dir < WARP_PL_NUM_DIRS; dir++) {
+			obs_source_t *tr = warp_pl_get_transition_dir(s, dir);
+
+			if (tr) {
+				obs_transition_set_size(tr, cx, cy);
+				obs_source_release(tr);
+			}
+		}
 	}
 }
 
@@ -2702,48 +3065,67 @@ static void missing_file_callback(void *src, const char *new_path, void *data)
 	obs_data_release(settings);
 }
 
-/* 'data' is the setting of the stinger transition the file was found under */
+/* Which stinger file of the playlist's a missing one is: the transition it
+ * belongs to, and the setting of that transition it was found under. */
+struct warp_pl_stinger_file {
+	size_t dir;
+	const char *key;
+};
+
+static const struct warp_pl_stinger_file warp_pl_stinger_video[WARP_PL_NUM_DIRS] = {
+	{WARP_PL_DIR_FORWARD, "path"},
+	{WARP_PL_DIR_BACKWARD, "path"},
+};
+
+static const struct warp_pl_stinger_file warp_pl_stinger_matte[WARP_PL_NUM_DIRS] = {
+	{WARP_PL_DIR_FORWARD, "track_matte_path"},
+	{WARP_PL_DIR_BACKWARD, "track_matte_path"},
+};
+
+/* 'data' is the stinger file of the playlist's that was found again */
 static void missing_stinger_callback(void *src, const char *new_path, void *data)
 {
 	struct warp_playlist_source *s = src;
-	const char *key = data;
+	const struct warp_pl_stinger_file *which = data;
+	struct warp_pl_transition *cfg = &s->tr[which->dir];
 	obs_data_t *fix = obs_data_create();
 	obs_data_t *stored;
 
-	obs_data_set_string(fix, key, new_path);
+	obs_data_set_string(fix, which->key, new_path);
 
 	pthread_mutex_lock(&s->mutex);
 
 	/* into the settings the stinger is saved with, and to the stinger that
 	 * is running, which the tick hands it to */
-	stored = obs_data_get_obj(s->transition_store, WARP_PL_TR_STINGER);
+	stored = obs_data_get_obj(cfg->store, WARP_PL_TR_STINGER);
 
 	if (stored) {
-		obs_data_set_string(stored, key, new_path);
+		obs_data_set_string(stored, which->key, new_path);
 		obs_data_release(stored);
 	}
 
-	if (s->pending_transition_settings) {
-		obs_data_apply(s->pending_transition_settings, fix);
+	if (cfg->pending_settings) {
+		obs_data_apply(cfg->pending_settings, fix);
 		obs_data_release(fix);
 	} else {
-		s->pending_transition_settings = fix;
+		cfg->pending_settings = fix;
 	}
 
 	pthread_mutex_unlock(&s->mutex);
 }
 
-/* reports the file 'key' of the stinger settings when it has gone missing */
+/* reports a file of the stinger settings when it has gone missing */
 static void warp_pl_add_missing_stinger(struct warp_playlist_source *s, obs_missing_files_t *files,
-					obs_data_t *tr_settings, const char *key)
+					obs_data_t *tr_settings, const struct warp_pl_stinger_file *which)
 {
-	const char *path = obs_data_get_string(tr_settings, key);
+	const char *path = obs_data_get_string(tr_settings, which->key);
 	obs_missing_file_t *file;
 
 	if (!path || !*path || os_file_exists(path))
 		return;
 
-	file = obs_missing_file_create(path, missing_stinger_callback, OBS_MISSING_FILE_SOURCE, s->source, (void *)key);
+	file = obs_missing_file_create(path, missing_stinger_callback, OBS_MISSING_FILE_SOURCE, s->source,
+				       (void *)which);
 
 	obs_missing_files_add_file(files, file);
 }
@@ -2752,8 +3134,8 @@ static obs_missing_files_t *warp_playlist_missingfiles(void *data)
 {
 	struct warp_playlist_source *s = data;
 	obs_missing_files_t *files = obs_missing_files_create();
-	obs_data_t *tr_settings = NULL;
 	obs_data_t *settings;
+	bool separate_back;
 
 	pthread_mutex_lock(&s->mutex);
 
@@ -2771,28 +3153,38 @@ static obs_missing_files_t *warp_playlist_missingfiles(void *data)
 	pthread_mutex_unlock(&s->mutex);
 
 	/* The stinger's videos are files the playlist plays as much as the ones
-	 * in the list, so missing ones are worth reporting too. The transition
-	 * belongs to this source alone, so nothing else reports them. */
-	warp_pl_capture_transition_settings(s);
+	 * in the list, so missing ones are worth reporting too. The transitions
+	 * belong to this source alone, so nothing else reports them. */
+	warp_pl_capture_transitions(s);
 
 	settings = obs_source_get_settings(s->source);
+	separate_back = obs_data_get_bool(settings, "separate_back_transition");
 
-	if (strcmp(obs_data_get_string(settings, "transition"), WARP_PL_TR_STINGER) == 0) {
+	for (size_t dir = 0; dir < WARP_PL_NUM_DIRS; dir++) {
+		obs_data_t *tr_settings;
+
+		if (dir == WARP_PL_DIR_BACKWARD && !separate_back)
+			continue;
+
+		if (strcmp(obs_data_get_string(settings, warp_pl_keys[dir].id), WARP_PL_TR_STINGER) != 0)
+			continue;
+
 		pthread_mutex_lock(&s->mutex);
-		tr_settings = obs_data_get_obj(s->transition_store, WARP_PL_TR_STINGER);
+		tr_settings = obs_data_get_obj(s->tr[dir].store, WARP_PL_TR_STINGER);
 		pthread_mutex_unlock(&s->mutex);
-	}
 
-	obs_data_release(settings);
+		if (!tr_settings)
+			continue;
 
-	if (tr_settings) {
-		warp_pl_add_missing_stinger(s, files, tr_settings, "path");
+		warp_pl_add_missing_stinger(s, files, tr_settings, &warp_pl_stinger_video[dir]);
 
 		if (obs_data_get_bool(tr_settings, "track_matte_enabled"))
-			warp_pl_add_missing_stinger(s, files, tr_settings, "track_matte_path");
+			warp_pl_add_missing_stinger(s, files, tr_settings, &warp_pl_stinger_matte[dir]);
 
 		obs_data_release(tr_settings);
 	}
+
+	obs_data_release(settings);
 
 	return files;
 }
