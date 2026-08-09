@@ -55,7 +55,7 @@ runs:
         print ::group::Install gersemi
         brew update --quiet
         brew tap --quiet obsproject/tools
-        brew trust obsproject/tools 2>/dev/null || true
+        brew trust obsproject/tools
         brew install --quiet obsproject/tools/gersemi
         print ::endgroup::
 
