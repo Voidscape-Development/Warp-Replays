@@ -26,14 +26,19 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QFileInfo>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QIcon>
 #include <QLabel>
 #include <QMainWindow>
 #include <QMap>
 #include <QMessageBox>
 #include <QMetaObject>
+#include <QPainter>
+#include <QPixmap>
 #include <QPointer>
 #include <QPushButton>
 #include <QStringList>
+#include <QStyle>
+#include <QStyledItemDelegate>
 #include <QTimer>
 #include <QTreeWidget>
 #include <QVBoxLayout>
@@ -53,6 +58,67 @@ enum WarpFlowColumn {
 	WARP_COL_LINKS,
 	WARP_COL_COUNT,
 };
+
+/* how narrow a column of the flow list is allowed to get, whatever is in it */
+constexpr int WARP_COLUMN_MIN_WIDTH = 100;
+
+/* The kind column is nothing but the flow's icon. The view lays a decoration
+ * down the left of the cell, which under a centred header would leave it
+ * stranded, so it is drawn in the middle of the cell here instead. */
+class WarpKindDelegate : public QStyledItemDelegate {
+public:
+	using QStyledItemDelegate::QStyledItemDelegate;
+
+	void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override
+	{
+		QStyleOptionViewItem opt = option;
+
+		initStyleOption(&opt, index);
+
+		const QIcon icon = opt.icon;
+
+		/* the row itself first - its background, and whether it is the
+		 * selected one - with the icon put down over it afterwards */
+		opt.icon = QIcon();
+		opt.features.setFlag(QStyleOptionViewItem::HasDecoration, false);
+		opt.text.clear();
+
+		QStyle *style = opt.widget ? opt.widget->style() : QApplication::style();
+
+		style->drawControl(QStyle::CE_ItemViewItem, &opt, painter, opt.widget);
+
+		if (icon.isNull())
+			return;
+
+		/* a flow that is switched off is greyed out like the rest of its
+		 * row is */
+		const bool enabled = index.data(Qt::UserRole).toBool();
+		QRect box(QPoint(0, 0), opt.decorationSize);
+
+		box.moveCenter(opt.rect.center());
+		icon.paint(painter, box, Qt::AlignCenter, enabled ? QIcon::Normal : QIcon::Disabled);
+	}
+};
+
+/* the replay buffer, said as a dot: green while it is running, red while it is
+ * not */
+QIcon warp_buffer_icon(bool active)
+{
+	const int size = 64;
+	QPixmap pixmap(size, size);
+
+	pixmap.fill(Qt::transparent);
+
+	QPainter p(&pixmap);
+
+	p.setRenderHint(QPainter::Antialiasing, true);
+	p.setPen(Qt::NoPen);
+	p.setBrush(active ? QColor(0x3E, 0xC7, 0x6A) : QColor(0xD2, 0x4B, 0x4B));
+	p.drawEllipse(QRectF(size * 0.08, size * 0.08, size * 0.84, size * 0.84));
+	p.end();
+
+	return QIcon(pixmap);
+}
 
 /* The Warp window: the flows of the scene collection, and what is being made
  * of them. Everything that changes one is done from here, so the list is
@@ -78,8 +144,13 @@ private:
 	QTreeWidget *tree = nullptr;
 	QPushButton *propsButton = nullptr;
 	QPushButton *removeButton = nullptr;
+	QLabel *bufferDot = nullptr;
 	QLabel *status = nullptr;
 	QTimer *timer = nullptr;
+
+	/* what the dot is showing, so it is only drawn again when the replay
+	 * buffer has actually changed its mind: -1 until it has been drawn once */
+	int bufferShown = -1;
 };
 
 void warp_window_frontend_event(enum obs_frontend_event event, void *data)
@@ -131,13 +202,18 @@ WarpWindow::WarpWindow(QWidget *parent) : QDialog(parent)
 	tree->setAlternatingRowColors(true);
 	tree->setSelectionMode(QAbstractItemView::SingleSelection);
 	tree->setUniformRowHeights(true);
-	tree->setIconSize(QSize(20, 20));
+	/* the kind column is the only one carrying an icon, and the icon is all
+	 * it carries, so it is drawn a size up from a decoration beside text */
+	tree->setIconSize(QSize(24, 24));
 	tree->setHeaderLabels({warp_flow_text("Warp.Window.Column.Flow"), warp_flow_text("Warp.Window.Column.Kind"),
 			       warp_flow_text("Warp.Window.Column.Target"), warp_flow_text("Warp.Window.Column.Clips"),
 			       warp_flow_text("Warp.Window.Column.Trigger"), warp_flow_text("Warp.Window.Column.Order"),
 			       warp_flow_text("Warp.Window.Column.Links")});
 	tree->header()->setSectionResizeMode(QHeaderView::ResizeToContents);
 	tree->header()->setStretchLastSection(true);
+	tree->header()->setMinimumSectionSize(WARP_COLUMN_MIN_WIDTH);
+	tree->header()->setDefaultAlignment(Qt::AlignCenter);
+	tree->setItemDelegateForColumn(WARP_COL_KIND, new WarpKindDelegate(tree));
 
 	auto *addButton = new QPushButton(warp_flow_text("Warp.Window.Add"), this);
 
@@ -148,8 +224,16 @@ WarpWindow::WarpWindow(QWidget *parent) : QDialog(parent)
 
 	closeButton->setDefault(true);
 
+	bufferDot = new QLabel(this);
 	status = new QLabel(this);
 	status->setTextFormat(Qt::PlainText);
+
+	auto *statusRow = new QHBoxLayout();
+
+	statusRow->setContentsMargins(0, 0, 0, 0);
+	statusRow->addWidget(bufferDot);
+	statusRow->addWidget(status);
+	statusRow->addStretch(1);
 
 	auto *buttons = new QHBoxLayout();
 
@@ -163,7 +247,7 @@ WarpWindow::WarpWindow(QWidget *parent) : QDialog(parent)
 
 	layout->addWidget(intro);
 	layout->addWidget(tree, 1);
-	layout->addWidget(status);
+	layout->addLayout(statusRow);
 	layout->addLayout(buttons);
 
 	connect(addButton, &QPushButton::clicked, this, [this]() { addFlow(); });
@@ -229,14 +313,20 @@ void WarpWindow::refresh()
 		const char *kind = obs_data_get_string(flow, WARP_FLOW_KIND);
 		const bool enabled = obs_data_get_bool(flow, WARP_FLOW_ENABLED);
 		const int max_clips = (int)obs_data_get_int(flow, WARP_FLOW_MAX_CLIPS);
+		const QString name = QString::fromUtf8(obs_data_get_string(flow, WARP_FLOW_NAME));
 
 		auto *item = new QTreeWidgetItem(tree);
 
-		item->setIcon(WARP_COL_NAME, warp_flow_icon(kind));
-		item->setText(WARP_COL_NAME, QString::fromUtf8(obs_data_get_string(flow, WARP_FLOW_NAME)));
+		item->setText(WARP_COL_NAME, name);
 		item->setData(WARP_COL_NAME, Qt::UserRole, id);
 		item->setData(WARP_COL_CLIPS, Qt::UserRole, max_clips);
-		item->setText(WARP_COL_KIND, warp_flow_kind_name(kind));
+
+		/* the kind is the icon, and the icon is all of it: what it stands
+		 * for is a hover away for anyone it is new to */
+		item->setIcon(WARP_COL_KIND, warp_flow_icon(kind));
+		item->setData(WARP_COL_KIND, Qt::UserRole, enabled);
+		item->setToolTip(WARP_COL_KIND, warp_flow_kind_name(kind));
+
 		item->setText(WARP_COL_TARGET, QString::fromUtf8(obs_data_get_string(flow, WARP_FLOW_TARGET_NAME)));
 		item->setText(WARP_COL_TRIGGER, warp_trigger_name(obs_data_get_string(flow, WARP_FLOW_TRIGGER)));
 		item->setText(WARP_COL_ORDER, warp_order_name(obs_data_get_string(flow, WARP_FLOW_ORDER)));
@@ -264,8 +354,8 @@ void WarpWindow::refresh()
 			for (int column = 0; column < WARP_COL_COUNT; column++)
 				item->setForeground(column, grey);
 
-			item->setText(WARP_COL_KIND, warp_flow_kind_name(kind) + QStringLiteral(" ") +
-							     warp_flow_text("Warp.Window.Disabled"));
+			item->setText(WARP_COL_NAME,
+				      name + QStringLiteral(" ") + warp_flow_text("Warp.Window.Disabled"));
 		}
 
 		if (id == selected)
@@ -296,20 +386,28 @@ void WarpWindow::refreshStatus()
 			item->setText(WARP_COL_CLIPS, QString::number(clips));
 	}
 
-	QString text = warp_flow_replay_buffer_active() ? warp_flow_text("Warp.Window.Buffer.Running")
-							: warp_flow_text("Warp.Window.Buffer.Stopped");
+	const bool active = warp_flow_replay_buffer_active();
+
+	if (bufferShown != (int)active) {
+		bufferShown = (int)active;
+
+		const int size = bufferDot->fontMetrics().height() * 3 / 4;
+
+		bufferDot->setPixmap(
+			warp_buffer_icon(active).pixmap(QSize(size, size), bufferDot->devicePixelRatioF()));
+		bufferDot->setToolTip(active ? warp_flow_text("Warp.Window.Buffer.Running")
+					     : warp_flow_text("Warp.Window.Buffer.Stopped"));
+	}
 
 	char *last = warp_flow_last_clip();
 
 	if (last) {
-		text += QStringLiteral("  -  ") +
-			warp_flow_text("Warp.Window.LastClip").arg(QFileInfo(QString::fromUtf8(last)).fileName());
+		status->setText(
+			warp_flow_text("Warp.Window.LastClip").arg(QFileInfo(QString::fromUtf8(last)).fileName()));
 		bfree(last);
 	} else {
-		text += QStringLiteral("  -  ") + warp_flow_text("Warp.Window.LastClip.None");
+		status->setText(warp_flow_text("Warp.Window.LastClip.None"));
 	}
-
-	status->setText(text);
 }
 
 void WarpWindow::addFlow()
@@ -369,6 +467,50 @@ void WarpWindow::removeFlow()
 	refresh();
 }
 
+/* one prompt at a time, however many times the hotkey is leant on */
+bool warp_buffer_prompt_open = false;
+
+/* A flow's Save Replay hotkey, pressed with no replay buffer running to save.
+ * Told from the UI thread, but the dialog is left to the event loop rather
+ * than opened inside the task the press is being carried out in. */
+void warp_window_buffer_prompt(const char *flow_name)
+{
+	auto *main_window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+
+	if (!main_window || warp_buffer_prompt_open)
+		return;
+
+	warp_buffer_prompt_open = true;
+
+	const QString name = QString::fromUtf8(flow_name ? flow_name : "");
+
+	QMetaObject::invokeMethod(
+		main_window,
+		[main_window, name]() {
+			QMessageBox box(main_window);
+
+			box.setWindowTitle(warp_flow_text("Warp.Flow.Buffer.Title"));
+			box.setIcon(QMessageBox::Warning);
+			box.setText(warp_flow_text("Warp.Flow.Buffer.Text").arg(name));
+			box.setInformativeText(warp_flow_text("Warp.Flow.Buffer.Info"));
+
+			QPushButton *start =
+				box.addButton(warp_flow_text("Warp.Flow.Buffer.Start"), QMessageBox::AcceptRole);
+
+			box.addButton(warp_flow_text("Warp.Flow.Buffer.Cancel"), QMessageBox::RejectRole);
+			box.setDefaultButton(start);
+			box.exec();
+
+			warp_buffer_prompt_open = false;
+
+			/* the buffer may well have been started from elsewhere
+			 * while the question was sitting there */
+			if (box.clickedButton() == start && !obs_frontend_replay_buffer_active())
+				obs_frontend_replay_buffer_start();
+		},
+		Qt::QueuedConnection);
+}
+
 QPointer<WarpWindow> warp_window;
 
 void show_warp_window(void *)
@@ -391,4 +533,5 @@ void show_warp_window(void *)
 extern "C" void warp_register_tools_menu(void)
 {
 	obs_frontend_add_tools_menu_item(obs_module_text("Warp.Tools.Menu"), show_warp_window, nullptr);
+	warp_flow_set_buffer_prompt(warp_window_buffer_prompt);
 }
