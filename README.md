@@ -178,7 +178,7 @@ The first four are on the Warp Media source as well. Play, pause, stop, restart,
 
 ### Warp flows
 
-A **Warp** entry in the Tools menu opens the Warp window: the flows of the scene collection, what each one feeds, and how much is in it.
+A **Warp** entry in the Tools menu opens the Warp window: the flows of the scene collection, what each one feeds, and how much is in it. Underneath the list, a dot says whether the replay buffer is running — green while it is, red while it is not — next to the clip it saved last.
 
 A flow takes the clips the OBS replay buffer saves and puts them in a Warp Playlist source, so a list builds itself as an event goes on. Adding one opens a dialog laid out like OBS's own Add Source: the kinds down the left, what the one that is picked does on the right, and the settings it needs underneath.
 
@@ -201,7 +201,7 @@ Every flow is:
 
 Each flow registers two hotkeys of its own, named after it in Settings → Hotkeys:
 
-* **Warp: Save Replay to *flow*** — saves the replay buffer and keeps the clip for that flow. It does nothing when the replay buffer is not running.
+* **Warp: Save Replay to *flow*** — saves the replay buffer and keeps the clip for that flow. Pressed while the replay buffer is not running, it says so and offers to start it there and then.
 * **Warp: Add Last Saved Clip to *flow*** — puts the replay that was saved last in that flow without saving a new one, for a clip worth keeping that nobody knew about in advance.
 
 The keys they are bound to are saved with the flow, so a flow loads with its hotkey the way it was left.

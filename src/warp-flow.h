@@ -105,6 +105,13 @@ bool warp_flow_save_replay(const char *id);
  * new one */
 bool warp_flow_promote_last(const char *id);
 
+/* Told when a flow's Save Replay hotkey is pressed and there is no replay
+ * buffer running for it to save. The UI sets this so the press says so rather
+ * than doing nothing, and can offer to start the buffer there and then; with
+ * nothing set the press is only logged. Called on the UI thread. */
+typedef void (*warp_flow_buffer_prompt_t)(const char *flow_name);
+void warp_flow_set_buffer_prompt(warp_flow_buffer_prompt_t prompt);
+
 bool warp_flow_replay_buffer_active(void);
 /* the clip the replay buffer saved last, or NULL; the caller frees it */
 char *warp_flow_last_clip(void);

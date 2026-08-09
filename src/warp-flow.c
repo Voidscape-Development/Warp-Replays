@@ -96,6 +96,10 @@ static uint64_t warp_flow_claim_ns = 0;
 
 static uint64_t warp_flow_id_seq = 0;
 
+/* how the UI is told a hotkey press found no replay buffer to save; set once,
+ * while the module loads, and only ever called from the UI thread */
+static warp_flow_buffer_prompt_t warp_flow_buffer_prompt = NULL;
+
 /* ------------------------------------------------------------------------- */
 /* small helpers */
 
@@ -174,23 +178,31 @@ static void warp_flow_hotkey_task(void *param)
 {
 	struct warp_flow_hotkey_press *press = param;
 	char *id = NULL;
+	char *name = NULL;
 
 	pthread_mutex_lock(&warp_flow_mutex);
 	struct warp_flow *flow = warp_flow_find_by_hotkey(press->hotkey, press->promote);
 
-	if (flow)
+	if (flow) {
 		id = bstrdup(obs_data_get_string(flow->config, WARP_FLOW_ID));
+		name = bstrdup(obs_data_get_string(flow->config, WARP_FLOW_NAME));
+	}
 	pthread_mutex_unlock(&warp_flow_mutex);
 
 	if (id) {
-		if (press->promote)
+		if (press->promote) {
 			warp_flow_promote_last(id);
-		else
-			warp_flow_save_replay(id);
+		} else if (!warp_flow_save_replay(id) && !obs_frontend_replay_buffer_active()) {
+			/* the press did nothing because there was no buffer to
+			 * save: the user asked for a clip, so they are told */
+			if (warp_flow_buffer_prompt)
+				warp_flow_buffer_prompt(name);
+		}
 
 		bfree(id);
 	}
 
+	bfree(name);
 	bfree(press);
 }
 
@@ -872,6 +884,11 @@ static void warp_flow_replay_saved(void)
 	bfree(path);
 }
 
+void warp_flow_set_buffer_prompt(warp_flow_buffer_prompt_t prompt)
+{
+	warp_flow_buffer_prompt = prompt;
+}
+
 bool warp_flow_replay_buffer_active(void)
 {
 	return obs_frontend_replay_buffer_active();
@@ -1110,6 +1127,7 @@ void warp_flow_shutdown(void)
 		return;
 
 	warp_flow_ready = false;
+	warp_flow_buffer_prompt = NULL;
 
 	obs_frontend_remove_event_callback(warp_flow_frontend_event, NULL);
 	obs_frontend_remove_save_callback(warp_flow_save_cb, NULL);
