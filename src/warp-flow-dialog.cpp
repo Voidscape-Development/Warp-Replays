@@ -62,6 +62,7 @@ const WarpFlowKind warp_flow_kinds[] = {
 	{WARP_FLOW_KIND_REPLAY, "Warp.Flow.Kind.Replay", "Warp.Flow.Kind.Replay.Desc"},
 	{WARP_FLOW_KIND_HIGHLIGHT, "Warp.Flow.Kind.Highlight", "Warp.Flow.Kind.Highlight.Desc"},
 	{WARP_FLOW_KIND_COMBO, "Warp.Flow.Kind.Combo", "Warp.Flow.Kind.Combo.Desc"},
+	{WARP_FLOW_KIND_INSTANT, "Warp.Flow.Kind.Instant", "Warp.Flow.Kind.Instant.Desc"},
 };
 
 QPolygonF warp_star(const QPointF &center, qreal outer, qreal inner)
@@ -102,46 +103,66 @@ void warp_set_row_visible(QFormLayout *form, QWidget *field, bool visible)
 	field->setVisible(visible);
 }
 
-bool warp_enum_playlist_sources(void *param, obs_source_t *source)
+/* the Warp source a flow of that kind feeds: an instant replay holds its one
+ * clip in a Warp Media source, every other kind builds a list in a Warp
+ * Playlist source */
+const char *warp_flow_target_id(const QString &kind)
 {
+	return kind == QString(WARP_FLOW_KIND_INSTANT) ? WARP_MEDIA_SOURCE_ID : WARP_PLAYLIST_SOURCE_ID;
+}
+
+bool warp_flow_target_is_media(const char *source_id)
+{
+	return strcmp(source_id, WARP_MEDIA_SOURCE_ID) == 0;
+}
+
+struct WarpTargetSearch {
+	const char *id;
+	QList<QPair<QString, QString>> found;
+};
+
+bool warp_enum_target_sources(void *param, obs_source_t *source)
+{
+	auto *search = static_cast<WarpTargetSearch *>(param);
 	const char *id = obs_source_get_id(source);
 
-	if (id && strcmp(id, WARP_PLAYLIST_SOURCE_ID) == 0) {
-		auto *out = static_cast<QList<QPair<QString, QString>> *>(param);
+	if (id && strcmp(id, search->id) == 0) {
 		const char *name = obs_source_get_name(source);
 		const char *uuid = obs_source_get_uuid(source);
 
-		out->append({QString::fromUtf8(name ? name : ""), QString::fromUtf8(uuid ? uuid : "")});
+		search->found.append({QString::fromUtf8(name ? name : ""), QString::fromUtf8(uuid ? uuid : "")});
 	}
 
 	return true;
 }
 
-/* Every Warp Playlist source in the scene collection, with an entry for making
+/* Every source of that kind in the scene collection, with an entry for making
  * one on the end of it. The entry that is picked carries the source's uuid, or
  * an empty string for the new one. */
-void warp_fill_target_combo(QComboBox *combo, const QString &selected_uuid)
+void warp_fill_target_combo(QComboBox *combo, const QString &selected_uuid, const char *source_id)
 {
-	QList<QPair<QString, QString>> sources;
+	WarpTargetSearch search = {source_id, {}};
 
-	obs_enum_sources(warp_enum_playlist_sources, &sources);
-	std::sort(sources.begin(), sources.end(),
+	obs_enum_sources(warp_enum_target_sources, &search);
+	std::sort(search.found.begin(), search.found.end(),
 		  [](const QPair<QString, QString> &a, const QPair<QString, QString> &b) {
 			  return a.first.localeAwareCompare(b.first) < 0;
 		  });
 
 	combo->clear();
 
-	for (const auto &source : sources)
+	for (const auto &source : search.found)
 		combo->addItem(source.first, source.second);
 
-	combo->addItem(warp_flow_text("Warp.Flow.Target.New"), QString());
+	combo->addItem(warp_flow_text(warp_flow_target_is_media(source_id) ? "Warp.Flow.Target.New.Media"
+									   : "Warp.Flow.Target.New"),
+		       QString());
 
 	int index = selected_uuid.isEmpty() ? -1 : combo->findData(selected_uuid);
 
-	/* a playlist to feed has to be made when there is not one yet */
+	/* a source to feed has to be made when there is not one yet */
 	if (index < 0)
-		index = sources.isEmpty() ? combo->count() - 1 : 0;
+		index = search.found.isEmpty() ? combo->count() - 1 : 0;
 
 	combo->setCurrentIndex(index);
 }
@@ -158,6 +179,13 @@ void warp_fill_order_combo(QComboBox *combo)
 	combo->addItem(warp_flow_text("Warp.Flow.Order.NewestFirst"), QString(WARP_FLOW_ORDER_NEWEST_FIRST));
 }
 
+void warp_fill_playback_combo(QComboBox *combo)
+{
+	combo->addItem(warp_flow_text("Warp.Flow.Playback.Keep"), QString(WARP_MEDIA_LOAD_KEEP));
+	combo->addItem(warp_flow_text("Warp.Flow.Playback.Play"), QString(WARP_MEDIA_LOAD_PLAY));
+	combo->addItem(warp_flow_text("Warp.Flow.Playback.Hold"), QString(WARP_MEDIA_LOAD_HOLD));
+}
+
 void warp_select_data(QComboBox *combo, const QString &value)
 {
 	const int index = combo->findData(value);
@@ -166,10 +194,10 @@ void warp_select_data(QComboBox *combo, const QString &value)
 		combo->setCurrentIndex(index);
 }
 
-/* A Warp Playlist source called 'wanted', or as close to it as a name that is
- * not taken already gets. It is put in the current scene: a source no scene
- * holds on to is not saved with the scene collection. */
-obs_source_t *warp_create_playlist_source(const QString &wanted)
+/* A Warp source called 'wanted', or as close to it as a name that is not taken
+ * already gets. It is put in the current scene: a source no scene holds on to
+ * is not saved with the scene collection. */
+obs_source_t *warp_create_target_source(const QString &wanted, const char *source_id)
 {
 	QString name = wanted;
 
@@ -184,7 +212,7 @@ obs_source_t *warp_create_playlist_source(const QString &wanted)
 	}
 
 	obs_data_t *settings = obs_data_create();
-	obs_source_t *source = obs_source_create(WARP_PLAYLIST_SOURCE_ID, name.toUtf8().constData(), settings, nullptr);
+	obs_source_t *source = obs_source_create(source_id, name.toUtf8().constData(), settings, nullptr);
 
 	obs_data_release(settings);
 
@@ -204,10 +232,10 @@ obs_source_t *warp_create_playlist_source(const QString &wanted)
 	return source;
 }
 
-/* The playlist the flow is to feed, made first when that is what was asked
- * for. Answers false, having said why, when there is nothing to feed. */
+/* The source the flow is to feed, made first when that is what was asked for.
+ * Answers false, having said why, when there is nothing to feed. */
 bool warp_resolve_target(QWidget *parent, QComboBox *combo, QLineEdit *new_name, const QString &fallback_name,
-			 QString &uuid, QString &name)
+			 const char *source_id, QString &uuid, QString &name)
 {
 	const QString chosen = combo->currentData().toString();
 
@@ -234,7 +262,7 @@ bool warp_resolve_target(QWidget *parent, QComboBox *combo, QLineEdit *new_name,
 	if (wanted.isEmpty())
 		wanted = fallback_name;
 
-	obs_source_t *source = warp_create_playlist_source(wanted);
+	obs_source_t *source = warp_create_target_source(wanted, source_id);
 
 	if (!source) {
 		QMessageBox::warning(parent, warp_flow_text("Warp.Flow.Create.Title"),
@@ -297,6 +325,32 @@ QWidget *warp_limit_row(QCheckBox **check, QSpinBox **spin, QWidget *parent)
 	return row;
 }
 
+/* the speed an instant replay flow plays a clip at, off until it is ticked: a
+ * flow that is not asked for a speed leaves the source playing at its own */
+QWidget *warp_speed_row(QCheckBox **check, QSpinBox **spin, QWidget *parent)
+{
+	auto *row = new QWidget(parent);
+	auto *layout = new QHBoxLayout(row);
+
+	layout->setContentsMargins(0, 0, 0, 0);
+
+	*check = new QCheckBox(warp_flow_text("Warp.Flow.Speed"), row);
+	*spin = new QSpinBox(row);
+
+	(*spin)->setRange(WARP_FLOW_SPEED_MIN, WARP_FLOW_SPEED_MAX);
+	(*spin)->setValue(50);
+	(*spin)->setSuffix(warp_flow_text("Warp.Flow.Speed.Suffix"));
+	(*spin)->setEnabled(false);
+
+	QObject::connect(*check, &QCheckBox::toggled, *spin, &QSpinBox::setEnabled);
+
+	layout->addWidget(*check);
+	layout->addWidget(*spin);
+	layout->addStretch(1);
+
+	return row;
+}
+
 QFrame *warp_separator(QWidget *parent)
 {
 	auto *line = new QFrame(parent);
@@ -335,8 +389,26 @@ QIcon warp_flow_icon(const char *kind)
 
 	const bool combo = kind && strcmp(kind, WARP_FLOW_KIND_COMBO) == 0;
 	const bool highlight = kind && strcmp(kind, WARP_FLOW_KIND_HIGHLIGHT) == 0;
+	const bool instant = kind && strcmp(kind, WARP_FLOW_KIND_INSTANT) == 0;
 
-	if (highlight) {
+	if (instant) {
+		/* one screen, with the bolt of a clip that is there the moment it
+		 * is saved rather than the play mark of a list that is worked
+		 * through */
+		QPolygonF bolt;
+
+		bolt << QPointF(size * 0.56, size * 0.30) << QPointF(size * 0.38, size * 0.52)
+		     << QPointF(size * 0.49, size * 0.52) << QPointF(size * 0.44, size * 0.70)
+		     << QPointF(size * 0.62, size * 0.48) << QPointF(size * 0.51, size * 0.48);
+
+		p.setPen(pen);
+		p.setBrush(Qt::NoBrush);
+		p.drawRoundedRect(QRectF(size * 0.12, size * 0.18, size * 0.76, size * 0.64), size * 0.12, size * 0.12);
+
+		p.setPen(Qt::NoPen);
+		p.setBrush(fg);
+		p.drawPolygon(bolt);
+	} else if (highlight) {
 		p.setPen(Qt::NoPen);
 		p.setBrush(fg);
 		p.drawPolygon(warp_star(QPointF(size / 2.0, size / 2.0), size * 0.42, size * 0.18));
@@ -431,7 +503,8 @@ WarpFlowCreateDialog::WarpFlowCreateDialog(QWidget *parent) : QDialog(parent)
 	form->addRow(warp_flow_text("Warp.Flow.Name"), nameEdit);
 
 	targetCombo = new QComboBox(this);
-	warp_fill_target_combo(targetCombo, QString());
+	targetSourceId = QString::fromUtf8(WARP_PLAYLIST_SOURCE_ID);
+	warp_fill_target_combo(targetCombo, QString(), WARP_PLAYLIST_SOURCE_ID);
 	form->addRow(warp_flow_text("Warp.Flow.Target"), targetCombo);
 
 	newTargetEdit = new QLineEdit(this);
@@ -439,7 +512,7 @@ WarpFlowCreateDialog::WarpFlowCreateDialog(QWidget *parent) : QDialog(parent)
 	form->addRow(warp_flow_text("Warp.Flow.Target.NewName"), newTargetEdit);
 
 	hlTargetCombo = new QComboBox(this);
-	warp_fill_target_combo(hlTargetCombo, QString());
+	warp_fill_target_combo(hlTargetCombo, QString(), WARP_PLAYLIST_SOURCE_ID);
 	hlTargetCombo->setCurrentIndex(hlTargetCombo->count() - 1);
 	form->addRow(warp_flow_text("Warp.Flow.Target.Highlight"), hlTargetCombo);
 
@@ -462,11 +535,19 @@ WarpFlowCreateDialog::WarpFlowCreateDialog(QWidget *parent) : QDialog(parent)
 	warp_fill_order_combo(hlOrderCombo);
 	form->addRow(warp_flow_text("Warp.Flow.Order.Highlight"), hlOrderCombo);
 
+	playbackCombo = new QComboBox(this);
+	warp_fill_playback_combo(playbackCombo);
+	form->addRow(warp_flow_text("Warp.Flow.Playback"), playbackCombo);
+
+	QWidget *speed_row = warp_speed_row(&speedCheck, &speedSpin, this);
+
+	form->addRow(warp_flow_text("Warp.Flow.Speed.Label"), speed_row);
+
 	QWidget *limit_row = warp_limit_row(&limitCheck, &limitSpin, this);
 
 	form->addRow(warp_flow_text("Warp.Flow.Limit.Label"), limit_row);
 
-	/* the replay flows a highlight list can be fed from */
+	/* the replay flows a highlight or instant replay list can be fed from */
 	fedByCombo->addItem(warp_flow_text("Warp.Flow.FedBy.None"), QString());
 
 	obs_data_array_t *flows = warp_flow_list();
@@ -525,6 +606,7 @@ void WarpFlowCreateDialog::kindChanged()
 	const QString kind = item->data(Qt::UserRole).toString();
 	const bool is_combo = kind == QString(WARP_FLOW_KIND_COMBO);
 	const bool is_highlight = kind == QString(WARP_FLOW_KIND_HIGHLIGHT);
+	const bool is_instant = kind == QString(WARP_FLOW_KIND_INSTANT);
 
 	for (const WarpFlowKind &entry : warp_flow_kinds) {
 		if (kind == QString::fromUtf8(entry.id)) {
@@ -534,16 +616,35 @@ void WarpFlowCreateDialog::kindChanged()
 		}
 	}
 
+	/* An instant replay is held in a Warp Media source, so the sources it is
+	 * picked from are different ones. Filled again only when the kind that
+	 * was picked feeds something other than the kind before it did, so
+	 * moving between the list kinds keeps whatever was chosen. */
+	const QString target_id = QString::fromUtf8(warp_flow_target_id(kind));
+
+	if (target_id != targetSourceId) {
+		targetSourceId = target_id;
+		warp_fill_target_combo(targetCombo, QString(), target_id.toUtf8().constData());
+	}
+
 	warp_set_row_visible(form, hlTargetCombo, is_combo);
 	warp_set_row_visible(form, hlOrderCombo, is_combo);
-	warp_set_row_visible(form, fedByCombo, is_highlight);
+	warp_set_row_visible(form, fedByCombo, is_highlight || is_instant);
+
+	/* one clip rather than a list: there is no end to add it to, and nothing
+	 * to drop when the list gets long */
+	warp_set_row_visible(form, orderCombo, !is_instant);
+	warp_set_row_visible(form, playbackCombo, is_instant);
+	warp_set_row_visible(form, speedCheck->parentWidget(), is_instant);
 
 	/* A highlight list keeps what it is given: the clips it is fed have
 	 * been picked out already, so a limit on it would throw them away. */
-	warp_set_row_visible(form, limitCheck->parentWidget(), !is_highlight);
+	warp_set_row_visible(form, limitCheck->parentWidget(), !is_highlight && !is_instant);
 
 	if (auto *label = qobject_cast<QLabel *>(form->labelForField(targetCombo)))
-		label->setText(warp_flow_text(is_combo ? "Warp.Flow.Target.Replay" : "Warp.Flow.Target"));
+		label->setText(warp_flow_text(is_combo     ? "Warp.Flow.Target.Replay"
+					      : is_instant ? "Warp.Flow.Target.Instant"
+							   : "Warp.Flow.Target"));
 
 	targetChanged();
 }
@@ -565,7 +666,9 @@ bool WarpFlowCreateDialog::buildFlow(const char *kind, const QString &name, QCom
 	QString uuid;
 	QString target_name;
 
-	if (!warp_resolve_target(this, target_combo, new_target_edit, name, uuid, target_name))
+	const char *target_id = warp_flow_target_id(QString::fromUtf8(kind));
+
+	if (!warp_resolve_target(this, target_combo, new_target_edit, name, target_id, uuid, target_name))
 		return false;
 
 	obs_data_t *config = obs_data_create();
@@ -578,6 +681,15 @@ bool WarpFlowCreateDialog::buildFlow(const char *kind, const QString &name, QCom
 	obs_data_set_string(config, WARP_FLOW_TARGET_NAME, target_name.toUtf8().constData());
 	obs_data_set_int(config, WARP_FLOW_MAX_CLIPS, max_clips);
 	obs_data_set_bool(config, WARP_FLOW_ENABLED, true);
+
+	/* what playback does with a clip, and how fast, is the instant replay
+	 * flow's alone: the list kinds put a clip in a list and leave playback
+	 * where it was */
+	if (warp_flow_target_is_media(target_id)) {
+		obs_data_set_string(config, WARP_FLOW_PLAYBACK,
+				    playbackCombo->currentData().toString().toUtf8().constData());
+		obs_data_set_int(config, WARP_FLOW_SPEED, speedCheck->isChecked() ? speedSpin->value() : 0);
+	}
 
 	obs_data_array_t *link_array = obs_data_array_create();
 
@@ -605,6 +717,39 @@ bool WarpFlowCreateDialog::buildFlow(const char *kind, const QString &name, QCom
 	created.append(flow_id);
 
 	return true;
+}
+
+/* Hands the flow that was just made to the flow feeding it, which is where the
+ * link between the two lives: 'Fed by' is the other end of 'Also feeds'. */
+void WarpFlowCreateDialog::linkFedBy(const QString &fedBy, const QString &flowId)
+{
+	if (fedBy.isEmpty())
+		return;
+
+	obs_data_t *source_flow = warp_flow_get(fedBy.toUtf8().constData());
+
+	if (!source_flow)
+		return;
+
+	obs_data_array_t *links = obs_data_get_array(source_flow, WARP_FLOW_LINKS);
+
+	if (!links)
+		links = obs_data_array_create();
+
+	obs_data_t *link = obs_data_create();
+
+	obs_data_set_string(link, WARP_FLOW_LINK_ID, flowId.toUtf8().constData());
+	obs_data_array_push_back(links, link);
+	obs_data_release(link);
+
+	obs_data_t *update = obs_data_create();
+
+	obs_data_set_array(update, WARP_FLOW_LINKS, links);
+	warp_flow_update(fedBy.toUtf8().constData(), update);
+
+	obs_data_release(update);
+	obs_data_array_release(links);
+	obs_data_release(source_flow);
 }
 
 void WarpFlowCreateDialog::accept()
@@ -656,41 +801,16 @@ void WarpFlowCreateDialog::accept()
 			created.clear();
 			return;
 		}
-	} else if (kind == QString(WARP_FLOW_KIND_HIGHLIGHT)) {
+	} else if (kind == QString(WARP_FLOW_KIND_HIGHLIGHT) || kind == QString(WARP_FLOW_KIND_INSTANT)) {
+		const QByteArray flow_kind = kind.toUtf8();
 		QString flow_id;
 
-		if (!buildFlow(WARP_FLOW_KIND_HIGHLIGHT, name, targetCombo, newTargetEdit, trigger.constData(),
+		if (!buildFlow(flow_kind.constData(), name, targetCombo, newTargetEdit, trigger.constData(),
 			       order.constData(), 0, QStringList(), flow_id))
 			return;
 
 		/* fed by a replay flow: it is that flow that has to be told */
-		const QString fed_by = fedByCombo->currentData().toString();
-
-		if (!fed_by.isEmpty()) {
-			obs_data_t *source_flow = warp_flow_get(fed_by.toUtf8().constData());
-
-			if (source_flow) {
-				obs_data_array_t *links = obs_data_get_array(source_flow, WARP_FLOW_LINKS);
-
-				if (!links)
-					links = obs_data_array_create();
-
-				obs_data_t *link = obs_data_create();
-
-				obs_data_set_string(link, WARP_FLOW_LINK_ID, flow_id.toUtf8().constData());
-				obs_data_array_push_back(links, link);
-				obs_data_release(link);
-
-				obs_data_t *update = obs_data_create();
-
-				obs_data_set_array(update, WARP_FLOW_LINKS, links);
-				warp_flow_update(fed_by.toUtf8().constData(), update);
-
-				obs_data_release(update);
-				obs_data_array_release(links);
-				obs_data_release(source_flow);
-			}
-		}
+		linkFedBy(fedByCombo->currentData().toString(), flow_id);
 	} else {
 		QString flow_id;
 
@@ -714,6 +834,9 @@ WarpFlowPropsDialog::WarpFlowPropsDialog(QWidget *parent, const QString &id) : Q
 
 	const char *kind = config ? obs_data_get_string(config, WARP_FLOW_KIND) : WARP_FLOW_KIND_REPLAY;
 	const bool is_highlight = strcmp(kind, WARP_FLOW_KIND_HIGHLIGHT) == 0;
+
+	isInstant = strcmp(kind, WARP_FLOW_KIND_INSTANT) == 0;
+	targetSourceId = QString::fromUtf8(warp_flow_target_id(QString::fromUtf8(kind)));
 
 	auto *header = new QHBoxLayout();
 	auto *icon = new QLabel(this);
@@ -739,8 +862,9 @@ WarpFlowPropsDialog::WarpFlowPropsDialog(QWidget *parent, const QString &id) : Q
 
 	targetCombo = new QComboBox(this);
 	warp_fill_target_combo(targetCombo,
-			       QString::fromUtf8(config ? obs_data_get_string(config, WARP_FLOW_TARGET_UUID) : ""));
-	form->addRow(warp_flow_text("Warp.Flow.Target"), targetCombo);
+			       QString::fromUtf8(config ? obs_data_get_string(config, WARP_FLOW_TARGET_UUID) : ""),
+			       targetSourceId.toUtf8().constData());
+	form->addRow(warp_flow_text(isInstant ? "Warp.Flow.Target.Instant" : "Warp.Flow.Target"), targetCombo);
 
 	newTargetEdit = new QLineEdit(this);
 	newTargetEdit->setPlaceholderText(warp_flow_text("Warp.Flow.Target.NewName.Placeholder"));
@@ -755,6 +879,27 @@ WarpFlowPropsDialog::WarpFlowPropsDialog(QWidget *parent, const QString &id) : Q
 	warp_fill_order_combo(orderCombo);
 	warp_select_data(orderCombo, QString::fromUtf8(config ? obs_data_get_string(config, WARP_FLOW_ORDER) : ""));
 	form->addRow(warp_flow_text("Warp.Flow.Order"), orderCombo);
+	warp_set_row_visible(form, orderCombo, !isInstant);
+
+	/* one clip at a time: what there is to say about it is what playback
+	 * does with it once it is in, and how fast it is played */
+	playbackCombo = new QComboBox(this);
+	warp_fill_playback_combo(playbackCombo);
+	warp_select_data(playbackCombo,
+			 QString::fromUtf8(config ? obs_data_get_string(config, WARP_FLOW_PLAYBACK) : ""));
+	form->addRow(warp_flow_text("Warp.Flow.Playback"), playbackCombo);
+	warp_set_row_visible(form, playbackCombo, isInstant);
+
+	QWidget *speed_row = warp_speed_row(&speedCheck, &speedSpin, this);
+	const int speed = config ? (int)obs_data_get_int(config, WARP_FLOW_SPEED) : 0;
+
+	speedCheck->setChecked(speed > 0);
+
+	if (speed > 0)
+		speedSpin->setValue(speed);
+
+	form->addRow(warp_flow_text("Warp.Flow.Speed.Label"), speed_row);
+	warp_set_row_visible(form, speed_row, isInstant);
 
 	QWidget *limit_row = warp_limit_row(&limitCheck, &limitSpin, this);
 	const int max_clips = config ? (int)obs_data_get_int(config, WARP_FLOW_MAX_CLIPS) : 0;
@@ -765,7 +910,7 @@ WarpFlowPropsDialog::WarpFlowPropsDialog(QWidget *parent, const QString &id) : Q
 		limitSpin->setValue(max_clips);
 
 	form->addRow(warp_flow_text("Warp.Flow.Limit.Label"), limit_row);
-	warp_set_row_visible(form, limit_row, !is_highlight);
+	warp_set_row_visible(form, limit_row, !is_highlight && !isInstant);
 
 	enabledCheck = new QCheckBox(warp_flow_text("Warp.Flow.Enabled"), this);
 	enabledCheck->setChecked(config ? obs_data_get_bool(config, WARP_FLOW_ENABLED) : true);
@@ -860,7 +1005,8 @@ void WarpFlowPropsDialog::accept()
 	QString uuid;
 	QString target_name;
 
-	if (!warp_resolve_target(this, targetCombo, newTargetEdit, name, uuid, target_name))
+	if (!warp_resolve_target(this, targetCombo, newTargetEdit, name, targetSourceId.toUtf8().constData(), uuid,
+				 target_name))
 		return;
 
 	obs_data_t *config = obs_data_create();
@@ -872,6 +1018,12 @@ void WarpFlowPropsDialog::accept()
 	obs_data_set_string(config, WARP_FLOW_ORDER, orderCombo->currentData().toString().toUtf8().constData());
 	obs_data_set_int(config, WARP_FLOW_MAX_CLIPS, limitCheck->isChecked() ? limitSpin->value() : 0);
 	obs_data_set_bool(config, WARP_FLOW_ENABLED, enabledCheck->isChecked());
+
+	if (isInstant) {
+		obs_data_set_string(config, WARP_FLOW_PLAYBACK,
+				    playbackCombo->currentData().toString().toUtf8().constData());
+		obs_data_set_int(config, WARP_FLOW_SPEED, speedCheck->isChecked() ? speedSpin->value() : 0);
+	}
 
 	obs_data_array_t *links = obs_data_array_create();
 

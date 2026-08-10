@@ -56,6 +56,7 @@ private:
 	void targetChanged();
 	bool buildFlow(const char *kind, const QString &name, QComboBox *targetCombo, QLineEdit *newTargetEdit,
 		       const char *trigger, const char *order, int maxClips, const QStringList &links, QString &flowId);
+	void linkFedBy(const QString &fedBy, const QString &flowId);
 
 	QListWidget *kindList = nullptr;
 	QLabel *kindTitle = nullptr;
@@ -73,6 +74,13 @@ private:
 	QComboBox *hlTargetCombo = nullptr;
 	QLineEdit *hlNewTargetEdit = nullptr;
 	QComboBox *hlOrderCombo = nullptr;
+	QComboBox *playbackCombo = nullptr;
+	QCheckBox *speedCheck = nullptr;
+	QSpinBox *speedSpin = nullptr;
+
+	/* the id of the source kind targetCombo is listing, so it is only filled
+	 * again when the kind that is picked feeds a different one */
+	QString targetSourceId;
 
 	QStringList created;
 };
@@ -88,6 +96,11 @@ private:
 	void targetChanged();
 
 	QString flowId;
+	/* the kind cannot be changed here, so what it feeds and which fields
+	 * mean anything are settled once, when the dialog is built */
+	bool isInstant = false;
+	QString targetSourceId;
+
 	QFormLayout *form = nullptr;
 	QLineEdit *nameEdit = nullptr;
 	QComboBox *targetCombo = nullptr;
@@ -96,6 +109,9 @@ private:
 	QComboBox *orderCombo = nullptr;
 	QCheckBox *limitCheck = nullptr;
 	QSpinBox *limitSpin = nullptr;
+	QComboBox *playbackCombo = nullptr;
+	QCheckBox *speedCheck = nullptr;
+	QSpinBox *speedSpin = nullptr;
 	QCheckBox *enabledCheck = nullptr;
 	QListWidget *linkList = nullptr;
 };
