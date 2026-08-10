@@ -54,6 +54,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  * playlist moves on, in seconds */
 #define WARP_PL_STALL_SECONDS 3.0f
 
+/* what the volume property is allowed to ask for, in percent. Unity is the
+ * ceiling: the files are played as they are at 100%, and the property is there
+ * to turn them down rather than to boost them into clipping. */
+#define WARP_PL_VOLUME_MIN 0
+#define WARP_PL_VOLUME_MAX 100
+
 /* how long an item plays before it may be transitioned away from early */
 #define WARP_PL_MIN_ITEM_SECONDS 0.25f
 
@@ -262,6 +268,11 @@ struct warp_playlist_source {
 	int base_speed;
 	int speed;
 
+	/* what the playlist's audio is scaled by on its way out, from 0 for
+	 * silence to 1 for the files as they are. Read by the audio thread,
+	 * which takes it under the lock along with the transition. */
+	float volume;
+
 	bool auto_advance;
 	bool loop_playlist;
 	bool shuffle;
@@ -382,16 +393,27 @@ static obs_source_t *warp_pl_get_transition_dir(struct warp_playlist_source *s, 
 	return transition;
 }
 
-/* the transition that is on screen, with a reference held */
-static obs_source_t *warp_pl_get_transition(struct warp_playlist_source *s)
+/* The transition that is on screen, with a reference held, along with the
+ * volume its audio is played at. The audio thread needs both, and taking them
+ * together keeps the samples it copies and the volume it scales them by from
+ * coming from either side of an update. */
+static obs_source_t *warp_pl_get_transition_volume(struct warp_playlist_source *s, float *volume)
 {
 	obs_source_t *transition;
 
 	pthread_mutex_lock(&s->mutex);
 	transition = obs_source_get_ref(s->tr[s->active_dir].source);
+	if (volume)
+		*volume = s->volume;
 	pthread_mutex_unlock(&s->mutex);
 
 	return transition;
+}
+
+/* the transition that is on screen, with a reference held */
+static obs_source_t *warp_pl_get_transition(struct warp_playlist_source *s)
+{
+	return warp_pl_get_transition_volume(s, NULL);
 }
 
 /* Drops s->mutex and works through whatever was queued while it was held.
@@ -1501,6 +1523,7 @@ static void warp_playlist_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "back_transition_scale", WARP_PL_SCALE_FIT);
 	obs_data_set_default_string(settings, "back_transition_alignment", "center");
 	obs_data_set_default_int(settings, "speed_percent", 100);
+	obs_data_set_default_int(settings, "volume_percent", 100);
 	obs_data_set_default_bool(settings, "restart_on_activate", true);
 	obs_data_set_default_bool(settings, "clear_on_media_end", true);
 	obs_data_set_default_bool(settings, "linear_alpha", false);
@@ -1740,6 +1763,11 @@ static obs_properties_t *warp_playlist_getproperties(void *data)
 	obs_property_int_set_suffix(prop, "%");
 	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.Speed.Desc"));
 
+	prop = obs_properties_add_int_slider(props, "volume_percent", obs_module_text("Warp.Playlist.Volume"),
+					     WARP_PL_VOLUME_MIN, WARP_PL_VOLUME_MAX, 1);
+	obs_property_int_set_suffix(prop, "%");
+	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.Volume.Desc"));
+
 	obs_properties_add_bool(props, "restart_on_activate", obs_module_text("Warp.Playlist.RestartOnActivate"));
 
 	obs_properties_add_bool(props, "clear_on_media_end", obs_module_text("Warp.Playlist.ClearOnEnd"));
@@ -1891,9 +1919,15 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 	bool active = obs_source_active(s->source);
 	bool separate_back = obs_data_get_bool(settings, "separate_back_transition");
 	int speed = (int)obs_data_get_int(settings, "speed_percent");
+	int volume = (int)obs_data_get_int(settings, "volume_percent");
 
 	if (speed < MP_SPEED_MIN || speed > MP_SPEED_MAX)
 		speed = 100;
+
+	if (volume < WARP_PL_VOLUME_MIN)
+		volume = WARP_PL_VOLUME_MIN;
+	else if (volume > WARP_PL_VOLUME_MAX)
+		volume = WARP_PL_VOLUME_MAX;
 
 	/* the transitions' own properties write to the transitions rather than
 	 * to these settings, so what they are running with is read back before
@@ -1949,6 +1983,9 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 	s->is_linear_alpha = obs_data_get_bool(settings, "linear_alpha");
 	s->range = (enum video_range_type)obs_data_get_int(settings, "color_range");
 	s->base_speed = speed;
+	/* the audio thread picks this up on its next call, so it applies to the
+	 * file that is playing rather than only to the ones after it */
+	s->volume = (float)volume / 100.0f;
 
 	if (warp_pl_load_playlist(s, settings))
 		order_changed = true;
@@ -2501,6 +2538,7 @@ static void *warp_playlist_create(obs_data_t *settings, obs_source_t *source)
 	s->source = source;
 	s->state = OBS_MEDIA_STATE_NONE;
 	s->base_speed = 100;
+	s->volume = 1.0f;
 	/* s->speed is left at zero: the update below fills it in, and a speed
 	 * that was never played at is not a change to report */
 	s->rand_state = os_gettime_ns() | 1;
@@ -2642,7 +2680,8 @@ static bool warp_playlist_audio_render(void *data, uint64_t *ts_out, struct obs_
 	struct warp_playlist_source *s = data;
 	/* the tick swaps the transition out, so the audio thread needs a
 	 * reference of its own rather than the bare pointer */
-	obs_source_t *transition = warp_pl_get_transition(s);
+	float volume = 1.0f;
+	obs_source_t *transition = warp_pl_get_transition_volume(s, &volume);
 	uint64_t timestamp;
 
 	if (!transition)
@@ -2664,6 +2703,9 @@ static bool warp_playlist_audio_render(void *data, uint64_t *ts_out, struct obs_
 
 	obs_source_get_audio_mix(transition, &child_audio);
 
+	/* The volume property is the only place the playlist's audio can be
+	 * turned down: a composite source is not given a slider in the OBS
+	 * mixer. Full volume hands the samples over as they are. */
 	for (size_t mix = 0; mix < MAX_AUDIO_MIXES; mix++) {
 		if ((mixers & (1 << mix)) == 0)
 			continue;
@@ -2672,7 +2714,12 @@ static bool warp_playlist_audio_render(void *data, uint64_t *ts_out, struct obs_
 			float *out = audio_output->output[mix].data[ch];
 			float *in = child_audio.output[mix].data[ch];
 
-			memcpy(out, in, AUDIO_OUTPUT_FRAMES * sizeof(float));
+			if (volume == 1.0f) {
+				memcpy(out, in, AUDIO_OUTPUT_FRAMES * sizeof(float));
+			} else {
+				for (size_t frame = 0; frame < AUDIO_OUTPUT_FRAMES; frame++)
+					out[frame] = in[frame] * volume;
+			}
 		}
 	}
 
