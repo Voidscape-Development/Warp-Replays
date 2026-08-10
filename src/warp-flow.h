@@ -24,11 +24,10 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 extern "C" {
 #endif
 
-/* A flow takes the clips the OBS replay buffer writes and puts them in a Warp
- * Playlist source, so a list builds itself as an event goes on. What it does
- * with a clip is all it is: which playlist it feeds, which way round the list
- * grows, how long the list is allowed to get, and which other flows are fed
- * the same clip.
+/* A flow takes the clips the OBS replay buffer writes and hands them to a Warp
+ * source, so a feed builds itself as an event goes on. What it does with a clip
+ * is all it is: which source it feeds, how that source is left, and which other
+ * flows are fed the same clip.
  *
  * Flows are configured entirely through obs_data_t objects, which are also
  * what they are saved as: the keys below are both the fields the UI fills in
@@ -45,14 +44,35 @@ extern "C" {
 #define WARP_FLOW_ENABLED "enabled"
 #define WARP_FLOW_LINKS "links"
 #define WARP_FLOW_CLIPS_ADDED "clips_added"
+/* instant replay flows only: what playback does with a clip that lands, one of
+ * the WARP_MEDIA_LOAD_* values of warp-events.h, and the speed to play it at in
+ * percent, with zero leaving the source's own speed alone */
+#define WARP_FLOW_PLAYBACK "playback"
+#define WARP_FLOW_SPEED "speed"
+
+/* The range the speed above takes, which is the range a Warp source plays at;
+ * warp-flow.c checks the two against each other. Zero, underneath the range,
+ * is the flow leaving the source's own speed alone. */
+#define WARP_FLOW_SPEED_MIN 10
+#define WARP_FLOW_SPEED_MAX 400
 
 /* items of the WARP_FLOW_LINKS array carry the id of the flow they link to */
 #define WARP_FLOW_LINK_ID "id"
 
-/* What the flow is for. Both kinds work the same way; the kind is what the
- * flow is called in the UI, and what a Combo list pairs up. */
+/* What the flow is for.
+ *
+ *   replay, highlight - a list in a Warp Playlist source. Both work the same
+ *                       way; the kind is what the flow is called in the UI, and
+ *                       what a Combo list pairs up.
+ *   instant           - a Warp Media source holding one clip: the one that was
+ *                       saved last, loaded the moment it lands, so it can be
+ *                       brought on screen over what is happening now. There is
+ *                       no list, so order and limit mean nothing to it, and
+ *                       what it feeds is a Warp Media source rather than a
+ *                       Warp Playlist one. */
 #define WARP_FLOW_KIND_REPLAY "replay"
 #define WARP_FLOW_KIND_HIGHLIGHT "highlight"
+#define WARP_FLOW_KIND_INSTANT "instant"
 
 /* Where clips come from:
  *
@@ -68,7 +88,8 @@ extern "C" {
 
 /* Which end of the playlist a clip is added to: oldest first appends, so the
  * list plays in the order the clips were saved; newest first inserts at the
- * top, so the clip that was just saved is the next one up. */
+ * top, so the clip that was just saved is the next one up. Means nothing to an
+ * instant replay flow, which holds one clip rather than a list. */
 #define WARP_FLOW_ORDER_OLDEST_FIRST "oldest_first"
 #define WARP_FLOW_ORDER_NEWEST_FIRST "newest_first"
 
@@ -115,7 +136,8 @@ void warp_flow_set_buffer_prompt(warp_flow_buffer_prompt_t prompt);
 bool warp_flow_replay_buffer_active(void);
 /* the clip the replay buffer saved last, or NULL; the caller frees it */
 char *warp_flow_last_clip(void);
-/* how many files are in the flow's playlist source, or -1 when it is gone */
+/* How many clips the flow's source is holding, or -1 when it is gone. An
+ * instant replay flow holds one clip at a time, so it answers 0 or 1. */
 int warp_flow_clip_count(const char *id);
 
 #ifdef __cplusplus

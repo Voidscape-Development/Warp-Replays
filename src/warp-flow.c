@@ -27,10 +27,16 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <util/platform.h>
 #include <util/threading.h>
 
+#include <media-playback/media-playback.h>
 #include <plugin-support.h>
 
 #include "warp-events.h"
 #include "warp-flow.h"
+
+/* the speed a flow plays a clip at is the source's speed, so the range the UI
+ * offers has to be the range the source takes */
+_Static_assert(WARP_FLOW_SPEED_MIN == MP_SPEED_MIN && WARP_FLOW_SPEED_MAX == MP_SPEED_MAX,
+	       "a flow's speed range has drifted from the one Warp sources play at");
 
 #define WARP_FLOW_LOG(level, format, ...) blog(level, "[Warp Flow]: " format, ##__VA_ARGS__)
 
@@ -66,8 +72,15 @@ struct warp_flow_delivery {
 	char *flow_name;
 	char *target_uuid;
 	char *target_name;
+	/* a Warp Media source holding the one clip, rather than a Warp Playlist
+	 * source holding a list of them */
+	bool instant;
+	/* the list ones */
 	bool newest_first;
 	int max_clips;
+	/* the instant one */
+	char *playback;
+	int speed;
 };
 
 struct warp_flow_plan {
@@ -353,6 +366,8 @@ static void warp_flow_set_defaults(obs_data_t *config)
 	obs_data_set_default_string(config, WARP_FLOW_ORDER, WARP_FLOW_ORDER_OLDEST_FIRST);
 	obs_data_set_default_int(config, WARP_FLOW_MAX_CLIPS, 0);
 	obs_data_set_default_bool(config, WARP_FLOW_ENABLED, true);
+	obs_data_set_default_string(config, WARP_FLOW_PLAYBACK, WARP_MEDIA_LOAD_KEEP);
+	obs_data_set_default_int(config, WARP_FLOW_SPEED, 0);
 }
 
 /* A flow's configuration for the outside, defaults and all: applying one data
@@ -544,12 +559,13 @@ obs_data_t *warp_flow_get_by_name(const char *name)
 }
 
 /* ------------------------------------------------------------------------- */
-/* feeding a playlist */
+/* feeding a source */
 
-/* The Warp Playlist source the flow feeds. Looked up by uuid, which survives
- * the source being renamed, and by name for a flow whose configuration was
- * written somewhere the uuid does not mean anything. */
-static obs_source_t *warp_flow_resolve_target(const char *uuid, const char *name)
+/* The Warp source the flow feeds - a Warp Playlist source for a list, a Warp
+ * Media source for an instant replay, which is what 'source_id' says. Looked up
+ * by uuid, which survives the source being renamed, and by name for a flow
+ * whose configuration was written somewhere the uuid does not mean anything. */
+static obs_source_t *warp_flow_resolve_target(const char *uuid, const char *name, const char *source_id)
 {
 	obs_source_t *source = NULL;
 
@@ -562,7 +578,7 @@ static obs_source_t *warp_flow_resolve_target(const char *uuid, const char *name
 	if (!source)
 		return NULL;
 
-	if (!warp_flow_str_eq(obs_source_get_id(source), WARP_PLAYLIST_SOURCE_ID)) {
+	if (!warp_flow_str_eq(obs_source_get_id(source), source_id)) {
 		obs_source_release(source);
 		return NULL;
 	}
@@ -570,8 +586,8 @@ static obs_source_t *warp_flow_resolve_target(const char *uuid, const char *name
 	return source;
 }
 
-/* keeps the flow pointing at its playlist through a rename, and through being
- * looked up by name */
+/* keeps the flow pointing at the source it feeds through a rename, and through
+ * being looked up by name */
 static void warp_flow_note_target(const char *flow_id, obs_source_t *target)
 {
 	const char *uuid = obs_source_get_uuid(target);
@@ -609,9 +625,9 @@ static void warp_flow_count_clip(const char *flow_id)
  *
  * Nothing about playback is touched: the playlist keeps playing what it is
  * playing, and reaches the new clip in its turn. */
-static void warp_flow_deliver_one(const struct warp_flow_delivery *d, const char *path)
+static void warp_flow_deliver_playlist(const struct warp_flow_delivery *d, const char *path)
 {
-	obs_source_t *target = warp_flow_resolve_target(d->target_uuid, d->target_name);
+	obs_source_t *target = warp_flow_resolve_target(d->target_uuid, d->target_name, WARP_PLAYLIST_SOURCE_ID);
 
 	if (!target) {
 		WARP_FLOW_LOG(LOG_WARNING, "flow '%s': no Warp Playlist source called '%s' to add '%s' to",
@@ -703,6 +719,63 @@ static void warp_flow_deliver_one(const struct warp_flow_delivery *d, const char
 	obs_source_release(target);
 }
 
+/* Loads 'path' into the flow's Warp Media source, so the clip that was just
+ * saved is the one that source is holding. The source is handed the clip
+ * through its own warp_media_load proc, which is what decides whether it plays
+ * there and then, waits for the source to be brought on screen, or is parked on
+ * its first frame; the source emits its loaded action either way, so a Warp
+ * Detection filter can bring it on however the operator has set that up.
+ *
+ * There is no list to add to and nothing to keep: an instant replay source
+ * holds the last clip, and the one before it is let go. */
+static void warp_flow_deliver_instant(const struct warp_flow_delivery *d, const char *path)
+{
+	obs_source_t *target = warp_flow_resolve_target(d->target_uuid, d->target_name, WARP_MEDIA_SOURCE_ID);
+
+	if (!target) {
+		WARP_FLOW_LOG(LOG_WARNING, "flow '%s': no Warp Media source called '%s' to load '%s' into",
+			      d->flow_name, d->target_name ? d->target_name : "", path);
+		return;
+	}
+
+	warp_flow_note_target(d->flow_id, target);
+
+	calldata_t cd = {0};
+
+	calldata_set_string(&cd, "path", path);
+	calldata_set_string(&cd, "playback", d->playback ? d->playback : WARP_MEDIA_LOAD_KEEP);
+	calldata_set_int(&cd, "speed", d->speed);
+
+	bool loaded = proc_handler_call(obs_source_get_proc_handler(target), WARP_MEDIA_LOAD_PROC, &cd);
+
+	calldata_free(&cd);
+
+	if (!loaded) {
+		WARP_FLOW_LOG(LOG_WARNING, "flow '%s': '%s' would not take '%s'", d->flow_name, d->target_name, path);
+		obs_source_release(target);
+		return;
+	}
+
+	warp_flow_count_clip(d->flow_id);
+
+	if (d->speed > 0)
+		WARP_FLOW_LOG(LOG_INFO, "flow '%s': loaded '%s' into '%s' (%s, %d%%)", d->flow_name, path,
+			      d->target_name, d->playback, d->speed);
+	else
+		WARP_FLOW_LOG(LOG_INFO, "flow '%s': loaded '%s' into '%s' (%s)", d->flow_name, path, d->target_name,
+			      d->playback);
+
+	obs_source_release(target);
+}
+
+static void warp_flow_deliver_one(const struct warp_flow_delivery *d, const char *path)
+{
+	if (d->instant)
+		warp_flow_deliver_instant(d, path);
+	else
+		warp_flow_deliver_playlist(d, path);
+}
+
 /* ------------------------------------------------------------------------- */
 /* working out who gets a clip */
 
@@ -715,6 +788,7 @@ static void warp_flow_plan_free(struct warp_flow_plan *plan)
 		bfree(d->flow_name);
 		bfree(d->target_uuid);
 		bfree(d->target_name);
+		bfree(d->playback);
 	}
 
 	da_free(plan->items);
@@ -763,9 +837,12 @@ static void warp_flow_plan_add(struct warp_flow_plan *plan, struct warp_flow *fl
 		d.flow_name = bstrdup(obs_data_get_string(flow->config, WARP_FLOW_NAME));
 		d.target_uuid = bstrdup(obs_data_get_string(flow->config, WARP_FLOW_TARGET_UUID));
 		d.target_name = bstrdup(obs_data_get_string(flow->config, WARP_FLOW_TARGET_NAME));
+		d.instant = warp_flow_str_eq(obs_data_get_string(flow->config, WARP_FLOW_KIND), WARP_FLOW_KIND_INSTANT);
 		d.newest_first = warp_flow_str_eq(obs_data_get_string(flow->config, WARP_FLOW_ORDER),
 						  WARP_FLOW_ORDER_NEWEST_FIRST);
 		d.max_clips = (int)obs_data_get_int(flow->config, WARP_FLOW_MAX_CLIPS);
+		d.playback = bstrdup(obs_data_get_string(flow->config, WARP_FLOW_PLAYBACK));
+		d.speed = (int)obs_data_get_int(flow->config, WARP_FLOW_SPEED);
 
 		da_push_back(plan->items, &d);
 	}
@@ -981,6 +1058,7 @@ int warp_flow_clip_count(const char *id)
 {
 	char *uuid;
 	char *name;
+	bool instant;
 
 	pthread_mutex_lock(&warp_flow_mutex);
 	struct warp_flow *flow = warp_flow_find(id);
@@ -992,10 +1070,12 @@ int warp_flow_clip_count(const char *id)
 
 	uuid = bstrdup(obs_data_get_string(flow->config, WARP_FLOW_TARGET_UUID));
 	name = bstrdup(obs_data_get_string(flow->config, WARP_FLOW_TARGET_NAME));
+	instant = warp_flow_str_eq(obs_data_get_string(flow->config, WARP_FLOW_KIND), WARP_FLOW_KIND_INSTANT);
 
 	pthread_mutex_unlock(&warp_flow_mutex);
 
-	obs_source_t *target = warp_flow_resolve_target(uuid, name);
+	obs_source_t *target =
+		warp_flow_resolve_target(uuid, name, instant ? WARP_MEDIA_SOURCE_ID : WARP_PLAYLIST_SOURCE_ID);
 
 	bfree(uuid);
 	bfree(name);
@@ -1003,13 +1083,25 @@ int warp_flow_clip_count(const char *id)
 	if (!target)
 		return -1;
 
-	calldata_t cd = {0};
 	int count = -1;
 
-	if (proc_handler_call(obs_source_get_proc_handler(target), "warp_playlist_status", &cd))
-		count = (int)calldata_int(&cd, "count");
+	if (instant) {
+		/* one clip at a time: the source is either holding one or it is
+		 * still empty */
+		obs_data_t *settings = obs_source_get_settings(target);
+		const char *file = obs_data_get_string(settings, "local_file");
 
-	calldata_free(&cd);
+		count = (file && *file) ? 1 : 0;
+		obs_data_release(settings);
+	} else {
+		calldata_t cd = {0};
+
+		if (proc_handler_call(obs_source_get_proc_handler(target), "warp_playlist_status", &cd))
+			count = (int)calldata_int(&cd, "count");
+
+		calldata_free(&cd);
+	}
+
 	obs_source_release(target);
 
 	return count;

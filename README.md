@@ -59,7 +59,10 @@ A filter that watches a Warp Media or Warp Playlist source and triggers somethin
   * *Media Pause*, when playback is paused.
   * *Media Restart*, when the file or playlist is restarted from the top — the media controls' restart button, the Warp Media *Restart* hotkey, the playlist's *Restart Current Video*, and the `Restart` and `RestartCurrent` websocket requests. Moving through a playlist with next, previous or *Back to First Video* is not a restart.
 
-  These three are about commands, so they only fire for playback someone asked for. Playback the source drives by itself does not report one: a Warp Media source restarting as it goes on screen is not a *Media Restart*, and the pause a frame step does before it steps is not a *Media Pause*. Nor is a playlist reaching its next file a *Media Play*.
+  One more is about the file rather than about playback:
+  * *Clip Loaded*, when a clip is put in a Warp Media source from outside it — which is what an [Instant Replay flow](#instant-replays) does as each replay is saved. This is the event to react to for bringing an instant replay on screen: point it at a hotkey, or at a filter that runs your slide-in.
+
+  The first three are about commands, so they only fire for playback someone asked for. Playback the source drives by itself does not report one: a Warp Media source restarting as it goes on screen is not a *Media Restart*, and the pause a frame step does before it steps is not a *Media Pause*. Nor is a playlist reaching its next file a *Media Play*.
 
   The event list is built from the same tables the sources register their hotkeys from, so a preset speed or step size added to the sources turns up here as well.
 * **Then Trigger**:
@@ -174,28 +177,29 @@ warp_get_speed(out int speed)      warp_playlist_clear()
 warp_step_frames(int frames)       warp_playlist_status(out int index, out int count, out string current_file)
 ```
 
-The first four are on the Warp Media source as well. Play, pause, stop, restart, next, previous and seeking are OBS's own media controls on both sources, so obs-websocket's built-in `TriggerMediaInputAction`, `SetMediaInputCursor` and `GetMediaInputStatus` requests work on them too.
+The first four are on the Warp Media source as well, along with `warp_media_load(string path, int speed, string playback)`, which points the source at a file and says what playback does with it — `keep`, `play` or `hold`, as the [Instant Replay flow](#instant-replays) settings describe. It is what an instant replay flow calls, and it emits the source's `loaded` media action. Play, pause, stop, restart, next, previous and seeking are OBS's own media controls on both sources, so obs-websocket's built-in `TriggerMediaInputAction`, `SetMediaInputCursor` and `GetMediaInputStatus` requests work on them too.
 
 ### Warp flows
 
 A **Warp** entry in the Tools menu opens the Warp window: the flows of the scene collection, what each one feeds, and how much is in it. Underneath the list, a dot says whether the replay buffer is running — green while it is, red while it is not — next to the clip it saved last.
 
-A flow takes the clips the OBS replay buffer saves and puts them in a Warp Playlist source, so a list builds itself as an event goes on. Adding one opens a dialog laid out like OBS's own Add Source: the kinds down the left, what the one that is picked does on the right, and the settings it needs underneath.
+A flow takes the clips the OBS replay buffer saves and hands them to a Warp source, so a feed builds itself as an event goes on. Adding one opens a dialog laid out like OBS's own Add Source: the kinds down the left, what the one that is picked does on the right, and the settings it needs underneath.
 
 * **Replay List** — a list that fills itself with the clips the replay buffer saves.
 * **Highlight List** — a list that keeps the clips worth keeping. It works the same way, and is usually fed by a replay list rather than by the replay buffer directly.
 * **Combo List** — a replay list and a highlight list, made and linked in one go. The replay list takes the saves and hands every clip it takes to the highlight list as well. Each has its own playlist source and its own order, so the replay feed can run newest first while the highlights stay in the order they happened.
+* **Instant Replay** — one clip in a Warp Media source, loaded the moment it is saved, so the replay that just happened is ready to go on screen over the action. See [instant replays](#instant-replays) below.
 
 Every flow is:
 
-* **Feeds**: the Warp Playlist source clips are added to, picked from the ones already in the scene collection or made on the spot. A new one is put in the current scene, since a source no scene holds on to is not saved with the scene collection.
+* **Feeds**: the Warp source clips are handed to — a Warp Playlist source for the list kinds, a Warp Media source for an instant replay — picked from the ones already in the scene collection or made on the spot. A new one is put in the current scene, since a source no scene holds on to is not saved with the scene collection.
 * **Takes**: where its clips come from.
   * *Only what its own hotkey saves* — the flow's own Save Replay hotkey saves the replay buffer and keeps the clip for that flow. Saves made any other way go past it, so two flows with two hotkeys feed two different lists.
   * *Every replay buffer save* — the flow takes those as well as the saves nobody claimed: OBS's own Save Replay hotkey, obs-websocket, a script.
 
   A flow's Save Replay hotkey works either way. What the setting decides is whether saves the flow did not ask for land in it too.
-* **Order**: *oldest first*, added to the end, so the list plays in the order the clips were saved; or *newest first*, added to the top, so the clip that was just saved is the next one up.
-* **Limit**: drop the oldest clip once the list is longer than a number you set. The oldest is the one that would be played last, whichever way round the list is built. Off by default, and not offered for highlight lists: what is in one was put there on purpose.
+* **Order**: *oldest first*, added to the end, so the list plays in the order the clips were saved; or *newest first*, added to the top, so the clip that was just saved is the next one up. Not offered for an instant replay, which holds one clip rather than a list.
+* **Limit**: drop the oldest clip once the list is longer than a number you set. The oldest is the one that would be played last, whichever way round the list is built. Off by default, and not offered for highlight lists or instant replays: what is in one was put there on purpose, and the other holds a single clip.
 * **Also feeds**: the flows this one hands every clip it takes on to, so a highlight reel builds itself alongside a replay feed. Links are followed through further links, and a flow already being fed is not fed twice.
 * **Take clips**: a flow that is switched off takes nothing itself, but still passes clips on to the flows it is linked to.
 
@@ -208,9 +212,27 @@ The keys they are bound to are saved with the flow, so a flow loads with its hot
 
 A clip landing in a playlist disturbs nothing about playback: the file list is edited the way the playlist's own Clear Playlist edits it, so whatever is on screen plays out untouched and the new clip is reached in its turn. A clip that is already in the list is not added a second time, and a flow whose playlist source has gone says so in the OBS log rather than losing the clip quietly.
 
-Flows are saved with the scene collection, alongside the playlist sources they feed, so an event day's collection carries its own feed setup and switching collections switches flows.
+Flows are saved with the scene collection, alongside the sources they feed, so an event day's collection carries its own feed setup and switching collections switches flows.
 
 Every flow action can also be driven from outside OBS — see [obs-websocket control](#obs-websocket-control).
+
+#### Instant replays
+
+An **Instant Replay** flow feeds a Warp Media source instead of a playlist. There is no list: the source is pointed at the clip that was just saved, the one before it is let go, and the source is left holding a replay of what happened seconds ago — ready to slide in over the live action, drop into a corner, or fill the screen while play is stopped.
+
+It has two settings of its own on top of the ones every flow has:
+
+* **When a clip lands**:
+  * *Load it and leave playback alone* — the source's own settings decide from there. A source that is on screen starts the clip; one that is not waits, and plays it from the top as it is brought on, if *Restart playback when source becomes active* is ticked on the source. This is the one to use for a source that is slid in.
+  * *Load it and play it now* — the clip starts from the top there and then, on screen or not. Bring the source on part-way through and you join the replay where it has got to.
+  * *Load it and hold the first frame* — the clip is parked on its opening frame and left there until someone plays it, for an operator who wants to call the moment themselves. A source set to restart when it becomes active still restarts as it is brought on, so a clip that is to stay held through the reveal wants that setting off.
+* **Speed**: the percentage the clip is played at, for a replay that comes in slow. Off by default, which leaves the source playing at whatever speed it is set to. The speed hotkeys still work on the source while the clip plays, so an operator can slow it down further mid-replay.
+
+**Bringing it on screen is yours to set up**, which is the point: the flow loads the clip and says so, and how the source arrives is whatever you have built. The source emits its `warp_media_action` signal with `loaded` as each clip lands, so a [Warp Detection filter](#warp-detection-filter) on it, listening for **Clip Loaded**, can trigger a hotkey, switch a filter on, or fire whatever drives your slide-in. A move/scale animation, a scene item toggle, a stinger — the flow does not care which. The signal is emitted as soon as the clip is in rather than once it has decoded, so a source that is only being loaded says so too; *play* and *hold* have the file decoding straight away, so there is picture by the time an animation lands.
+
+An instant replay flow takes clips the same way the list kinds do — from its own **Save Replay to** hotkey, or from every replay buffer save — and it can be fed by another flow instead, so one save can fill a replay list *and* load the instant replay source at once. Its **Add Last Saved Clip to** hotkey reloads the clip that was saved last without saving a new one.
+
+The Warp window shows an instant replay flow holding 0 or 1 clips, and what it does with one where a list shows its order.
 
 ## Building
 

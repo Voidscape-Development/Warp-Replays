@@ -100,6 +100,22 @@ struct warp_source {
 	 * cleared around the synchronous call it covers. */
 	bool internal_command;
 
+	/* A clip warp_media_load has handed the source and what playback still
+	 * owes it. libobs defers a video source's settings update to its next
+	 * tick, so the file is not open when the load returns: the load leaves
+	 * these behind instead, and the tick carries them out once the update
+	 * has been applied.
+	 *
+	 * start_pending is a clip that is to be played from the top rather than
+	 * left to the source's own settings; hold_clip is one that is to be
+	 * parked on its first frame, which it cannot be until it has one. Set
+	 * from whichever thread handed the clip over and read on the graphics
+	 * thread, so both are set and read atomically, and hold_clip is set
+	 * first: the tick that sees a clip to start has to see how it is to be
+	 * left as well. */
+	volatile bool start_pending;
+	volatile bool hold_clip;
+
 	struct warp_hotkey_binding speed_bindings[WARP_NUM_SPEED_PRESETS];
 	struct warp_hotkey_binding step_bindings[WARP_NUM_STEP_HOTKEYS];
 };
@@ -451,11 +467,79 @@ static void *warp_source_reconnect(void *data)
 	return NULL;
 }
 
+/* Whether the source has something to put on screen yet. Opening a file is
+ * asynchronous: the source exists as soon as it is created, but its media
+ * thread still has to read the header and decode a frame before anything can
+ * be rendered from it, and until then the source draws nothing at all. The
+ * Warp Playlist waits for this before handing an item to its transition, so a
+ * switch never starts against a source that is still empty, and a held clip
+ * waits for it before being parked on its first frame. */
+static bool warp_source_ready(struct warp_source *s)
+{
+	if (!s->media || !media_playback_is_open(s->media))
+		/* Nothing the media says about itself means anything until its
+		 * streams have been worked out. In particular it reports no
+		 * video, because it does not know yet that it has any, and a
+		 * duration, because a container gives that up as soon as its
+		 * header has been read -- which together used to read as "an
+		 * audio-only file, ready to go" for the first few frames of
+		 * every video file that was opened. */
+		return false;
+
+	if (!media_playback_has_video(s->media))
+		/* audio only: there is no picture to wait for */
+		return true;
+
+	/* The picture is there once a decoded frame has been written into the
+	 * source's texture. A non-zero width is not enough on its own: a source
+	 * that is off screen reports the size of a frame it has decoded while
+	 * its texture is still empty. */
+	return os_atomic_load_bool(&s->has_picture);
+}
+
+/* Parks a clip that was loaded to be held on its first frame, once the file has
+ * opened far enough to have one. libobs carries the pause and the seek out on
+ * the media's own thread, so this is done from the tick rather than from the
+ * call that asked for the clip to be held. */
+static void warp_source_hold_tick(struct warp_source *s)
+{
+	if (!warp_source_ready(s))
+		return;
+
+	/* the source is holding the clip, not being told to pause by anyone: the
+	 * media action signal is about commands */
+	s->internal_command = true;
+	obs_source_media_play_pause(s->source, true);
+	s->internal_command = false;
+
+	media_playback_seek(s->media, 0);
+
+	os_atomic_set_bool(&s->hold_clip, false);
+}
+
 static void warp_source_tick(void *data, float seconds)
 {
 	UNUSED_PARAMETER(seconds);
 
 	struct warp_source *s = data;
+
+	/* A clip that was loaded to be played or held. libobs applies a deferred
+	 * settings update just before this tick, so the file the load asked for
+	 * is the one being started here. */
+	if (os_atomic_set_bool(&s->start_pending, false)) {
+		/* A held clip is parked on its own first frame, so the picture
+		 * of the one before it goes now: the source holds on to what it
+		 * has while a new file opens, and the hold would otherwise park
+		 * on that rather than waiting for the clip it was given. */
+		if (os_atomic_load_bool(&s->hold_clip))
+			clear_video(s);
+
+		warp_source_start(s);
+	}
+
+	if (os_atomic_load_bool(&s->hold_clip))
+		warp_source_hold_tick(s);
+
 	if (s->destroy_media) {
 		if (s->media) {
 			media_playback_destroy(s->media);
@@ -595,7 +679,11 @@ static void warp_source_update(void *data, obs_data_t *settings)
 		warp_source_open(s);
 
 	dump_source_info(s, input, input_format);
-	if ((!s->restart_on_activate || active) && should_restart_media)
+
+	/* A clip that was loaded to be played or held is started by the tick
+	 * this update is being applied on, from the top and whether or not the
+	 * source is on screen, so it is not started here as well. */
+	if ((!s->restart_on_activate || active) && should_restart_media && !os_atomic_load_bool(&s->start_pending))
 		warp_source_start(s);
 
 	/* the Speed property applies live, so it is a speed change like any
@@ -655,37 +743,9 @@ static void get_nb_frames(void *data, calldata_t *cd)
 	calldata_set_int(cd, "num_frames", frames);
 }
 
-/* Whether the source has something to put on screen yet. Opening a file is
- * asynchronous: the source exists as soon as it is created, but its media
- * thread still has to read the header and decode a frame before anything can
- * be rendered from it, and until then the source draws nothing at all. The
- * Warp Playlist waits for this before handing an item to its transition, so a
- * switch never starts against a source that is still empty. */
 static void media_ready_proc(void *data, calldata_t *cd)
 {
-	struct warp_source *s = data;
-	bool ready;
-
-	if (!s->media || !media_playback_is_open(s->media))
-		/* Nothing the media says about itself means anything until its
-		 * streams have been worked out. In particular it reports no
-		 * video, because it does not know yet that it has any, and a
-		 * duration, because a container gives that up as soon as its
-		 * header has been read -- which together used to read as "an
-		 * audio-only file, ready to go" for the first few frames of
-		 * every video file that was opened. */
-		ready = false;
-	else if (media_playback_has_video(s->media))
-		/* The picture is there once a decoded frame has been written
-		 * into the source's texture. A non-zero width is not enough on
-		 * its own: a source that is off screen reports the size of a
-		 * frame it has decoded while its texture is still empty. */
-		ready = os_atomic_load_bool(&s->has_picture);
-	else
-		/* audio only: there is no picture to wait for */
-		ready = true;
-
-	calldata_set_bool(cd, "ready", ready);
+	calldata_set_bool(cd, "ready", warp_source_ready(data));
 }
 
 static bool warp_source_play_hotkey(void *data, obs_hotkey_pair_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -892,6 +952,66 @@ static void step_frames_proc(void *data, calldata_t *cd)
 		warp_source_do_step(data, (int)frames);
 }
 
+/* Puts a file in the source and says what playback is to do with it, which is
+ * what a Warp Instant Replay flow calls when a clip lands. The file goes in
+ * through the source's settings, the way changing it in the properties does, so
+ * it is saved with the scene collection and the source reopens it like any
+ * other change of file. */
+static void warp_media_load_proc(void *data, calldata_t *cd)
+{
+	struct warp_source *s = data;
+	const char *path = NULL;
+	const char *playback = NULL;
+	long long speed = 0;
+
+	if (!calldata_get_string(cd, "path", &path) || !path || !*path) {
+		FF_BLOG(LOG_WARNING, "asked to load a clip without saying which");
+		return;
+	}
+
+	calldata_get_string(cd, "playback", &playback);
+	calldata_get_int(cd, "speed", &speed);
+
+	if (!playback || !*playback)
+		playback = WARP_MEDIA_LOAD_KEEP;
+
+	const bool play = strcmp(playback, WARP_MEDIA_LOAD_PLAY) == 0;
+	const bool hold = strcmp(playback, WARP_MEDIA_LOAD_HOLD) == 0;
+
+	obs_data_t *settings = obs_source_get_settings(s->source);
+
+	/* a clip is a file on disk, whatever the source was pointed at before */
+	if (!s->is_local_file)
+		FF_BLOG(LOG_INFO, "loading a clip, so the source is no longer reading '%s'", s->input ? s->input : "");
+
+	obs_data_set_bool(settings, "is_local_file", true);
+	obs_data_set_string(settings, "local_file", path);
+
+	if (speed >= MP_SPEED_MIN && speed <= MP_SPEED_MAX)
+		obs_data_set_int(settings, "speed_percent", (int)speed);
+
+	obs_source_update(s->source, settings);
+	obs_data_release(settings);
+
+	/* Playback is left to the update and the source's own settings unless
+	 * the clip was asked to be played or held; both of those are started by
+	 * the tick that applies the update, whether or not the source is on
+	 * screen, because a clip that is not decoding cannot play now and has no
+	 * frame to be held on. */
+	os_atomic_set_bool(&s->hold_clip, hold);
+	os_atomic_set_bool(&s->start_pending, play || hold);
+
+	FF_BLOG(LOG_INFO, "loaded '%s' (%s)", path, playback);
+
+	/* Said as soon as the clip is in rather than once it has decoded, so
+	 * that a source which is only being loaded says so too: one that is off
+	 * screen and set to restart as it is brought on has nothing to decode
+	 * until it is, and waiting for picture would leave whoever is listening
+	 * for this - a Warp Detection filter bringing the source on - waiting
+	 * for something that only their own reaction can bring about. */
+	warp_signal_media_action(s->source, WARP_MEDIA_ACTION_LOADED);
+}
+
 static void warp_source_register_warp_hotkeys(struct warp_source *s, obs_source_t *source)
 {
 	static const int speed_presets[WARP_NUM_SPEED_PRESETS] = {WARP_SPEED_PRESET_LIST};
@@ -985,6 +1105,8 @@ static void *warp_source_create(obs_data_t *settings, obs_source_t *source)
 	proc_handler_add(ph, "void warp_adjust_speed(int delta)", adjust_speed_proc, s);
 	proc_handler_add(ph, "void warp_get_speed(out int speed)", get_speed_proc, s);
 	proc_handler_add(ph, "void warp_step_frames(int frames)", step_frames_proc, s);
+	proc_handler_add(ph, "void " WARP_MEDIA_LOAD_PROC "(string path, int speed, string playback)",
+			 warp_media_load_proc, s);
 
 	warp_source_update(s, settings);
 	return s;
@@ -1038,9 +1160,23 @@ static void warp_source_deactivate(void *data)
 	}
 }
 
+/* A clip that was loaded to be played or held is waiting on the tick, which is
+ * long enough for the operator to get in first. Whatever they asked for is what
+ * the source does: the load does not come back and take playback off them. */
+static void warp_source_drop_pending_load(struct warp_source *s)
+{
+	if (s->internal_command)
+		return;
+
+	os_atomic_set_bool(&s->start_pending, false);
+	os_atomic_set_bool(&s->hold_clip, false);
+}
+
 static void warp_source_play_pause(void *data, bool pause)
 {
 	struct warp_source *s = data;
+
+	warp_source_drop_pending_load(s);
 
 	if (!s->media)
 		warp_source_open(s);
@@ -1067,6 +1203,8 @@ static void warp_source_stop(void *data)
 {
 	struct warp_source *s = data;
 
+	warp_source_drop_pending_load(s);
+
 	if (s->media) {
 		media_playback_stop(s->media);
 		clear_video(s);
@@ -1077,6 +1215,8 @@ static void warp_source_stop(void *data)
 static void warp_source_restart(void *data)
 {
 	struct warp_source *s = data;
+
+	warp_source_drop_pending_load(s);
 
 	if (obs_source_showing(s->source))
 		warp_source_start(s);

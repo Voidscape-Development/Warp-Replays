@@ -60,6 +60,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define EVENT_MEDIA_PLAY "media_play"
 #define EVENT_MEDIA_PAUSE "media_pause"
 #define EVENT_MEDIA_RESTART "media_restart"
+#define EVENT_MEDIA_LOADED "media_loaded"
 
 /* the speed Reset Speed sets, which has an event like the presets do */
 #define WARP_DETECT_RESET_SPEED 100
@@ -76,6 +77,7 @@ enum warp_detect_kind {
 	WARP_DETECT_KIND_MEDIA_PLAY,
 	WARP_DETECT_KIND_MEDIA_PAUSE,
 	WARP_DETECT_KIND_MEDIA_RESTART,
+	WARP_DETECT_KIND_MEDIA_LOADED,
 };
 
 /* what is done about it */
@@ -427,6 +429,9 @@ static enum warp_detect_kind warp_detect_event_kind(obs_data_t *settings, int *v
 	if (strcmp(event, EVENT_MEDIA_RESTART) == 0)
 		return WARP_DETECT_KIND_MEDIA_RESTART;
 
+	if (strcmp(event, EVENT_MEDIA_LOADED) == 0)
+		return WARP_DETECT_KIND_MEDIA_LOADED;
+
 	if (warp_detect_event_is(event, EVENT_STEP_FORWARD, &hotkey_value)) {
 		*value = hotkey_value ? hotkey_value : (int)obs_data_get_int(settings, S_FRAME_VALUE);
 		*any = !hotkey_value && obs_data_get_bool(settings, S_ANY_VALUE);
@@ -497,6 +502,8 @@ static bool warp_detect_media_matches(obs_data_t *settings, const char *action)
 		return strcmp(action, WARP_MEDIA_ACTION_PAUSE) == 0;
 	case WARP_DETECT_KIND_MEDIA_RESTART:
 		return strcmp(action, WARP_MEDIA_ACTION_RESTART) == 0;
+	case WARP_DETECT_KIND_MEDIA_LOADED:
+		return strcmp(action, WARP_MEDIA_ACTION_LOADED) == 0;
 	default:
 		return false;
 	}
@@ -895,6 +902,7 @@ static void warp_detect_add_events(obs_property_t *list)
 	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.MediaPlay"), EVENT_MEDIA_PLAY);
 	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.MediaPause"), EVENT_MEDIA_PAUSE);
 	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.MediaRestart"), EVENT_MEDIA_RESTART);
+	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.MediaLoaded"), EVENT_MEDIA_LOADED);
 }
 
 static bool warp_detect_modified(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)

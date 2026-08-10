@@ -69,10 +69,43 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define WARP_SPEED_CHANGE_DECREASED "decreased"
 
 /* values of the 'action' field: playback was started or resumed, paused, or
- * restarted from the top */
+ * restarted from the top; or a file was put in the source from outside it,
+ * which is what a Warp Instant Replay flow does when a clip lands */
 #define WARP_MEDIA_ACTION_PLAY "play"
 #define WARP_MEDIA_ACTION_PAUSE "pause"
 #define WARP_MEDIA_ACTION_RESTART "restart"
+#define WARP_MEDIA_ACTION_LOADED "loaded"
+
+/* Puts a file in a Warp Media source, as a proc on the source itself:
+ *
+ *   warp_media_load(string path, int speed, string playback)
+ *
+ * The source is switched to that local file, played at 'speed' percent when
+ * that is anything other than zero, and left doing whatever 'playback' says.
+ * The loaded action above is emitted once the file is in, whichever way
+ * playback was left, so a Warp Detection filter can bring the source on screen
+ * the moment a clip arrives.
+ *
+ * This is what a Warp Instant Replay flow calls; it is a proc rather than a
+ * settings change so that holding a clip on its first frame - which has to
+ * wait for the file to open and decode - is done by the source, on its own
+ * tick, rather than by whoever handed the clip over. */
+#define WARP_MEDIA_LOAD_PROC "warp_media_load"
+
+/* what playback does with a file that has just been loaded:
+ *
+ *   keep - nothing beyond loading it: the source's own settings decide, the
+ *          same way they do when the file is changed from the properties. A
+ *          source that is on screen plays the clip; one that is not waits, and
+ *          plays it when it is brought on if it restarts on activate.
+ *   play - starts the clip from the top there and then, on screen or not.
+ *   hold - parks the clip on its first frame and leaves it there, for an
+ *          operator to start when they are ready. A source set to restart when
+ *          it becomes active still restarts as it is brought on screen, so a
+ *          clip that is to stay held through the reveal wants that setting off. */
+#define WARP_MEDIA_LOAD_KEEP "keep"
+#define WARP_MEDIA_LOAD_PLAY "play"
+#define WARP_MEDIA_LOAD_HOLD "hold"
 
 static inline void warp_signal_speed_changed(obs_source_t *source, int speed, int prev_speed, const char *change)
 {

@@ -43,6 +43,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QTreeWidget>
 #include <QVBoxLayout>
 
+#include "warp-events.h"
 #include "warp-flow-dialog.hpp"
 #include "warp-flow.h"
 
@@ -178,8 +179,20 @@ QString warp_trigger_name(const char *trigger)
 	return warp_flow_text("Warp.Flow.Trigger.Hotkey");
 }
 
-QString warp_order_name(const char *order)
+/* What an instant replay flow does with a clip stands in the order column: it
+ * holds one clip rather than building a list, so which end of a list a clip
+ * goes on says nothing about it. */
+QString warp_order_name(const char *kind, const char *order, const char *playback)
 {
+	if (kind && strcmp(kind, WARP_FLOW_KIND_INSTANT) == 0) {
+		if (playback && strcmp(playback, WARP_MEDIA_LOAD_PLAY) == 0)
+			return warp_flow_text("Warp.Flow.Playback.Play");
+		if (playback && strcmp(playback, WARP_MEDIA_LOAD_HOLD) == 0)
+			return warp_flow_text("Warp.Flow.Playback.Hold");
+
+		return warp_flow_text("Warp.Flow.Playback.Keep");
+	}
+
 	if (order && strcmp(order, WARP_FLOW_ORDER_NEWEST_FIRST) == 0)
 		return warp_flow_text("Warp.Flow.Order.NewestFirst");
 
@@ -329,7 +342,8 @@ void WarpWindow::refresh()
 
 		item->setText(WARP_COL_TARGET, QString::fromUtf8(obs_data_get_string(flow, WARP_FLOW_TARGET_NAME)));
 		item->setText(WARP_COL_TRIGGER, warp_trigger_name(obs_data_get_string(flow, WARP_FLOW_TRIGGER)));
-		item->setText(WARP_COL_ORDER, warp_order_name(obs_data_get_string(flow, WARP_FLOW_ORDER)));
+		item->setText(WARP_COL_ORDER, warp_order_name(kind, obs_data_get_string(flow, WARP_FLOW_ORDER),
+							      obs_data_get_string(flow, WARP_FLOW_PLAYBACK)));
 
 		QStringList linked;
 		obs_data_array_t *links = obs_data_get_array(flow, WARP_FLOW_LINKS);
