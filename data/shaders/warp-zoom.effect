@@ -1,0 +1,50 @@
+/*
+Warp
+Copyright (C) 2026 Voidscape Development
+
+Draws the picture with its texture coordinates scaled and shifted, which is
+what a zoom is: the window mul_val/add_val describe is stretched back over the
+whole frame, so the source keeps the size it always had and only its contents
+are magnified.
+*/
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+/* the visible window, in texture coordinates: uv * mul_val + add_val */
+uniform float2 mul_val;
+uniform float2 add_val;
+
+sampler_state textureSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv = v_in.uv * mul_val + add_val;
+
+	return vert_out;
+}
+
+float4 PSDraw(VertData v_in) : TARGET
+{
+	return image.Sample(textureSampler, v_in.uv);
+}
+
+technique Draw
+{
+	pass {
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSDraw(v_in);
+	}
+}

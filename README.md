@@ -13,6 +13,7 @@ A media source based on OBS Studio's built-in Media Source, with the same proper
   * Preset speed hotkeys: 25%, 50%, 125%, 150%, 200%
   * The Speed property in the source settings also applies live
 * **Frame stepping** hotkeys: step 1, 5, 10, or 20 frames forward or backward. Stepping while the video is playing pauses it first; stepping is frame-accurate, including backward steps.
+* **Zoom and framing** of the clip that is loaded — see [zoom](#zoom). The framing goes back to the whole picture as each clip lands, so an [instant replay](#instant-replays) arrives ready to go on screen rather than still zoomed into the last one.
 
 All hotkeys are per-source and are bound in OBS under Settings → Hotkeys. Every one of these actions can also be driven from outside OBS — see [obs-websocket control](#obs-websocket-control).
 
@@ -29,6 +30,7 @@ A playlist source in the spirit of the VLC video source, built on the same playb
   * **Scaling** and **alignment**, for playlists whose files are not all the same size.
   * **Use a different transition when going back**, which gives moving back through the playlist a transition of its own — a second section with its own transition, properties, duration, scaling and alignment. The first section is then the one the playlist goes forward with: automatic advance, Next Video and starting the playlist over. With the option off, the one transition handles both directions. Both transitions are kept live and set up separately, so a stinger for going back keeps its own video loaded and is ready the moment it is asked for, and the picture is handed from one to the other as the direction changes rather than blinking out in between. Going back has no timing setting of its own: only automatic advance is placed against the end of a file, and that only ever moves forward.
 * **Playback speed and frame stepping** for the file that is playing, with the same hotkeys as the Warp Media source. The speed resets to the configured Speed value whenever the playlist moves to another file.
+* **Zoom and framing** for the video that is playing — see [zoom](#zoom) — with the same rule the speed follows: the framing belongs to the video, not to the playlist. Zoom into a corner of one replay and the playlist moves on to the next file at the whole picture, ready to go, however far in the last one was left. The file being transitioned away from keeps the framing it was being watched at, so it plays out the transition as it was on screen while the incoming one is already framed at the top.
 * **Volume**, from silent to 100% of the audio in the files themselves. The playlist mixes its own audio, which leaves it out of the OBS audio mixer, so this property is where its level is set. It applies live, to the file that is playing as well as to the ones after it, so a playlist of clips recorded far louder than the rest of the show can be turned down without touching the files.
 * **Hotkeys**: Next Video, Previous Video, Back to First Video, Restart Current Video, Clear Playlist, plus Play/Pause, Stop, the speed hotkeys, and the frame stepping hotkeys.
 
@@ -38,11 +40,47 @@ Media controls (the ones in the OBS media controls dock) apply to the playlist: 
 
 Every playlist action can also be driven from outside OBS — see [obs-websocket control](#obs-websocket-control).
 
+### Zoom
+
+Every Warp source can be zoomed into and panned around while it plays, and so can any other source, through the **Warp Zoom** filter. It is one system in three places: the filter that draws it, the presets a framing is kept as, and the dock an operator works it from.
+
+The picture is magnified inside the frame the source already fills. Nothing downstream has to know a zoom is on: the source reports the size it always did, so a playlist's transitions, the scene item it sits in and the canvas are all untouched, and a zoomed source can be faded, moved or stingered exactly as before.
+
+* **Zoom** from 100% to 800%. 100% is the whole picture and the zoom never goes below it, so there is no way to end up with the frame smaller than the video.
+* **Pan** anywhere inside the picture. The window is kept inside the video, so the edge of the video stays at the edge of the frame however far it is pushed: panning right at 400% stops the moment the right-hand edge of the file is at the right-hand edge of the screen.
+* **Presets**: a framing kept under a name, recalled with a smooth move. Every source has as many as it needs, plus a **Default** preset that is always the first in the list, is always the whole picture, and cannot be renamed, moved, overwritten or removed — whatever else is set up, there is always one way back.
+* **Moves glide** rather than jumping. A preset recall eases in and out over 400ms by default, and each preset can be given a glide of its own, so a wide establishing shot can ease in slowly while a tight punch-in snaps across. The zoom and pan hotkeys use a shorter glide, short enough that a held-down key runs its presses into one continuous move.
+* **Hotkeys**, per source, in Settings → Hotkeys: Zoom In, Zoom Out, Reset Zoom, Pan Left / Right / Up / Down, *Recall Zoom Preset 1* through *8*, and one hotkey per preset named after it. The numbered slots fire whichever preset is in that position, so their bindings survive a preset being renamed or removed mid-show; a preset's own hotkey follows it through a rename, because it is bound to the preset rather than to its name.
+* The **Zoom** group in the source properties sets how long moves take, and, on the Warp Zoom filter, the framing itself.
+
+Zoom In and Zoom Out multiply by 1.25 rather than adding a fixed amount, so a press feels the same at 600% as it does at 150%. Panning moves by a twentieth of what is on screen, which covers the same distance on the stream whatever the zoom is.
+
+On the Warp sources the framing belongs to the **video**, not to the source: a playlist moving to its next file, and a clip landing in a Warp Media source, both put it back to the whole picture without a word, the same way the speed goes back to what the source is set to. Nothing about the framing is saved with those sources — the presets are, the framing is not, because it was that video's. The Warp Zoom filter is the other way round: dropped on a camera or a scene, it keeps the framing it was left with, like any other filter.
+
+#### The Warp Zoom dock
+
+A dock called **Warp Zoom** is added to OBS when the plugin loads — turn it on under Docks if it is not showing. It is the panel a framing is found from, laid out like a PTZ desk:
+
+* The **picture** the chosen source is putting out, framed as it is right now. **Drag it to pan** — the picture follows the cursor, so it is moved rather than aimed — and **roll the wheel to zoom** in and out around it. A dragged pan tracks the hand exactly rather than gliding behind it; everything else in the dock eases. A small map in the corner says where the framing sits in the whole picture once there is anything left out.
+* A **zoom slider**, and a pad of pan arrows around a **Reset**, for framing without the mouse on the picture.
+* The **presets** of that source. Double-click one, or press Recall, to move to it. **Keep…** stores the framing that is on screen right now under a name you type, the way a PTZ desk stores a shot; **Update** moves a preset that already exists to the framing on screen, keeping its name and its hotkey; Rename and Remove do what they say, and none of them are offered for the Default preset. The number in front of a preset is the numbered recall hotkey that fires it.
+* The **speed** the source is playing at, with the same preset speeds the hotkeys use — framing and speed being the two things ridden live.
+
+The dock is pointed at one source with the list at the top, or set to **follow the active source**, in which case it frames whichever Warp source, or source carrying a Warp Zoom filter, is on program right now. Leave it off to set a framing on a feed before it goes on air.
+
+Presets can also be set up by number, which is what the **Zoom Presets…** button in the [Warp window](#warp-flows) opens: every source that can be zoomed, its presets, and the zoom, centre and glide of each one written out.
+
+#### The Warp Zoom filter
+
+**Warp Zoom** is in the OBS filter list, so anything can be framed with it — a camera, a browser source, a whole scene. It carries everything the Warp sources' own zoom does: its own presets, its own hotkeys, and its own entry in the dock, listed as *source - filter*. Its framing and presets are saved with the filter, so it is left the way it was found.
+
+The Warp sources put a driven zoom filter on what they are showing themselves — the playlist on every file it opens, the media source on itself the first time anything asks it to zoom. Those are not operators' filters: they render the framing the source that made them hands over, and they are what keeps the zoom with the video rather than with the source.
+
 ### Warp Detection filter
 
 A filter that watches a Warp Media or Warp Playlist source and triggers something else when the operator changes playback. Add it under Filters on any source — it never touches the picture, so the source it is on does not have to be the source it listens to.
 
-* **Listen To**: the Warp Media or Warp Playlist source to watch. Left unset, the filter watches the source it is on. A source that is not in the scene collection yet is picked up as soon as it appears, so the filter survives a scene collection loading in whatever order it likes.
+* **Listen To**: the Warp Media or Warp Playlist source to watch, or any source carrying a Warp Zoom filter, whose framing is watched through that filter. Left unset, the filter watches the source it is on. A source that is not in the scene collection yet is picked up as soon as it appears, so the filter survives a scene collection loading in whatever order it likes.
 * **React To**, one event per filter. Every speed and frame stepping hotkey has an event of its own, named after that hotkey — *Set Speed to 25%*, *Set Speed to 50%*, *Reset Speed (100%)*, *Set Speed to 125/150/200%*, *Speed Up (+10%)*, *Slow Down (-10%)*, *Step Forward 1/5/10/20 Frames* and *Step Backward 1/5/10/20 Frames* — so every step level can set off something different. Three more events match a value you choose instead:
   * *Speed Set to a Value…*, matching one speed, or any speed.
   * *Frames Skipped Forward…* / *Frames Skipped Backward…*, matching one frame count, or any count.
@@ -60,6 +98,13 @@ A filter that watches a Warp Media or Warp Playlist source and triggers somethin
   * *Media Pause*, when playback is paused.
   * *Media Restart*, when the file or playlist is restarted from the top — the media controls' restart button, the Warp Media *Restart* hotkey, the playlist's *Restart Current Video*, and the `Restart` and `RestartCurrent` websocket requests. Moving through a playlist with next, previous or *Back to First Video* is not a restart.
 
+  Three are about how the source is framed rather than about playback, and fire for a zoom driven from anywhere — a hotkey, the dock, the websocket:
+  * *Zoom Changed*, whenever the framing moves at all.
+  * *Zoom Preset Recalled…*, matching one preset by name, or any of them.
+  * *Zoom Reset*, when the framing goes back to the whole picture.
+
+  The framing a video starts at is not a change: a playlist reaching its next file resets the zoom without firing anything, the same way it resets the speed.
+
   One more is about the file rather than about playback:
   * *Clip Loaded*, when a clip is put in a Warp Media source from outside it — which is what an [Instant Replay flow](#instant-replays) does as each replay is saved. This is the event to react to for bringing an instant replay on screen: point it at a hotkey, or at a filter that runs your slide-in.
 
@@ -70,6 +115,7 @@ A filter that watches a Warp Media or Warp Playlist source and triggers somethin
   * *A Global Hotkey*: any of OBS's own hotkeys — Start Recording, Save Replay, and the rest — listed by the same translated names the Settings → Hotkeys page uses.
   * *A Source Hotkey*: pick a source or scene, then one of its hotkeys, again by the name the hotkeys page shows. Another Warp source's speed and stepping hotkeys are in that list, so one source can drive another.
   * *A Filter*: pick a source and one of its filters, then enable, disable or toggle it — or trigger one of the filter's own hotkeys.
+  * *A Zoom Preset*: pick a source that can be zoomed and one of its presets, and the source is framed with it. This is what auto-framing hangs on — an [Instant Replay flow](#instant-replays) loading a clip can frame it before it goes on screen, by reacting to *Clip Loaded* with the preset the replay should arrive at.
 
 Hotkeys are triggered through OBS's hotkey routing on the UI thread, exactly as if the key had been pressed, and every trigger is written to the OBS log. For several reactions to the same source, add several Warp Detection filters.
 
@@ -81,9 +127,12 @@ Both Warp sources emit the events as signals on their signal handler, so scripts
 warp_speed_changed(ptr source, int speed, int prev_speed, string change)
 warp_frames_stepped(ptr source, int frames)
 warp_media_action(ptr source, string action)
+warp_zoom_changed(ptr source, float zoom, float x, float y, string change, string preset)
 ```
 
-`change` is `set`, `increased` or `decreased`; `frames` is negative when stepping backward; `action` is `play`, `pause` or `restart`. The speed a file starts at is not a change: a playlist moving to its next file resets the speed without emitting anything. `warp_media_action` reports commands, so playback a source drives by itself — restarting as it goes on screen, the pause a frame step does first, a playlist rolling on to its next file — emits nothing.
+On `warp_zoom_changed`, `zoom` is 1 for the whole picture and up to 8 at the tightest, `x` and `y` are where the middle of what is shown sits in the file, and `change` is `manual`, `preset`, `reset` or `set`, with `preset` naming the preset when one was recalled. A Warp Zoom filter emits it on itself.
+
+For the rest, `change` is `set`, `increased` or `decreased`; `frames` is negative when stepping backward; `action` is `play`, `pause` or `restart`. The speed a file starts at is not a change: a playlist moving to its next file resets the speed without emitting anything. `warp_media_action` reports commands, so playback a source drives by itself — restarting as it goes on screen, the pause a frame step does first, a playlist rolling on to its next file — emits nothing.
 
 ### obs-websocket control
 
@@ -127,6 +176,22 @@ Five more apply to a Warp Playlist source, and answer with an error when they ar
 | `RestartCurrent` | Restarts the video that is playing |
 | `ClearPlaylist` | Clears the playlist, exactly as the hotkey does — the file list is emptied for good, and written to the log first |
 
+Nine more frame the source rather than driving playback, and are the one group that is not limited to the Warp sources: they work on anything that can be zoomed, which is a Warp source or any source carrying a [Warp Zoom filter](#the-warp-zoom-filter). Add `filterName` to name which filter to frame with when a source carries more than one; without it the source's own zoom is used, or the one filter it has.
+
+| Request | Fields | What it does |
+| --- | --- | --- |
+| `SetZoom` | `zoom`, `x`, `y`, `glide` | Frames the source. `zoom` is a percentage from 100 to 800, `x` and `y` are where the middle of the picture sits, in percent. Leave a field out and it stays where it is, so a control surface can pan without knowing the zoom |
+| `ZoomIn` | `factor`, `glide` | Zooms in, multiplying by 1.25 unless `factor` says otherwise |
+| `ZoomOut` | `factor`, `glide` | Zooms out the same way |
+| `PanZoom` | `dx`, `dy`, `glide` | Pans by a percentage of what is on screen |
+| `ResetZoom` | `glide` | Back to the whole picture |
+| `RecallZoomPreset` | `preset`, `slot` | Moves to a preset, named by `preset` (its name or its id) or numbered by `slot` |
+| `SaveZoomPreset` | `name` | Keeps the framing the source has right now as a preset, and answers with its `presetId` |
+| `RemoveZoomPreset` | `preset` | Removes a preset. The Default preset cannot be removed and answers with an error |
+| `GetZoomPresets` | | Changes nothing, and answers with the presets |
+
+`glide` is how long the move takes, in milliseconds; leave it out for the source's own preset glide, or send `0` for a move that lands at once. Every one of these answers with `zoomPresets`, so a control surface can lay out its buttons from the reply it already has.
+
 Every response says whether the request was carried out, and reports where playback stands afterwards, so a control surface can follow the source without asking again:
 
 ```json
@@ -142,7 +207,7 @@ Every response says whether the request was carried out, and reports where playb
 }
 ```
 
-A Warp Playlist source also reports `playlistIndex` (-1 when nothing is playing), `playlistLength` and `currentFile`. A request that could not be carried out — no such source, a source that is not a Warp source, or a value outside the range the action takes — answers with `"success": false` and an `error` saying what was wrong, and changes nothing.
+Every response also reports `zoom`, `zoomX` and `zoomY` — how the source is framed, in percent — along with `zoomFilter` when the framing lives in a filter rather than in the source itself, so a zoom can be followed without asking for it separately. A Warp Playlist source also reports `playlistIndex` (-1 when nothing is playing), `playlistLength` and `currentFile`. A request that could not be carried out — no such source, a source that is not a Warp source, or a value outside the range the action takes — answers with `"success": false` and an `error` saying what was wrong, and changes nothing.
 
 The requests do exactly what the matching hotkeys do, including emitting the signals above, so a Warp Detection filter reacts to a speed change driven over the websocket the same way it reacts to the hotkey. The difference is that a hotkey only applies to a source that is on screen, because the operator is pressing it at whatever is in front of them, while a request names the source it means and is carried out whether or not it is being shown. `Restart` on a Warp Media source is the exception: the source only restarts playback while it is being shown, over the websocket as from the hotkey.
 
@@ -178,11 +243,25 @@ warp_get_speed(out int speed)      warp_playlist_clear()
 warp_step_frames(int frames)       warp_playlist_status(out int index, out int count, out string current_file)
 ```
 
-The first four are on the Warp Media source as well, along with `warp_media_load(string path, int speed, string playback)`, which points the source at a file and says what playback does with it — `keep`, `play` or `hold`, as the [Instant Replay flow](#instant-replays) settings describe. It is what an instant replay flow calls, and it emits the source's `loaded` media action. Play, pause, stop, restart, next, previous and seeking are OBS's own media controls on both sources, so obs-websocket's built-in `TriggerMediaInputAction`, `SetMediaInputCursor` and `GetMediaInputStatus` requests work on them too.
+Everything that can be zoomed carries the framing procs as well, which is how the dock, the websocket requests and a Warp Detection filter all drive it without caring which kind of source they are holding:
+
+```
+warp_zoom_set(float zoom, float x, float y, int glide)
+warp_zoom_get(out float zoom, out float x, out float y, out float target_zoom, out float target_x, out float target_y)
+warp_zoom_adjust(float factor, int glide)          warp_zoom_save_preset(string name, out string id)
+warp_zoom_pan(float dx, float dy, int glide)       warp_zoom_update_preset(string id, string name, float zoom, float x, float y, int glide, out bool found)
+warp_zoom_reset(int glide)                         warp_zoom_remove_preset(string id, out bool removed)
+warp_zoom_recall(string preset, int slot, out bool found)  warp_zoom_move_preset(string id, int delta, out bool moved)
+warp_zoom_presets(out string presets)
+```
+
+These take the zoom as a factor from 1 to 8 and the position from 0 to 1, rather than the percentages the websocket requests and the properties use. `warp_zoom_presets` answers with the presets as JSON, since a calldata cannot carry an array.
+
+The first four playlist procs are on the Warp Media source as well, along with `warp_media_load(string path, int speed, string playback)`, which points the source at a file and says what playback does with it — `keep`, `play` or `hold`, as the [Instant Replay flow](#instant-replays) settings describe. It is what an instant replay flow calls, and it emits the source's `loaded` media action. Play, pause, stop, restart, next, previous and seeking are OBS's own media controls on both sources, so obs-websocket's built-in `TriggerMediaInputAction`, `SetMediaInputCursor` and `GetMediaInputStatus` requests work on them too.
 
 ### Warp flows
 
-A **Warp** entry in the Tools menu opens the Warp window: the flows of the scene collection, what each one feeds, and how much is in it. Underneath the list, a dot says whether the replay buffer is running — green while it is, red while it is not — next to the clip it saved last.
+A **Warp** entry in the Tools menu opens the Warp window: the flows of the scene collection, what each one feeds, and how much is in it. Underneath the list, a dot says whether the replay buffer is running — green while it is, red while it is not — next to the clip it saved last, and a **Zoom Presets…** button opens the [zoom presets](#the-warp-zoom-dock) of every source that can be framed.
 
 A flow takes the clips the OBS replay buffer saves and hands them to a Warp source, so a feed builds itself as an event goes on. Adding one opens a dialog laid out like OBS's own Add Source: the kinds down the left, what the one that is picked does on the right, and the settings it needs underneath.
 
@@ -230,6 +309,8 @@ It has two settings of its own on top of the ones every flow has:
 * **Speed**: the percentage the clip is played at, for a replay that comes in slow. Off by default, which leaves the source playing at whatever speed it is set to. The speed hotkeys still work on the source while the clip plays, so an operator can slow it down further mid-replay.
 
 **Bringing it on screen is yours to set up**, which is the point: the flow loads the clip and says so, and how the source arrives is whatever you have built. The source emits its `warp_media_action` signal with `loaded` as each clip lands, so a [Warp Detection filter](#warp-detection-filter) on it, listening for **Clip Loaded**, can trigger a hotkey, switch a filter on, or fire whatever drives your slide-in. A move/scale animation, a scene item toggle, a stinger — the flow does not care which. The signal is emitted as soon as the clip is in rather than once it has decoded, so a source that is only being loaded says so too; *play* and *hold* have the file decoding straight away, so there is picture by the time an animation lands.
+
+The same event can frame the clip as well as reveal it: a second Warp Detection filter listening for **Clip Loaded** with *A Zoom Preset* as its trigger frames the source before it arrives, so a replay can come in already punched in on the corner of the pitch it happened on. The framing goes back to the whole picture by itself as the next clip lands.
 
 An instant replay flow takes clips the same way the list kinds do — from its own **Save Replay to** hotkey, or from every replay buffer save — and it can be fed by another flow instead, so one save can fill a replay list *and* load the instant replay source at once. Its **Add Last Saved Clip to** hotkey reloads the clip that was saved last without saving a new one.
 

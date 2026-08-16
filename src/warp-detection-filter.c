@@ -21,12 +21,14 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <string.h>
 
 #include <obs-module.h>
+#include <util/dstr.h>
 #include <util/platform.h>
 #include <util/threading.h>
 
 #include <media-playback/media-playback.h>
 
 #include "warp-events.h"
+#include "warp-zoom.h"
 
 #define WARP_DETECT_LOG(level, format, ...) \
 	blog(level, "[Warp Detection '%s']: " format, obs_source_get_name(f->source), ##__VA_ARGS__)
@@ -45,6 +47,10 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define S_FILTER_NAME "filter_name"
 #define S_FILTER_MODE "filter_mode"
 #define S_FILTER_HOTKEY "filter_hotkey"
+#define S_PRESET_VALUE "preset_value"
+#define S_ZOOM_SOURCE "zoom_source"
+#define S_ZOOM_FILTER "zoom_filter"
+#define S_ZOOM_PRESET "zoom_preset"
 
 /* The event listened for. Each speed and stepping hotkey has an event of its
  * own, saved as the kind with the hotkey's value on the end - "speed_set_50",
@@ -61,6 +67,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define EVENT_MEDIA_PAUSE "media_pause"
 #define EVENT_MEDIA_RESTART "media_restart"
 #define EVENT_MEDIA_LOADED "media_loaded"
+#define EVENT_ZOOM_CHANGED "zoom_changed"
+#define EVENT_ZOOM_PRESET "zoom_preset"
+#define EVENT_ZOOM_RESET "zoom_reset"
 
 /* the speed Reset Speed sets, which has an event like the presets do */
 #define WARP_DETECT_RESET_SPEED 100
@@ -78,12 +87,16 @@ enum warp_detect_kind {
 	WARP_DETECT_KIND_MEDIA_PAUSE,
 	WARP_DETECT_KIND_MEDIA_RESTART,
 	WARP_DETECT_KIND_MEDIA_LOADED,
+	WARP_DETECT_KIND_ZOOM_CHANGED,
+	WARP_DETECT_KIND_ZOOM_PRESET,
+	WARP_DETECT_KIND_ZOOM_RESET,
 };
 
 /* what is done about it */
 #define ACTION_GLOBAL_HOTKEY "global_hotkey"
 #define ACTION_SOURCE_HOTKEY "source_hotkey"
 #define ACTION_FILTER "filter"
+#define ACTION_ZOOM_PRESET "zoom_preset"
 
 #define FILTER_MODE_ENABLE "enable"
 #define FILTER_MODE_DISABLE "disable"
@@ -256,6 +269,62 @@ static void warp_detect_do_filter(struct warp_detect_filter *f, const char *even
 	obs_source_release(owner);
 }
 
+/* The zoom a filter's action frames: the source it names when that is a Warp
+ * source or a Warp Zoom filter, the filter it names on it, or the Warp Zoom
+ * filter that source carries. The caller releases the reference. */
+static obs_source_t *warp_detect_zoom_target(obs_source_t *owner, const char *filter_name)
+{
+	if (filter_name && *filter_name) {
+		obs_source_t *filter = obs_source_get_filter_by_name(owner, filter_name);
+
+		if (filter && warp_zoom_source_capable(filter))
+			return filter;
+
+		obs_source_release(filter);
+		return NULL;
+	}
+
+	if (warp_zoom_source_capable(owner))
+		return obs_source_get_ref(owner);
+
+	return warp_zoom_filter_find_operable(owner);
+}
+
+static void warp_detect_do_zoom(struct warp_detect_filter *f, const char *event, obs_data_t *settings)
+{
+	const char *source_name = obs_data_get_string(settings, S_ZOOM_SOURCE);
+	const char *filter_name = obs_data_get_string(settings, S_ZOOM_FILTER);
+	const char *preset = obs_data_get_string(settings, S_ZOOM_PRESET);
+	obs_source_t *owner;
+	obs_source_t *zoom;
+
+	if (!*source_name || !*preset)
+		return;
+
+	owner = obs_get_source_by_name(source_name);
+
+	if (!owner) {
+		WARP_DETECT_LOG(LOG_WARNING, "%s: no source named '%s'", event, source_name);
+		return;
+	}
+
+	zoom = warp_detect_zoom_target(owner, filter_name);
+
+	if (!zoom) {
+		WARP_DETECT_LOG(LOG_WARNING, "%s: '%s' cannot be zoomed", event, source_name);
+		obs_source_release(owner);
+		return;
+	}
+
+	if (warp_zoom_source_recall(zoom, preset))
+		WARP_DETECT_LOG(LOG_INFO, "%s: framed '%s' with zoom preset '%s'", event, source_name, preset);
+	else
+		WARP_DETECT_LOG(LOG_WARNING, "%s: '%s' has no zoom preset called '%s'", event, source_name, preset);
+
+	obs_source_release(zoom);
+	obs_source_release(owner);
+}
+
 static void warp_detect_perform(struct warp_detect_filter *f)
 {
 	obs_data_t *settings = obs_source_get_settings(f->source);
@@ -283,6 +352,8 @@ static void warp_detect_perform(struct warp_detect_filter *f)
 		}
 	} else if (strcmp(action, ACTION_FILTER) == 0) {
 		warp_detect_do_filter(f, event, settings);
+	} else if (strcmp(action, ACTION_ZOOM_PRESET) == 0) {
+		warp_detect_do_zoom(f, event, settings);
 	}
 
 	obs_data_release(settings);
@@ -432,6 +503,17 @@ static enum warp_detect_kind warp_detect_event_kind(obs_data_t *settings, int *v
 	if (strcmp(event, EVENT_MEDIA_LOADED) == 0)
 		return WARP_DETECT_KIND_MEDIA_LOADED;
 
+	if (strcmp(event, EVENT_ZOOM_CHANGED) == 0)
+		return WARP_DETECT_KIND_ZOOM_CHANGED;
+
+	if (strcmp(event, EVENT_ZOOM_PRESET) == 0) {
+		*any = obs_data_get_bool(settings, S_ANY_VALUE);
+		return WARP_DETECT_KIND_ZOOM_PRESET;
+	}
+
+	if (strcmp(event, EVENT_ZOOM_RESET) == 0)
+		return WARP_DETECT_KIND_ZOOM_RESET;
+
 	if (warp_detect_event_is(event, EVENT_STEP_FORWARD, &hotkey_value)) {
 		*value = hotkey_value ? hotkey_value : (int)obs_data_get_int(settings, S_FRAME_VALUE);
 		*any = !hotkey_value && obs_data_get_bool(settings, S_ANY_VALUE);
@@ -507,6 +589,66 @@ static bool warp_detect_media_matches(obs_data_t *settings, const char *action)
 	default:
 		return false;
 	}
+}
+
+/* A zoom is one of three things to react to: the framing moving at all, a
+ * preset being recalled - one preset by name, or any of them - and the picture
+ * being put back to the whole frame. */
+static bool warp_detect_zoom_matches(obs_data_t *settings, const char *change, const char *preset)
+{
+	int value;
+	bool any;
+
+	switch (warp_detect_event_kind(settings, &value, &any)) {
+	case WARP_DETECT_KIND_ZOOM_CHANGED:
+		return true;
+	case WARP_DETECT_KIND_ZOOM_PRESET: {
+		const char *wanted = obs_data_get_string(settings, S_PRESET_VALUE);
+
+		if (strcmp(change, WARP_ZOOM_CHANGE_PRESET) != 0)
+			return false;
+
+		return any || (preset && *preset && astrcmpi(preset, wanted) == 0);
+	}
+	case WARP_DETECT_KIND_ZOOM_RESET:
+		return strcmp(change, WARP_ZOOM_CHANGE_RESET) == 0;
+	default:
+		return false;
+	}
+}
+
+static void warp_detect_zoom_signal(void *param, calldata_t *cd)
+{
+	struct warp_detect_filter *f = param;
+	const char *change = NULL;
+	const char *preset = NULL;
+	double zoom = 1.0;
+
+	if (!obs_source_enabled(f->source))
+		return;
+
+	if (!calldata_get_string(cd, "change", &change) || !change)
+		return;
+
+	calldata_get_string(cd, "preset", &preset);
+	calldata_get_float(cd, "zoom", &zoom);
+
+	obs_data_t *settings = obs_source_get_settings(f->source);
+	bool matched = warp_detect_zoom_matches(settings, change, preset);
+
+	obs_data_release(settings);
+
+	if (!matched)
+		return;
+
+	char event[sizeof(f->event_desc)];
+
+	if (preset && *preset)
+		snprintf(event, sizeof(event), "zoom %s to '%s' (%d%%)", change, preset, (int)(zoom * 100.0));
+	else
+		snprintf(event, sizeof(event), "zoom %s to %d%%", change, (int)(zoom * 100.0));
+
+	warp_detect_fire(f, event);
 }
 
 static void warp_detect_speed_signal(void *param, calldata_t *cd)
@@ -613,6 +755,7 @@ static void warp_detect_disconnect(struct warp_detect_filter *f)
 		signal_handler_disconnect(handler, WARP_SIGNAL_SPEED_CHANGED, warp_detect_speed_signal, f);
 		signal_handler_disconnect(handler, WARP_SIGNAL_FRAMES_STEPPED, warp_detect_frames_signal, f);
 		signal_handler_disconnect(handler, WARP_SIGNAL_MEDIA_ACTION, warp_detect_media_signal, f);
+		signal_handler_disconnect(handler, WARP_SIGNAL_ZOOM_CHANGED, warp_detect_zoom_signal, f);
 		obs_source_release(source);
 	}
 
@@ -638,9 +781,14 @@ static obs_source_t *warp_detect_wanted_source(struct warp_detect_filter *f)
 
 	obs_data_release(settings);
 
+	/* A source that is not a Warp source is listened to through the Warp
+	 * Zoom filter on it, which is where its framing is changed and where it
+	 * says so. */
 	if (source && !warp_detect_is_warp_source(source)) {
+		obs_source_t *zoom = warp_zoom_filter_find_operable(source);
+
 		obs_source_release(source);
-		source = NULL;
+		source = zoom;
 	}
 
 	return source;
@@ -665,6 +813,7 @@ static void warp_detect_resolve(struct warp_detect_filter *f)
 	signal_handler_connect(handler, WARP_SIGNAL_SPEED_CHANGED, warp_detect_speed_signal, f);
 	signal_handler_connect(handler, WARP_SIGNAL_FRAMES_STEPPED, warp_detect_frames_signal, f);
 	signal_handler_connect(handler, WARP_SIGNAL_MEDIA_ACTION, warp_detect_media_signal, f);
+	signal_handler_connect(handler, WARP_SIGNAL_ZOOM_CHANGED, warp_detect_zoom_signal, f);
 	f->listening_to = obs_source_get_weak_source(wanted);
 
 	WARP_DETECT_LOG(LOG_INFO, "listening to '%s'", obs_source_get_name(wanted));
@@ -689,11 +838,27 @@ static void warp_detect_tick(void *data, float seconds)
 /* ------------------------------------------------------------------------- */
 /* properties */
 
+/* The sources there is something to listen to on: the Warp sources, and any
+ * source carrying a Warp Zoom filter, whose framing is worth reacting to the
+ * same way a Warp source's is. */
+static bool warp_detect_can_listen(obs_source_t *source)
+{
+	obs_source_t *zoom;
+
+	if (warp_detect_is_warp_source(source))
+		return true;
+
+	zoom = warp_zoom_filter_find_operable(source);
+	obs_source_release(zoom);
+
+	return zoom != NULL;
+}
+
 static bool warp_detect_add_warp_source(void *data, obs_source_t *source)
 {
 	obs_property_t *list = data;
 
-	if (warp_detect_is_warp_source(source)) {
+	if (warp_detect_can_listen(source)) {
 		const char *name = obs_source_get_name(source);
 
 		if (name && *name)
@@ -903,6 +1068,69 @@ static void warp_detect_add_events(obs_property_t *list)
 	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.MediaPause"), EVENT_MEDIA_PAUSE);
 	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.MediaRestart"), EVENT_MEDIA_RESTART);
 	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.MediaLoaded"), EVENT_MEDIA_LOADED);
+
+	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.ZoomChanged"), EVENT_ZOOM_CHANGED);
+	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.ZoomPreset"), EVENT_ZOOM_PRESET);
+	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.ZoomReset"), EVENT_ZOOM_RESET);
+}
+
+/* the presets of the source an action names, so the preset to recall is picked
+ * from the ones that are there rather than typed in */
+static void warp_detect_fill_presets(obs_property_t *list, const char *source_name, const char *filter_name,
+				     const char *selected)
+{
+	obs_source_t *owner = *source_name ? obs_get_source_by_name(source_name) : NULL;
+	obs_source_t *zoom = owner ? warp_detect_zoom_target(owner, filter_name) : NULL;
+	obs_data_array_t *presets = zoom ? warp_zoom_source_presets(zoom) : NULL;
+
+	warp_detect_start_list(list);
+
+	for (size_t i = 0; presets && i < obs_data_array_count(presets); i++) {
+		obs_data_t *preset = obs_data_array_item(presets, i);
+		const char *name = obs_data_get_string(preset, WARP_ZOOM_P_NAME);
+
+		/* Presets are recalled by name here rather than by id: a filter
+		 * saying "frame it the way Wide does" survives the preset being
+		 * remade, and reads as what it does in the settings. */
+		if (name && *name)
+			obs_property_list_add_string(list, name, name);
+
+		obs_data_release(preset);
+	}
+
+	obs_data_array_release(presets);
+	obs_source_release(zoom);
+	obs_source_release(owner);
+
+	warp_detect_keep_value(list, selected);
+}
+
+/* the Warp Zoom filters on a source, for an action that names one rather than
+ * taking whichever the source carries */
+static void warp_detect_add_zoom_filter(obs_source_t *parent, obs_source_t *child, void *param)
+{
+	obs_property_t *list = param;
+	const char *id = obs_source_get_id(child);
+	const char *name = obs_source_get_name(child);
+
+	UNUSED_PARAMETER(parent);
+
+	if (id && strcmp(id, WARP_ZOOM_FILTER_ID) == 0 && name && *name)
+		obs_property_list_add_string(list, name, name);
+}
+
+static void warp_detect_fill_zoom_filters(obs_property_t *list, const char *source_name, const char *selected)
+{
+	obs_source_t *owner = *source_name ? obs_get_source_by_name(source_name) : NULL;
+
+	warp_detect_start_list(list);
+
+	if (owner) {
+		obs_source_enum_filters(owner, warp_detect_add_zoom_filter, list);
+		obs_source_release(owner);
+	}
+
+	warp_detect_keep_value(list, selected);
 }
 
 static bool warp_detect_modified(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
@@ -917,6 +1145,8 @@ static bool warp_detect_modified(obs_properties_t *props, obs_property_t *proper
 	bool source_hotkey = strcmp(action, ACTION_SOURCE_HOTKEY) == 0;
 	bool filter = strcmp(action, ACTION_FILTER) == 0;
 	bool filter_hotkey = filter && strcmp(filter_mode, FILTER_MODE_HOTKEY) == 0;
+	bool zoom_action = strcmp(action, ACTION_ZOOM_PRESET) == 0;
+	bool preset_value = strcmp(event, EVENT_ZOOM_PRESET) == 0;
 	obs_property_t *list;
 
 	UNUSED_PARAMETER(property);
@@ -924,7 +1154,8 @@ static bool warp_detect_modified(obs_properties_t *props, obs_property_t *proper
 	/* reacting to any value leaves nothing for the value to do */
 	obs_property_set_visible(obs_properties_get(props, S_SPEED_VALUE), speed_value && !any_value);
 	obs_property_set_visible(obs_properties_get(props, S_FRAME_VALUE), frame_value && !any_value);
-	obs_property_set_visible(obs_properties_get(props, S_ANY_VALUE), speed_value || frame_value);
+	obs_property_set_visible(obs_properties_get(props, S_PRESET_VALUE), preset_value && !any_value);
+	obs_property_set_visible(obs_properties_get(props, S_ANY_VALUE), speed_value || frame_value || preset_value);
 
 	obs_property_set_visible(obs_properties_get(props, S_GLOBAL_HOTKEY), global_hotkey);
 	obs_property_set_visible(obs_properties_get(props, S_HOTKEY_SOURCE), source_hotkey);
@@ -933,6 +1164,9 @@ static bool warp_detect_modified(obs_properties_t *props, obs_property_t *proper
 	obs_property_set_visible(obs_properties_get(props, S_FILTER_NAME), filter);
 	obs_property_set_visible(obs_properties_get(props, S_FILTER_MODE), filter);
 	obs_property_set_visible(obs_properties_get(props, S_FILTER_HOTKEY), filter_hotkey);
+	obs_property_set_visible(obs_properties_get(props, S_ZOOM_SOURCE), zoom_action);
+	obs_property_set_visible(obs_properties_get(props, S_ZOOM_FILTER), zoom_action);
+	obs_property_set_visible(obs_properties_get(props, S_ZOOM_PRESET), zoom_action);
 
 	/* every list is built from what is in OBS right now */
 	list = obs_properties_get(props, S_TARGET);
@@ -965,6 +1199,16 @@ static bool warp_detect_modified(obs_properties_t *props, obs_property_t *proper
 							obs_data_get_string(settings, S_FILTER_HOTKEY));
 	}
 
+	if (zoom_action) {
+		const char *owner = obs_data_get_string(settings, S_ZOOM_SOURCE);
+		const char *zoom_filter = obs_data_get_string(settings, S_ZOOM_FILTER);
+
+		warp_detect_fill_sources(obs_properties_get(props, S_ZOOM_SOURCE), owner);
+		warp_detect_fill_zoom_filters(obs_properties_get(props, S_ZOOM_FILTER), owner, zoom_filter);
+		warp_detect_fill_presets(obs_properties_get(props, S_ZOOM_PRESET), owner, zoom_filter,
+					 obs_data_get_string(settings, S_ZOOM_PRESET));
+	}
+
 	return true;
 }
 
@@ -992,6 +1236,8 @@ static obs_properties_t *warp_detect_getproperties(void *data)
 
 	obs_properties_add_int(props, S_FRAME_VALUE, obs_module_text("Warp.Detect.Frames"), 1, 10000, 1);
 
+	obs_properties_add_text(props, S_PRESET_VALUE, obs_module_text("Warp.Detect.Preset"), OBS_TEXT_DEFAULT);
+
 	prop = obs_properties_add_bool(props, S_ANY_VALUE, obs_module_text("Warp.Detect.AnyValue"));
 	obs_property_set_modified_callback(prop, warp_detect_modified);
 
@@ -1000,6 +1246,7 @@ static obs_properties_t *warp_detect_getproperties(void *data)
 	obs_property_list_add_string(prop, obs_module_text("Warp.Detect.Action.GlobalHotkey"), ACTION_GLOBAL_HOTKEY);
 	obs_property_list_add_string(prop, obs_module_text("Warp.Detect.Action.SourceHotkey"), ACTION_SOURCE_HOTKEY);
 	obs_property_list_add_string(prop, obs_module_text("Warp.Detect.Action.Filter"), ACTION_FILTER);
+	obs_property_list_add_string(prop, obs_module_text("Warp.Detect.Action.ZoomPreset"), ACTION_ZOOM_PRESET);
 	obs_property_set_modified_callback(prop, warp_detect_modified);
 
 	obs_properties_add_list(props, S_GLOBAL_HOTKEY, obs_module_text("Warp.Detect.Hotkey"), OBS_COMBO_TYPE_LIST,
@@ -1029,6 +1276,19 @@ static obs_properties_t *warp_detect_getproperties(void *data)
 	obs_property_set_modified_callback(prop, warp_detect_modified);
 
 	obs_properties_add_list(props, S_FILTER_HOTKEY, obs_module_text("Warp.Detect.Hotkey"), OBS_COMBO_TYPE_LIST,
+				OBS_COMBO_FORMAT_STRING);
+
+	prop = obs_properties_add_list(props, S_ZOOM_SOURCE, obs_module_text("Warp.Detect.ZoomSource"),
+				       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_set_long_description(prop, obs_module_text("Warp.Detect.ZoomSource.Desc"));
+	obs_property_set_modified_callback(prop, warp_detect_modified);
+
+	prop = obs_properties_add_list(props, S_ZOOM_FILTER, obs_module_text("Warp.Detect.ZoomFilter"),
+				       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_set_long_description(prop, obs_module_text("Warp.Detect.ZoomFilter.Desc"));
+	obs_property_set_modified_callback(prop, warp_detect_modified);
+
+	obs_properties_add_list(props, S_ZOOM_PRESET, obs_module_text("Warp.Detect.ZoomPreset"), OBS_COMBO_TYPE_LIST,
 				OBS_COMBO_FORMAT_STRING);
 
 	return props;

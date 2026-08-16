@@ -34,6 +34,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #endif
 
 #include "warp-events.h"
+#include "warp-zoom.h"
 
 #define WARP_PL_LOG(level, format, ...) \
 	blog(level, "[Warp Playlist '%s']: " format, obs_source_get_name(s->source), ##__VA_ARGS__)
@@ -197,6 +198,12 @@ struct warp_playlist_source {
 	size_t active_dir;
 	/* item currently played */
 	obs_source_t *current;
+	/* Its zoom filter, kept here so the tick does not have to go looking
+	 * for it every frame. Every item is given one as it is opened, which is
+	 * what makes the framing belong to the video rather than to the
+	 * playlist: the file being transitioned away from keeps the zoom it was
+	 * being watched at while the one coming in is already at the top. */
+	obs_source_t *current_zoom;
 	/* item transitioned away from, kept alive until the transition ends */
 	obs_source_t *prev;
 	/* next item, opened early so it has picture when the transition starts */
@@ -267,6 +274,11 @@ struct warp_playlist_source {
 	/* speed every item starts at, and the live speed of the current item */
 	int base_speed;
 	int speed;
+
+	/* How the file that is playing is framed, along with the presets it can
+	 * be sent to. It guards itself, and is put back to the whole picture as
+	 * each file goes up, the same way the speed is. */
+	struct warp_zoom_control zoom;
 
 	/* what the playlist's audio is scaled by on its way out, from 0 for
 	 * silence to 1 for the files as they are. Read by the audio thread,
@@ -670,8 +682,25 @@ static obs_source_t *warp_pl_create_item(struct warp_playlist_source *s, const c
 	obs_source_t *item = obs_source_create_private(WARP_MEDIA_SOURCE_ID, path, settings);
 	obs_data_release(settings);
 
-	if (!item)
+	if (!item) {
 		WARP_PL_LOG(LOG_WARNING, "failed to open '%s'", path);
+		return item;
+	}
+
+	/* Every file is opened with a zoom filter of its own, driven by this
+	 * playlist. It costs nothing while the file is being watched whole -
+	 * an unzoomed filter steps out of the way - and it is what keeps a
+	 * framing with the video it was set on: the next file is opened with a
+	 * filter of its own, so it comes up showing the whole picture however
+	 * far into the last one the operator had zoomed. */
+	obs_source_t *zoom = warp_zoom_filter_create_driven(obs_module_text("Warp.ZoomFilter.Name"));
+
+	if (zoom) {
+		obs_source_filter_add(item, zoom);
+		obs_source_release(zoom);
+	} else {
+		WARP_PL_LOG(LOG_WARNING, "could not put a zoom on '%s'", path);
+	}
 
 	return item;
 }
@@ -763,6 +792,11 @@ static void warp_pl_show(struct warp_playlist_source *s, obs_source_t *item, boo
 	s->prev = s->current;
 	s->current = item;
 	s->showing_nothing = item == NULL;
+
+	/* the zoom of the file that is going up; the one stepping aside keeps
+	 * its own, so it plays out the transition framed the way it was watched */
+	warp_pl_retire(s, s->current_zoom);
+	s->current_zoom = item ? warp_zoom_filter_find(item) : NULL;
 }
 
 /* Puts the item that is waiting for the switch on screen, once it has picture
@@ -798,6 +832,10 @@ static void warp_pl_promote_pending(struct warp_playlist_source *s)
 	/* every item starts at the configured speed, whatever the previous item
 	 * was being played back at */
 	warp_pl_call_item_proc(item, "warp_set_speed", "speed", s->base_speed);
+
+	/* and framed the way every file starts, however far into the last one
+	 * the operator had zoomed: the framing was that video's, not this one's */
+	warp_zoom_control_restore_default(&s->zoom);
 
 	warp_pl_show(s, item, s->pending_transition, s->pending_dir);
 
@@ -886,9 +924,15 @@ static void warp_pl_stop(struct warp_playlist_source *s)
 
 	warp_pl_retire(s, s->prev);
 	warp_pl_retire(s, s->current);
+	warp_pl_retire(s, s->current_zoom);
 	s->prev = NULL;
 	s->current = NULL;
+	s->current_zoom = NULL;
 	s->showing_nothing = true;
+
+	/* whatever was framed is not being played any more, so the next file to
+	 * go up starts from the whole picture like any other */
+	warp_zoom_control_restore_default(&s->zoom);
 
 	s->pos = s->order.num;
 	s->state = OBS_MEDIA_STATE_STOPPED;
@@ -1527,6 +1571,10 @@ static void warp_playlist_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "restart_on_activate", true);
 	obs_data_set_default_bool(settings, "clear_on_media_end", true);
 	obs_data_set_default_bool(settings, "linear_alpha", false);
+
+	/* the framing itself is not saved with the playlist: it belongs to the
+	 * file that is playing, and the next file starts from the top */
+	warp_zoom_control_defaults(settings, false);
 }
 
 static const char *media_filter =
@@ -1768,6 +1816,8 @@ static obs_properties_t *warp_playlist_getproperties(void *data)
 	obs_property_int_set_suffix(prop, "%");
 	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.Volume.Desc"));
 
+	warp_zoom_control_properties(props, false);
+
 	obs_properties_add_bool(props, "restart_on_activate", obs_module_text("Warp.Playlist.RestartOnActivate"));
 
 	obs_properties_add_bool(props, "clear_on_media_end", obs_module_text("Warp.Playlist.ClearOnEnd"));
@@ -1934,6 +1984,10 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 	 * the settings they were saved with are looked at */
 	warp_pl_capture_transitions(s);
 
+	/* the zoom guards itself, and registers hotkeys as its presets change,
+	 * so it is brought up to date with the playlist's lock dropped */
+	warp_zoom_control_update(&s->zoom, settings);
+
 	const char *transition_id[WARP_PL_NUM_DIRS];
 	bool store_loaded[WARP_PL_NUM_DIRS];
 	uint32_t alignment[WARP_PL_NUM_DIRS];
@@ -2063,6 +2117,11 @@ static void warp_playlist_save(void *data, obs_data_t *settings)
 	/* the transitions' own properties write to the transitions, so what
 	 * they are running with is read back before they are written out */
 	warp_pl_capture_transitions(s);
+
+	/* the zoom presets are edited in the dock and the Warp window rather
+	 * than through the properties, so they are written out from the control
+	 * the same way */
+	warp_zoom_control_save(&s->zoom, settings);
 
 	for (size_t dir = 0; dir < WARP_PL_NUM_DIRS; dir++) {
 		obs_data_t *store = obs_data_create();
@@ -2531,7 +2590,7 @@ static void warp_playlist_register_procs(struct warp_playlist_source *s, obs_sou
 static void *warp_playlist_create(obs_data_t *settings, obs_source_t *source)
 {
 	static const char *signals[] = {WARP_SIGNAL_DECL_SPEED_CHANGED, WARP_SIGNAL_DECL_FRAMES_STEPPED,
-					WARP_SIGNAL_DECL_MEDIA_ACTION, NULL};
+					WARP_SIGNAL_DECL_MEDIA_ACTION, WARP_SIGNAL_DECL_ZOOM_CHANGED, NULL};
 
 	struct warp_playlist_source *s = bzalloc(sizeof(struct warp_playlist_source));
 
@@ -2569,6 +2628,9 @@ static void *warp_playlist_create(obs_data_t *settings, obs_source_t *source)
 	warp_playlist_register_hotkeys(s, source);
 	warp_playlist_register_procs(s, source);
 
+	warp_zoom_control_init(&s->zoom, source, "WarpPlaylist", true, false);
+	warp_zoom_control_register_procs(&s->zoom, source);
+
 	warp_playlist_update(s, settings);
 	return s;
 }
@@ -2580,8 +2642,11 @@ static void warp_playlist_destroy(void *data)
 	obs_source_t *transitions[WARP_PL_NUM_DIRS];
 	obs_source_t *target;
 	obs_source_t *current;
+	obs_source_t *current_zoom;
 	obs_source_t *pending;
 	obs_source_t *prev;
+
+	warp_zoom_control_free(&s->zoom);
 
 	pthread_mutex_lock(&s->mutex);
 
@@ -2600,11 +2665,13 @@ static void warp_playlist_destroy(void *data)
 
 	target = s->transition_target;
 	current = s->current;
+	current_zoom = s->current_zoom;
 	pending = s->pending;
 	prev = s->prev;
 
 	s->transition_target = NULL;
 	s->current = NULL;
+	s->current_zoom = NULL;
 	s->pending = NULL;
 	s->prev = NULL;
 
@@ -2641,6 +2708,8 @@ static void warp_playlist_destroy(void *data)
 		obs_source_release(target);
 	if (current)
 		obs_source_release(current);
+	if (current_zoom)
+		obs_source_release(current_zoom);
 	if (pending)
 		obs_source_release(pending);
 	if (prev)
@@ -2923,6 +2992,26 @@ static void warp_playlist_tick(void *data, float seconds)
 	warp_pl_unlock(s);
 
 	obs_source_release(transition);
+
+	/* Frame the file that is playing. This is done after the switch above
+	 * rather than before it so that a file going up is framed on the tick
+	 * it goes up, and it is only ever handed to the item that is current:
+	 * one being transitioned away from keeps the last view it was handed,
+	 * so the outgoing half of a transition plays out at the zoom it was
+	 * being watched at while the incoming half is already at the top. */
+	struct warp_zoom_view view;
+	obs_source_t *zoom;
+
+	warp_zoom_control_tick(&s->zoom, seconds, &view);
+
+	pthread_mutex_lock(&s->mutex);
+	zoom = obs_source_get_ref(s->current_zoom);
+	pthread_mutex_unlock(&s->mutex);
+
+	if (zoom) {
+		warp_zoom_filter_apply(zoom, &view);
+		obs_source_release(zoom);
+	}
 
 	/* both transitions are sized, so the one that is not on screen is laid
 	 * out against the right bounds the moment it is switched to */

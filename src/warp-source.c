@@ -25,6 +25,7 @@
 #include <media-playback/media.h>
 
 #include "warp-events.h"
+#include "warp-zoom.h"
 
 #define FF_LOG_S(source, level, format, ...)      \
 	blog(level, "[Warp Media '%s']: " format, \
@@ -92,6 +93,18 @@ struct warp_source {
 	enum obs_media_state state;
 	obs_hotkey_pair_id play_pause_hotkey;
 	obs_hotkey_id stop_hotkey;
+
+	/* How the clip in the source is framed, and the filter that draws it.
+	 * An async source has no picture of its own to work on, so the zoom is
+	 * drawn by a filter the source puts on itself the first time anything
+	 * asks it to zoom, and drives from its own tick. A clip landing puts the
+	 * framing back to the whole picture: an instant replay arrives ready to
+	 * go on screen rather than still zoomed into the last one. */
+	struct warp_zoom_control zoom;
+	obs_source_t *zoom_filter;
+	/* said once when the source stands aside for a Warp Zoom filter the
+	 * operator put on it themselves */
+	bool zoom_yielded;
 
 	/* Set while the source drives its own playback instead of carrying out
 	 * a command someone sent: restarting as it goes on screen, and the
@@ -170,6 +183,10 @@ static bool is_local_file_modified(obs_properties_t *props, obs_property_t *prop
 
 static void warp_source_defaults(obs_data_t *settings)
 {
+	/* the framing is not saved with the source: it belongs to the clip that
+	 * is in it, and the next clip to land starts from the whole picture */
+	warp_zoom_control_defaults(settings, false);
+
 	obs_data_set_default_bool(settings, "is_local_file", true);
 	obs_data_set_default_bool(settings, "looping", false);
 	obs_data_set_default_bool(settings, "clear_on_media_end", true);
@@ -252,6 +269,8 @@ static obs_properties_t *warp_source_getproperties(void *data)
 	prop = obs_properties_add_int_slider(props, "speed_percent", obs_module_text("Warp.Video.Speed"), MP_SPEED_MIN,
 					     MP_SPEED_MAX, 1);
 	obs_property_int_set_suffix(prop, "%");
+
+	warp_zoom_control_properties(props, false);
 
 	prop = obs_properties_add_list(props, "color_range", obs_module_text("Warp.Video.ColorRange"),
 				       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
@@ -517,11 +536,85 @@ static void warp_source_hold_tick(struct warp_source *s)
 	os_atomic_set_bool(&s->hold_clip, false);
 }
 
+/* The filter the zoom is drawn by, made the first time anything asks the source
+ * to zoom rather than put on every source that is never framed. One the source
+ * was made with - a playlist opens its files with a zoom of their own - is
+ * picked up instead of a second one being added. Expects to be called from the
+ * graphics thread. */
+static obs_source_t *warp_source_zoom_filter(struct warp_source *s)
+{
+	obs_source_t *filter;
+
+	/* an operator who removed the filter from the source's filter list gets
+	 * a new one the next time they ask for a zoom, rather than a zoom that
+	 * quietly does nothing from then on */
+	if (s->zoom_filter && obs_filter_get_parent(s->zoom_filter) != s->source) {
+		obs_source_release(s->zoom_filter);
+		s->zoom_filter = NULL;
+	}
+
+	if (s->zoom_filter)
+		return s->zoom_filter;
+
+	filter = warp_zoom_filter_find(s->source);
+
+	if (!filter) {
+		/* A Warp Zoom filter the operator added themselves is the zoom
+		 * of this source: it has its own presets and its own hotkeys,
+		 * and a second one underneath it would zoom what it had already
+		 * zoomed. So the source stands aside rather than stacking. */
+		obs_source_t *theirs = warp_zoom_filter_find_operable(s->source);
+
+		if (theirs) {
+			if (!s->zoom_yielded) {
+				FF_BLOG(LOG_INFO, "'%s' frames this source, so its own zoom is left alone",
+					obs_source_get_name(theirs));
+				s->zoom_yielded = true;
+			}
+
+			obs_source_release(theirs);
+			return NULL;
+		}
+
+		filter = warp_zoom_filter_create_driven(obs_module_text("Warp.ZoomFilter.Name"));
+
+		if (!filter) {
+			FF_BLOG(LOG_WARNING, "could not put a zoom on the source");
+			return NULL;
+		}
+
+		obs_source_filter_add(s->source, filter);
+	}
+
+	s->zoom_filter = filter;
+
+	return filter;
+}
+
+/* frames the clip in the source with wherever the zoom has got to */
+static void warp_source_zoom_tick(struct warp_source *s, float seconds)
+{
+	struct warp_zoom_view view;
+	obs_source_t *filter;
+
+	warp_zoom_control_tick(&s->zoom, seconds, &view);
+
+	/* a source that has never been zoomed is left without a filter at all,
+	 * so nothing is added to a scene collection that does not use zoom */
+	if (warp_zoom_view_is_default(&view) && !s->zoom_filter)
+		return;
+
+	filter = warp_source_zoom_filter(s);
+
+	if (filter)
+		warp_zoom_filter_apply(filter, &view);
+}
+
 static void warp_source_tick(void *data, float seconds)
 {
-	UNUSED_PARAMETER(seconds);
-
 	struct warp_source *s = data;
+
+	warp_source_zoom_tick(s, seconds);
 
 	/* A clip that was loaded to be played or held. libobs applies a deferred
 	 * settings update just before this tick, so the file the load asked for
@@ -576,6 +669,10 @@ static void warp_source_tick(void *data, float seconds)
 static void warp_source_update(void *data, obs_data_t *settings)
 {
 	struct warp_source *s = data;
+
+	/* the zoom guards itself, and registers hotkeys as its presets change,
+	 * so it is brought up to date before anything else is touched */
+	warp_zoom_control_update(&s->zoom, settings);
 
 	/* zero until the first update, which is the one create() makes: the
 	 * speed a source starts at is not a change anyone can react to */
@@ -1001,6 +1098,11 @@ static void warp_media_load_proc(void *data, calldata_t *cd)
 	os_atomic_set_bool(&s->hold_clip, hold);
 	os_atomic_set_bool(&s->start_pending, play || hold);
 
+	/* a clip that has just landed is a new video, so it arrives framed the
+	 * way every clip arrives rather than zoomed into wherever the last one
+	 * was being watched */
+	warp_zoom_control_restore_default(&s->zoom);
+
 	FF_BLOG(LOG_INFO, "loaded '%s' (%s)", path, playback);
 
 	/* Said as soon as the clip is in rather than once it has decoded, so
@@ -1058,10 +1160,20 @@ static void warp_source_register_warp_hotkeys(struct warp_source *s, obs_source_
 	}
 }
 
+/* The zoom presets are made in the dock rather than through the properties, so
+ * they are written out from the control the way the playlist writes out what
+ * its transitions are set up with. */
+static void warp_source_save(void *data, obs_data_t *settings)
+{
+	struct warp_source *s = data;
+
+	warp_zoom_control_save(&s->zoom, settings);
+}
+
 static void *warp_source_create(obs_data_t *settings, obs_source_t *source)
 {
 	static const char *signals[] = {WARP_SIGNAL_DECL_SPEED_CHANGED, WARP_SIGNAL_DECL_FRAMES_STEPPED,
-					WARP_SIGNAL_DECL_MEDIA_ACTION, NULL};
+					WARP_SIGNAL_DECL_MEDIA_ACTION, WARP_SIGNAL_DECL_ZOOM_CHANGED, NULL};
 
 	struct warp_source *s = bzalloc(sizeof(struct warp_source));
 	s->source = source;
@@ -1108,6 +1220,9 @@ static void *warp_source_create(obs_data_t *settings, obs_source_t *source)
 	proc_handler_add(ph, "void " WARP_MEDIA_LOAD_PROC "(string path, int speed, string playback)",
 			 warp_media_load_proc, s);
 
+	warp_zoom_control_init(&s->zoom, source, "WarpMedia", true, false);
+	warp_zoom_control_register_procs(&s->zoom, source);
+
 	warp_source_update(s, settings);
 	return s;
 }
@@ -1117,6 +1232,11 @@ static void warp_source_destroy(void *data)
 	struct warp_source *s = data;
 
 	stop_reconnect_thread(s);
+
+	warp_zoom_control_free(&s->zoom);
+
+	if (s->zoom_filter)
+		obs_source_release(s->zoom_filter);
 
 	if (s->hotkey)
 		obs_hotkey_unregister(s->hotkey);
@@ -1302,6 +1422,7 @@ struct obs_source_info warp_media_source_info = {
 	.destroy = warp_source_destroy,
 	.get_defaults = warp_source_defaults,
 	.get_properties = warp_source_getproperties,
+	.save = warp_source_save,
 	.activate = warp_source_activate,
 	.deactivate = warp_source_deactivate,
 	.video_tick = warp_source_tick,

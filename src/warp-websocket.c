@@ -29,6 +29,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "obs-websocket-api.h"
 #include "warp-events.h"
 #include "warp-websocket.h"
+#include "warp-zoom.h"
 
 #ifdef WARP_HAVE_FRONTEND_API
 #include "warp-flow.h"
@@ -65,6 +66,15 @@ enum warp_ws_action {
 	WARP_WS_FIRST,
 	WARP_WS_RESTART_CURRENT,
 	WARP_WS_CLEAR_PLAYLIST,
+	WARP_WS_SET_ZOOM,
+	WARP_WS_ZOOM_IN,
+	WARP_WS_ZOOM_OUT,
+	WARP_WS_PAN_ZOOM,
+	WARP_WS_RESET_ZOOM,
+	WARP_WS_RECALL_ZOOM_PRESET,
+	WARP_WS_SAVE_ZOOM_PRESET,
+	WARP_WS_REMOVE_ZOOM_PRESET,
+	WARP_WS_GET_ZOOM_PRESETS,
 	/* reports where playback stands without changing anything: every
 	 * response carries that, so this request has nothing else to do */
 	WARP_WS_GET_STATUS,
@@ -75,6 +85,10 @@ struct warp_ws_request {
 	enum warp_ws_action action;
 	/* the source this request needs, when it only fits one of the two */
 	const char *source_id;
+	/* Set for the requests that work on anything that can be zoomed rather
+	 * than on a Warp source: a camera with a Warp Zoom filter on it is
+	 * framed with the same requests a Warp Playlist is. */
+	bool any_source;
 };
 
 /* One request per action the sources have, named after the hotkey it stands
@@ -82,24 +96,33 @@ struct warp_ws_request {
  * presets, and the four step sizes each way - are the same request here, with
  * the value in the request data. */
 static struct warp_ws_request warp_ws_requests[] = {
-	{"Play", WARP_WS_PLAY, NULL},
-	{"Pause", WARP_WS_PAUSE, NULL},
-	{"TogglePlayPause", WARP_WS_TOGGLE_PLAY_PAUSE, NULL},
-	{"Stop", WARP_WS_STOP, NULL},
-	{"Restart", WARP_WS_RESTART, NULL},
-	{"SetCursor", WARP_WS_SET_CURSOR, NULL},
-	{"SetSpeed", WARP_WS_SET_SPEED, NULL},
-	{"SpeedUp", WARP_WS_SPEED_UP, NULL},
-	{"SlowDown", WARP_WS_SLOW_DOWN, NULL},
-	{"ResetSpeed", WARP_WS_RESET_SPEED, NULL},
-	{"StepForward", WARP_WS_STEP_FORWARD, NULL},
-	{"StepBackward", WARP_WS_STEP_BACKWARD, NULL},
-	{"Next", WARP_WS_NEXT, WARP_PLAYLIST_SOURCE_ID},
-	{"Previous", WARP_WS_PREVIOUS, WARP_PLAYLIST_SOURCE_ID},
-	{"First", WARP_WS_FIRST, WARP_PLAYLIST_SOURCE_ID},
-	{"RestartCurrent", WARP_WS_RESTART_CURRENT, WARP_PLAYLIST_SOURCE_ID},
-	{"ClearPlaylist", WARP_WS_CLEAR_PLAYLIST, WARP_PLAYLIST_SOURCE_ID},
-	{"GetStatus", WARP_WS_GET_STATUS, NULL},
+	{"Play", WARP_WS_PLAY, NULL, false},
+	{"Pause", WARP_WS_PAUSE, NULL, false},
+	{"TogglePlayPause", WARP_WS_TOGGLE_PLAY_PAUSE, NULL, false},
+	{"Stop", WARP_WS_STOP, NULL, false},
+	{"Restart", WARP_WS_RESTART, NULL, false},
+	{"SetCursor", WARP_WS_SET_CURSOR, NULL, false},
+	{"SetSpeed", WARP_WS_SET_SPEED, NULL, false},
+	{"SpeedUp", WARP_WS_SPEED_UP, NULL, false},
+	{"SlowDown", WARP_WS_SLOW_DOWN, NULL, false},
+	{"ResetSpeed", WARP_WS_RESET_SPEED, NULL, false},
+	{"StepForward", WARP_WS_STEP_FORWARD, NULL, false},
+	{"StepBackward", WARP_WS_STEP_BACKWARD, NULL, false},
+	{"Next", WARP_WS_NEXT, WARP_PLAYLIST_SOURCE_ID, false},
+	{"Previous", WARP_WS_PREVIOUS, WARP_PLAYLIST_SOURCE_ID, false},
+	{"First", WARP_WS_FIRST, WARP_PLAYLIST_SOURCE_ID, false},
+	{"RestartCurrent", WARP_WS_RESTART_CURRENT, WARP_PLAYLIST_SOURCE_ID, false},
+	{"ClearPlaylist", WARP_WS_CLEAR_PLAYLIST, WARP_PLAYLIST_SOURCE_ID, false},
+	{"SetZoom", WARP_WS_SET_ZOOM, NULL, true},
+	{"ZoomIn", WARP_WS_ZOOM_IN, NULL, true},
+	{"ZoomOut", WARP_WS_ZOOM_OUT, NULL, true},
+	{"PanZoom", WARP_WS_PAN_ZOOM, NULL, true},
+	{"ResetZoom", WARP_WS_RESET_ZOOM, NULL, true},
+	{"RecallZoomPreset", WARP_WS_RECALL_ZOOM_PRESET, NULL, true},
+	{"SaveZoomPreset", WARP_WS_SAVE_ZOOM_PRESET, NULL, true},
+	{"RemoveZoomPreset", WARP_WS_REMOVE_ZOOM_PRESET, NULL, true},
+	{"GetZoomPresets", WARP_WS_GET_ZOOM_PRESETS, NULL, true},
+	{"GetStatus", WARP_WS_GET_STATUS, NULL, false},
 };
 
 static obs_websocket_vendor warp_ws_vendor = NULL;
@@ -144,7 +167,10 @@ static obs_source_t *warp_ws_get_source(obs_data_t *request, obs_data_t *respons
 
 	const char *id = obs_source_get_id(source);
 
-	if (!id || (strcmp(id, WARP_MEDIA_SOURCE_ID) != 0 && strcmp(id, WARP_PLAYLIST_SOURCE_ID) != 0)) {
+	/* the zoom requests work on anything that can be zoomed, which is any
+	 * source carrying a Warp Zoom filter as well as the Warp sources */
+	if (!req->any_source &&
+	    (!id || (strcmp(id, WARP_MEDIA_SOURCE_ID) != 0 && strcmp(id, WARP_PLAYLIST_SOURCE_ID) != 0))) {
 		warp_ws_fail(response, "'%s' is not a Warp Media or Warp Playlist source", obs_source_get_name(source));
 		obs_source_release(source);
 		return NULL;
@@ -182,6 +208,47 @@ static void warp_ws_call_int(obs_source_t *source, const char *proc, const char 
 	calldata_set_int(&cd, arg, value);
 	proc_handler_call(obs_source_get_proc_handler(source), proc, &cd);
 	calldata_free(&cd);
+}
+
+/* The zoom a request applies to: the source itself when it is one that can be
+ * zoomed, the Warp Zoom filter the request names in 'filterName', or the one
+ * the source carries. The caller releases the reference; 'response' may be NULL
+ * to look without saying anything about not finding one. */
+static obs_source_t *warp_ws_zoom_target(obs_source_t *source, obs_data_t *request, obs_data_t *response)
+{
+	const char *filter_name = request ? obs_data_get_string(request, "filterName") : NULL;
+	obs_source_t *filter;
+
+	if (filter_name && *filter_name) {
+		filter = obs_source_get_filter_by_name(source, filter_name);
+
+		if (!filter) {
+			if (response)
+				warp_ws_fail(response, "'%s' has no filter named '%s'", obs_source_get_name(source),
+					     filter_name);
+			return NULL;
+		}
+
+		if (!warp_zoom_source_capable(filter)) {
+			if (response)
+				warp_ws_fail(response, "'%s' is not a Warp Zoom filter", filter_name);
+			obs_source_release(filter);
+			return NULL;
+		}
+
+		return filter;
+	}
+
+	if (warp_zoom_source_capable(source))
+		return obs_source_get_ref(source);
+
+	filter = warp_zoom_filter_find_operable(source);
+
+	if (!filter && response)
+		warp_ws_fail(response, "'%s' cannot be zoomed: it is not a Warp source and has no Warp Zoom filter",
+			     obs_source_get_name(source));
+
+	return filter;
 }
 
 /* the same names obs-websocket's own GetMediaInputStatus reports */
@@ -228,6 +295,25 @@ static void warp_ws_add_status(obs_source_t *source, obs_data_t *response)
 		obs_data_set_int(response, "speed", calldata_int(&cd, "speed"));
 	calldata_free(&cd);
 
+	/* how the source is framed, so a control surface following a zoom does
+	 * not have to ask for it separately */
+	obs_source_t *zoom = warp_ws_zoom_target(source, NULL, NULL);
+
+	if (zoom) {
+		struct warp_zoom_view view;
+
+		if (warp_zoom_source_get(zoom, &view, NULL)) {
+			obs_data_set_double(response, "zoom", view.zoom * 100.0);
+			obs_data_set_double(response, "zoomX", view.x * 100.0);
+			obs_data_set_double(response, "zoomY", view.y * 100.0);
+		}
+
+		if (zoom != source)
+			obs_data_set_string(response, "zoomFilter", obs_source_get_name(zoom));
+
+		obs_source_release(zoom);
+	}
+
 	if (!id || strcmp(id, WARP_PLAYLIST_SOURCE_ID) != 0)
 		return;
 
@@ -238,6 +324,145 @@ static void warp_ws_add_status(obs_source_t *source, obs_data_t *response)
 		obs_data_set_string(response, "currentFile", calldata_string(&cd, "current_file"));
 	}
 	calldata_free(&cd);
+}
+
+/* How long a move a request asks for takes, in milliseconds, with -1 - the
+ * source's own preset glide - when the request says nothing. A client that
+ * wants the move to land at once sends zero. */
+static int warp_ws_glide(obs_data_t *request)
+{
+	return obs_data_has_user_value(request, "glide") ? (int)obs_data_get_int(request, "glide") : -1;
+}
+
+/* The zoom requests. They work on the zoom of the source the request names,
+ * which is the source itself for a Warp source and a Warp Zoom filter for
+ * anything else, and they take their zoom and position in percent the way the
+ * properties show them. */
+static bool warp_ws_run_zoom(const struct warp_ws_request *req, obs_source_t *source, obs_data_t *request,
+			     obs_data_t *response)
+{
+	obs_source_t *zoom = warp_ws_zoom_target(source, request, response);
+	int glide = warp_ws_glide(request);
+	bool ok = true;
+
+	if (!zoom)
+		return false;
+
+	switch (req->action) {
+	case WARP_WS_SET_ZOOM: {
+		struct warp_zoom_view view;
+
+		warp_zoom_source_get(zoom, NULL, &view);
+
+		/* a request that leaves a field out moves the others and leaves
+		 * that one where it is, so a control surface can pan without
+		 * having to know what the zoom is */
+		if (obs_data_has_user_value(request, "zoom"))
+			view.zoom = (float)(obs_data_get_double(request, "zoom") / 100.0);
+		if (obs_data_has_user_value(request, "x"))
+			view.x = (float)(obs_data_get_double(request, "x") / 100.0);
+		if (obs_data_has_user_value(request, "y"))
+			view.y = (float)(obs_data_get_double(request, "y") / 100.0);
+
+		if (view.zoom < WARP_ZOOM_MIN || view.zoom > WARP_ZOOM_MAX) {
+			warp_ws_fail(response, "zoom must be between %d and %d percent", (int)(WARP_ZOOM_MIN * 100),
+				     (int)(WARP_ZOOM_MAX * 100));
+			ok = false;
+			break;
+		}
+
+		warp_zoom_source_set(zoom, &view, glide);
+		break;
+	}
+	case WARP_WS_ZOOM_IN:
+	case WARP_WS_ZOOM_OUT: {
+		double factor = obs_data_has_user_value(request, "factor") ? obs_data_get_double(request, "factor")
+									   : WARP_ZOOM_STEP;
+
+		if (factor <= 0.0) {
+			warp_ws_fail(response, "factor must be what the zoom is multiplied by, above zero");
+			ok = false;
+			break;
+		}
+
+		warp_zoom_source_adjust(zoom, (float)(req->action == WARP_WS_ZOOM_IN ? factor : 1.0 / factor), glide);
+		break;
+	}
+	case WARP_WS_PAN_ZOOM: {
+		double dx = obs_data_get_double(request, "dx");
+		double dy = obs_data_get_double(request, "dy");
+
+		if (dx == 0.0 && dy == 0.0) {
+			warp_ws_fail(response,
+				     "dx or dy must say how far to pan, as a percentage of what is on screen");
+			ok = false;
+			break;
+		}
+
+		warp_zoom_source_pan(zoom, (float)(dx / 100.0), (float)(dy / 100.0), glide);
+		break;
+	}
+	case WARP_WS_RESET_ZOOM:
+		warp_zoom_source_reset(zoom, glide);
+		break;
+	case WARP_WS_RECALL_ZOOM_PRESET: {
+		const char *preset = obs_data_get_string(request, "preset");
+		long long slot = warp_ws_field(request, "slot", 0);
+
+		if (preset && *preset)
+			ok = warp_zoom_source_recall(zoom, preset);
+		else if (slot > 0)
+			ok = warp_zoom_source_recall_slot(zoom, (int)slot);
+		else
+			ok = false;
+
+		if (!ok)
+			warp_ws_fail(response, "no zoom preset called '%s'", preset && *preset ? preset : "");
+
+		break;
+	}
+	case WARP_WS_SAVE_ZOOM_PRESET: {
+		char *id = warp_zoom_source_save_preset(zoom, obs_data_get_string(request, "name"));
+
+		if (!id) {
+			warp_ws_fail(response, "could not keep the framing as a preset");
+			ok = false;
+			break;
+		}
+
+		obs_data_set_string(response, "presetId", id);
+		bfree(id);
+		break;
+	}
+	case WARP_WS_REMOVE_ZOOM_PRESET: {
+		const char *preset = obs_data_get_string(request, "preset");
+
+		ok = warp_zoom_source_remove_preset(zoom, preset);
+
+		if (!ok)
+			warp_ws_fail(response, "no zoom preset called '%s', or it is the one that cannot be removed",
+				     preset ? preset : "");
+
+		break;
+	}
+	default:
+		break;
+	}
+
+	if (ok) {
+		obs_data_array_t *presets = warp_zoom_source_presets(zoom);
+
+		/* every zoom response carries the presets, so a control surface
+		 * lays out its buttons from the answer it already has */
+		if (presets) {
+			obs_data_set_array(response, "zoomPresets", presets);
+			obs_data_array_release(presets);
+		}
+	}
+
+	obs_source_release(zoom);
+
+	return ok;
 }
 
 /* Carries out the request. Returns false with the response filled in when the
@@ -334,6 +559,16 @@ static bool warp_ws_run(const struct warp_ws_request *req, obs_source_t *source,
 	case WARP_WS_CLEAR_PLAYLIST:
 		warp_ws_call(source, "warp_playlist_clear");
 		return true;
+	case WARP_WS_SET_ZOOM:
+	case WARP_WS_ZOOM_IN:
+	case WARP_WS_ZOOM_OUT:
+	case WARP_WS_PAN_ZOOM:
+	case WARP_WS_RESET_ZOOM:
+	case WARP_WS_RECALL_ZOOM_PRESET:
+	case WARP_WS_SAVE_ZOOM_PRESET:
+	case WARP_WS_REMOVE_ZOOM_PRESET:
+	case WARP_WS_GET_ZOOM_PRESETS:
+		return warp_ws_run_zoom(req, source, request, response);
 	case WARP_WS_GET_STATUS:
 		return true;
 	}
