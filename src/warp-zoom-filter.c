@@ -16,8 +16,13 @@ You should have received a copy of the GNU General Public License along
 with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
-#include <graphics/vec2.h>
+/* libobs' own headers come first: plugin-support.h declares blogva() as a
+ * plain extern, and util/base.h declares it exported, which MSVC reads as a
+ * redefinition with different linkage when it meets the plain one first. */
+#include <obs-module.h>
 #include <plugin-support.h>
+
+#include <graphics/vec2.h>
 
 #include "warp-zoom.h"
 
