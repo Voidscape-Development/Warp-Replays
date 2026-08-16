@@ -56,6 +56,8 @@ target_sources(
     src/warp-playlist-source.c
     src/warp-detection-filter.c
     src/warp-websocket.c
+    src/warp-zoom.c
+    src/warp-zoom-filter.c
     src/media-playback/cache.c
     src/media-playback/decode.c
     src/media-playback/media-playback.c
@@ -68,7 +70,7 @@ if(ENABLE_FRONTEND_API)
 endif()
 
 if(ENABLE_FRONTEND_API AND ENABLE_QT)
-  target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/warp-flow-dialog.cpp src/warp-window.cpp)
+  target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/warp-flow-dialog.cpp src/warp-window.cpp src/warp-zoom-dock.cpp)
   target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE WARP_HAVE_FRONTEND)
 endif()
 

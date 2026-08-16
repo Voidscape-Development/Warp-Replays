@@ -46,6 +46,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "warp-events.h"
 #include "warp-flow-dialog.hpp"
 #include "warp-flow.h"
+#include "warp-zoom-dock.hpp"
 
 namespace {
 
@@ -233,7 +234,10 @@ WarpWindow::WarpWindow(QWidget *parent) : QDialog(parent)
 	propsButton = new QPushButton(warp_flow_text("Warp.Window.Props"), this);
 	removeButton = new QPushButton(warp_flow_text("Warp.Window.Remove"), this);
 
+	auto *zoomButton = new QPushButton(warp_flow_text("Warp.Window.ZoomPresets"), this);
 	auto *closeButton = new QPushButton(warp_flow_text("Warp.Window.Close"), this);
+
+	zoomButton->setToolTip(warp_flow_text("Warp.Window.ZoomPresets.Desc"));
 
 	closeButton->setDefault(true);
 
@@ -254,6 +258,7 @@ WarpWindow::WarpWindow(QWidget *parent) : QDialog(parent)
 	buttons->addWidget(propsButton);
 	buttons->addWidget(removeButton);
 	buttons->addStretch(1);
+	buttons->addWidget(zoomButton);
 	buttons->addWidget(closeButton);
 
 	auto *layout = new QVBoxLayout(this);
@@ -266,6 +271,7 @@ WarpWindow::WarpWindow(QWidget *parent) : QDialog(parent)
 	connect(addButton, &QPushButton::clicked, this, [this]() { addFlow(); });
 	connect(propsButton, &QPushButton::clicked, this, [this]() { editFlow(); });
 	connect(removeButton, &QPushButton::clicked, this, [this]() { removeFlow(); });
+	connect(zoomButton, &QPushButton::clicked, this, [this]() { warp_open_zoom_presets(this); });
 	connect(closeButton, &QPushButton::clicked, this, &QDialog::close);
 	connect(tree, &QTreeWidget::itemSelectionChanged, this, [this]() { selectionChanged(); });
 	connect(tree, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *, int) { editFlow(); });
