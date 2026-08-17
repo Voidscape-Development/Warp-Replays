@@ -176,10 +176,23 @@ static void warp_zoom_arm_signal(struct warp_zoom_control *ctl, const struct war
 				 const char *preset)
 {
 	ctl->signal_armed = true;
+	ctl->signal_is_stage = false;
 	ctl->signal_view = *view;
 	ctl->signal_change = change;
 
 	snprintf(ctl->signal_preset, sizeof(ctl->signal_preset), "%s", preset ? preset : "");
+}
+
+/* A shot being lined up, taken or dropped. Nothing has moved on screen, so it
+ * is said as a staging rather than as a change. Expects ctl->mutex to be
+ * held. */
+static void warp_zoom_arm_stage_signal(struct warp_zoom_control *ctl, const struct warp_zoom_view *view, bool staged,
+				       const char *change, const char *preset)
+{
+	warp_zoom_arm_signal(ctl, view, change, preset);
+
+	ctl->signal_is_stage = true;
+	ctl->signal_staged = staged;
 }
 
 static void warp_zoom_unlock(struct warp_zoom_control *ctl)
@@ -187,6 +200,8 @@ static void warp_zoom_unlock(struct warp_zoom_control *ctl)
 	struct warp_zoom_view view = ctl->signal_view;
 	const char *change = ctl->signal_change;
 	bool armed = ctl->signal_armed;
+	bool is_stage = ctl->signal_is_stage;
+	bool staged = ctl->signal_staged;
 	char preset[sizeof(ctl->signal_preset)];
 
 	snprintf(preset, sizeof(preset), "%s", ctl->signal_preset);
@@ -208,7 +223,11 @@ static void warp_zoom_unlock(struct warp_zoom_control *ctl)
 	calldata_set_string(&cd, "change", change ? change : WARP_ZOOM_CHANGE_SET);
 	calldata_set_string(&cd, "preset", preset);
 
-	signal_handler_signal(obs_source_get_signal_handler(ctl->source), WARP_SIGNAL_ZOOM_CHANGED, &cd);
+	if (is_stage)
+		calldata_set_bool(&cd, "staged", staged);
+
+	signal_handler_signal(obs_source_get_signal_handler(ctl->source),
+			      is_stage ? WARP_SIGNAL_ZOOM_STAGED : WARP_SIGNAL_ZOOM_CHANGED, &cd);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -244,21 +263,68 @@ static void warp_zoom_aim(struct warp_zoom_control *ctl, const struct warp_zoom_
 	ctl->glide_len = (float)glide_ms / 1000.0f;
 }
 
+/* Where a nudge works from: the shot being lined up when there is one, so that
+ * holding a key down walks the staged shot along rather than starting over from
+ * what is on screen. Expects ctl->mutex to be held. */
+static struct warp_zoom_view warp_zoom_base(struct warp_zoom_control *ctl)
+{
+	return ctl->staged ? ctl->stage : ctl->target;
+}
+
+/* Lines a shot up instead of putting it on screen, and answers whether it did.
+ * Everything that reframes the source goes through here first, so the dock, the
+ * hotkeys and the websocket all behave the way confirm mode says they will.
+ * Expects ctl->mutex to be held. */
+/* 'glide_ms' is how long the move will take when the shot is taken, which is
+ * not the same as how long the move that lined it up would have taken: lining
+ * a shot up moves nothing, and taking it should ease the way a recall does
+ * however the shot was found. Only a preset carrying a glide of its own passes
+ * anything but -1 here. */
+static bool warp_zoom_stage(struct warp_zoom_control *ctl, const struct warp_zoom_view *view, int glide_ms,
+			    const char *change, const char *preset)
+{
+	if (!ctl->confirm)
+		return false;
+
+	ctl->stage = *view;
+	warp_zoom_clamp(&ctl->stage);
+
+	ctl->staged = true;
+	ctl->stage_glide = glide_ms;
+	ctl->stage_change = change ? change : WARP_ZOOM_CHANGE_SET;
+	ctl->revision++;
+
+	snprintf(ctl->stage_preset, sizeof(ctl->stage_preset), "%s", preset ? preset : "");
+
+	warp_zoom_arm_stage_signal(ctl, &ctl->stage, true, ctl->stage_change, ctl->stage_preset);
+
+	return true;
+}
+
 void warp_zoom_control_set(struct warp_zoom_control *ctl, const struct warp_zoom_view *view, int glide_ms,
 			   const char *change, const char *preset)
 {
+	bool staged;
+
 	pthread_mutex_lock(&ctl->mutex);
 
-	warp_zoom_aim(ctl, view, glide_ms);
-	warp_zoom_arm_signal(ctl, &ctl->target, change ? change : WARP_ZOOM_CHANGE_SET, preset);
+	staged = warp_zoom_stage(ctl, view, -1, change ? change : WARP_ZOOM_CHANGE_SET, preset);
+
+	if (!staged) {
+		warp_zoom_aim(ctl, view, glide_ms);
+		warp_zoom_arm_signal(ctl, &ctl->target, change ? change : WARP_ZOOM_CHANGE_SET, preset);
+	}
 
 	warp_zoom_unlock(ctl);
-	warp_zoom_write_view(ctl);
+
+	if (!staged)
+		warp_zoom_write_view(ctl);
 }
 
 void warp_zoom_control_adjust(struct warp_zoom_control *ctl, float factor, int glide_ms)
 {
 	struct warp_zoom_view view;
+	bool staged;
 
 	if (!(factor > 0.0f))
 		return;
@@ -268,50 +334,76 @@ void warp_zoom_control_adjust(struct warp_zoom_control *ctl, float factor, int g
 	/* Zooming works on where the view is heading rather than on where it
 	 * has got to, so holding the key down walks steadily in instead of
 	 * fighting the glide it just asked for. */
-	view = ctl->target;
+	view = warp_zoom_base(ctl);
 	view.zoom *= factor;
 
-	warp_zoom_aim(ctl, &view, glide_ms < 0 ? (int)ctl->nudge_ms : glide_ms);
-	warp_zoom_arm_signal(ctl, &ctl->target, WARP_ZOOM_CHANGE_MANUAL, NULL);
+	if (glide_ms < 0)
+		glide_ms = (int)ctl->nudge_ms;
+
+	staged = warp_zoom_stage(ctl, &view, -1, WARP_ZOOM_CHANGE_MANUAL, NULL);
+
+	if (!staged) {
+		warp_zoom_aim(ctl, &view, glide_ms);
+		warp_zoom_arm_signal(ctl, &ctl->target, WARP_ZOOM_CHANGE_MANUAL, NULL);
+	}
 
 	warp_zoom_unlock(ctl);
-	warp_zoom_write_view(ctl);
+
+	if (!staged)
+		warp_zoom_write_view(ctl);
 }
 
 void warp_zoom_control_pan(struct warp_zoom_control *ctl, float dx, float dy, int glide_ms)
 {
 	struct warp_zoom_view view;
+	bool staged;
 
 	pthread_mutex_lock(&ctl->mutex);
 
-	view = ctl->target;
+	view = warp_zoom_base(ctl);
 
 	/* the move is a fraction of what is on screen, so panning covers the
 	 * same distance on the stream however far in the picture is zoomed */
 	view.x += dx / view.zoom;
 	view.y += dy / view.zoom;
 
-	warp_zoom_aim(ctl, &view, glide_ms < 0 ? (int)ctl->nudge_ms : glide_ms);
-	warp_zoom_arm_signal(ctl, &ctl->target, WARP_ZOOM_CHANGE_MANUAL, NULL);
+	if (glide_ms < 0)
+		glide_ms = (int)ctl->nudge_ms;
+
+	staged = warp_zoom_stage(ctl, &view, -1, WARP_ZOOM_CHANGE_MANUAL, NULL);
+
+	if (!staged) {
+		warp_zoom_aim(ctl, &view, glide_ms);
+		warp_zoom_arm_signal(ctl, &ctl->target, WARP_ZOOM_CHANGE_MANUAL, NULL);
+	}
 
 	warp_zoom_unlock(ctl);
-	warp_zoom_write_view(ctl);
+
+	if (!staged)
+		warp_zoom_write_view(ctl);
 }
 
 void warp_zoom_control_reset(struct warp_zoom_control *ctl, int glide_ms)
 {
 	struct warp_zoom_view view = warp_zoom_default_view();
 	char name[sizeof(ctl->signal_preset)];
+	bool staged;
 
 	pthread_mutex_lock(&ctl->mutex);
 
 	snprintf(name, sizeof(name), "%s", ctl->presets.num ? ctl->presets.array[0].name : "");
 
-	warp_zoom_aim(ctl, &view, glide_ms);
-	warp_zoom_arm_signal(ctl, &ctl->target, WARP_ZOOM_CHANGE_RESET, name);
+	staged = warp_zoom_stage(ctl, &view, -1, WARP_ZOOM_CHANGE_RESET, name);
+
+	if (!staged) {
+		warp_zoom_aim(ctl, &view, glide_ms);
+		warp_zoom_arm_signal(ctl, &ctl->target, WARP_ZOOM_CHANGE_RESET, name);
+	}
 
 	warp_zoom_unlock(ctl);
-	warp_zoom_write_view(ctl);
+
+	if (!staged)
+		warp_zoom_write_view(ctl);
 }
 
 void warp_zoom_control_restore_default(struct warp_zoom_control *ctl)
@@ -320,7 +412,10 @@ void warp_zoom_control_restore_default(struct warp_zoom_control *ctl)
 
 	/* A video starting is not a change anyone asked for, so nothing is
 	 * said about it and nothing is eased: the file goes up framed the way
-	 * every file goes up. */
+	 * every file goes up. A shot lined up on the video that has just gone
+	 * goes with it - taking it against the next one would frame a video it
+	 * was never composed against. */
+	ctl->staged = false;
 	ctl->view = warp_zoom_default_view();
 	ctl->target = ctl->view;
 	ctl->from = ctl->view;
@@ -336,8 +431,10 @@ bool warp_zoom_control_recall(struct warp_zoom_control *ctl, const char *id_or_n
 	struct warp_zoom_preset *preset;
 	struct warp_zoom_view view;
 	char name[sizeof(ctl->signal_preset)];
+	const char *change;
 	int glide;
 	bool reset;
+	bool staged;
 
 	pthread_mutex_lock(&ctl->mutex);
 
@@ -353,11 +450,124 @@ bool warp_zoom_control_recall(struct warp_zoom_control *ctl, const char *id_or_n
 	reset = warp_zoom_is_default(preset);
 	snprintf(name, sizeof(name), "%s", preset->name);
 
+	change = reset ? WARP_ZOOM_CHANGE_RESET : WARP_ZOOM_CHANGE_PRESET;
+	staged = warp_zoom_stage(ctl, &view, glide, change, name);
+
+	if (!staged) {
+		warp_zoom_aim(ctl, &view, glide);
+		warp_zoom_arm_signal(ctl, &ctl->target, change, name);
+	}
+
+	warp_zoom_unlock(ctl);
+
+	if (!staged)
+		warp_zoom_write_view(ctl);
+
+	return true;
+}
+
+void warp_zoom_control_set_confirm(struct warp_zoom_control *ctl, bool confirm)
+{
+	struct warp_zoom_view view;
+
+	pthread_mutex_lock(&ctl->mutex);
+
+	if (ctl->confirm != confirm) {
+		ctl->confirm = confirm;
+		ctl->revision++;
+	}
+
+	/* Coming out of confirm mode drops whatever was waiting rather than
+	 * putting it up: a shot goes to air because someone took it, never
+	 * because a setting was switched off. */
+	if (!confirm && ctl->staged) {
+		ctl->staged = false;
+		view = ctl->target;
+
+		warp_zoom_arm_stage_signal(ctl, &view, false, WARP_ZOOM_CHANGE_SET, NULL);
+	}
+
+	warp_zoom_unlock(ctl);
+}
+
+bool warp_zoom_control_confirm(struct warp_zoom_control *ctl)
+{
+	bool confirm;
+
+	pthread_mutex_lock(&ctl->mutex);
+	confirm = ctl->confirm;
+	pthread_mutex_unlock(&ctl->mutex);
+
+	return confirm;
+}
+
+bool warp_zoom_control_staged(struct warp_zoom_control *ctl, struct warp_zoom_view *out)
+{
+	bool staged;
+
+	pthread_mutex_lock(&ctl->mutex);
+
+	staged = ctl->staged;
+
+	if (out)
+		*out = staged ? ctl->stage : ctl->target;
+
+	pthread_mutex_unlock(&ctl->mutex);
+
+	return staged;
+}
+
+bool warp_zoom_control_take(struct warp_zoom_control *ctl)
+{
+	struct warp_zoom_view view;
+	char preset[sizeof(ctl->stage_preset)];
+	const char *change;
+	int glide;
+
+	pthread_mutex_lock(&ctl->mutex);
+
+	if (!ctl->staged) {
+		pthread_mutex_unlock(&ctl->mutex);
+		return false;
+	}
+
+	view = ctl->stage;
+	glide = ctl->stage_glide;
+	change = ctl->stage_change;
+	snprintf(preset, sizeof(preset), "%s", ctl->stage_preset);
+
+	ctl->staged = false;
+
+	/* it is going to air now, so this is a change to the picture like any
+	 * other: the same signal fires, and a Warp Detection filter reacts to
+	 * it here rather than when the shot was lined up */
 	warp_zoom_aim(ctl, &view, glide);
-	warp_zoom_arm_signal(ctl, &ctl->target, reset ? WARP_ZOOM_CHANGE_RESET : WARP_ZOOM_CHANGE_PRESET, name);
+	warp_zoom_arm_signal(ctl, &ctl->target, change, preset);
 
 	warp_zoom_unlock(ctl);
 	warp_zoom_write_view(ctl);
+
+	return true;
+}
+
+bool warp_zoom_control_drop(struct warp_zoom_control *ctl)
+{
+	struct warp_zoom_view view;
+
+	pthread_mutex_lock(&ctl->mutex);
+
+	if (!ctl->staged) {
+		pthread_mutex_unlock(&ctl->mutex);
+		return false;
+	}
+
+	ctl->staged = false;
+	ctl->revision++;
+	view = ctl->target;
+
+	warp_zoom_arm_stage_signal(ctl, &view, false, WARP_ZOOM_CHANGE_SET, NULL);
+
+	warp_zoom_unlock(ctl);
 
 	return true;
 }
@@ -508,6 +718,8 @@ static void warp_zoom_pan_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hot
 	if (!pressed || !warp_zoom_showing(binding->ctl))
 		return;
 
+	/* the four straight directions, then the corners, which move a full
+	 * step on both axes at once */
 	switch (binding->value) {
 	case 0:
 		dx = -WARP_ZOOM_PAN_STEP;
@@ -518,12 +730,54 @@ static void warp_zoom_pan_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hot
 	case 2:
 		dy = -WARP_ZOOM_PAN_STEP;
 		break;
+	case 3:
+		dy = WARP_ZOOM_PAN_STEP;
+		break;
+	case 4:
+		dx = -WARP_ZOOM_PAN_STEP;
+		dy = -WARP_ZOOM_PAN_STEP;
+		break;
+	case 5:
+		dx = WARP_ZOOM_PAN_STEP;
+		dy = -WARP_ZOOM_PAN_STEP;
+		break;
+	case 6:
+		dx = -WARP_ZOOM_PAN_STEP;
+		dy = WARP_ZOOM_PAN_STEP;
+		break;
 	default:
+		dx = WARP_ZOOM_PAN_STEP;
 		dy = WARP_ZOOM_PAN_STEP;
 		break;
 	}
 
 	warp_zoom_control_pan(binding->ctl, dx, dy, -1);
+}
+
+static void warp_zoom_take_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
+{
+	struct warp_zoom_control *ctl = data;
+
+	UNUSED_PARAMETER(id);
+	UNUSED_PARAMETER(hotkey);
+
+	if (!pressed || !warp_zoom_showing(ctl))
+		return;
+
+	warp_zoom_control_take(ctl);
+}
+
+static void warp_zoom_drop_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
+{
+	struct warp_zoom_control *ctl = data;
+
+	UNUSED_PARAMETER(id);
+	UNUSED_PARAMETER(hotkey);
+
+	if (!pressed || !warp_zoom_showing(ctl))
+		return;
+
+	warp_zoom_control_drop(ctl);
 }
 
 static void warp_zoom_slot_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -670,9 +924,14 @@ static void warp_zoom_sync_hotkeys(struct warp_zoom_control *ctl)
 
 static void warp_zoom_register_hotkeys(struct warp_zoom_control *ctl)
 {
-	static const char *const pan_names[4] = {"ZoomPanLeft", "ZoomPanRight", "ZoomPanUp", "ZoomPanDown"};
-	static const char *const pan_text[4] = {"Warp.Hotkey.Zoom.PanLeft", "Warp.Hotkey.Zoom.PanRight",
-						"Warp.Hotkey.Zoom.PanUp", "Warp.Hotkey.Zoom.PanDown"};
+	static const char *const pan_names[WARP_ZOOM_NUM_PANS] = {"ZoomPanLeft",     "ZoomPanRight",
+								  "ZoomPanUp",       "ZoomPanDown",
+								  "ZoomPanUpLeft",   "ZoomPanUpRight",
+								  "ZoomPanDownLeft", "ZoomPanDownRight"};
+	static const char *const pan_text[WARP_ZOOM_NUM_PANS] = {
+		"Warp.Hotkey.Zoom.PanLeft",     "Warp.Hotkey.Zoom.PanRight",    "Warp.Hotkey.Zoom.PanUp",
+		"Warp.Hotkey.Zoom.PanDown",     "Warp.Hotkey.Zoom.PanUpLeft",   "Warp.Hotkey.Zoom.PanUpRight",
+		"Warp.Hotkey.Zoom.PanDownLeft", "Warp.Hotkey.Zoom.PanDownRight"};
 	struct dstr name = {0};
 	struct dstr desc = {0};
 
@@ -691,7 +950,7 @@ static void warp_zoom_register_hotkeys(struct warp_zoom_control *ctl)
 	ctl->reset_hotkey = obs_hotkey_register_source(
 		ctl->source, name.array, obs_module_text("Warp.Hotkey.Zoom.Reset"), warp_zoom_reset_hotkey, ctl);
 
-	for (size_t i = 0; i < 4; i++) {
+	for (size_t i = 0; i < WARP_ZOOM_NUM_PANS; i++) {
 		ctl->pan_bindings[i].ctl = ctl;
 		ctl->pan_bindings[i].value = (int)i;
 
@@ -699,6 +958,14 @@ static void warp_zoom_register_hotkeys(struct warp_zoom_control *ctl)
 		ctl->pan_hotkeys[i] = obs_hotkey_register_source(ctl->source, name.array, obs_module_text(pan_text[i]),
 								 warp_zoom_pan_hotkey, &ctl->pan_bindings[i]);
 	}
+
+	dstr_printf(&name, "%s.ZoomTake", ctl->prefix);
+	ctl->take_hotkey = obs_hotkey_register_source(ctl->source, name.array, obs_module_text("Warp.Hotkey.Zoom.Take"),
+						      warp_zoom_take_hotkey, ctl);
+
+	dstr_printf(&name, "%s.ZoomDrop", ctl->prefix);
+	ctl->drop_hotkey = obs_hotkey_register_source(ctl->source, name.array, obs_module_text("Warp.Hotkey.Zoom.Drop"),
+						      warp_zoom_drop_hotkey, ctl);
 
 	/* The numbered slots are registered once and stay put, whatever the
 	 * presets do: a slot fires whichever preset is in that position, so a
@@ -739,8 +1006,10 @@ void warp_zoom_control_init(struct warp_zoom_control *ctl, obs_source_t *source,
 	ctl->in_hotkey = OBS_INVALID_HOTKEY_ID;
 	ctl->out_hotkey = OBS_INVALID_HOTKEY_ID;
 	ctl->reset_hotkey = OBS_INVALID_HOTKEY_ID;
+	ctl->take_hotkey = OBS_INVALID_HOTKEY_ID;
+	ctl->drop_hotkey = OBS_INVALID_HOTKEY_ID;
 
-	for (size_t i = 0; i < 4; i++)
+	for (size_t i = 0; i < WARP_ZOOM_NUM_PANS; i++)
 		ctl->pan_hotkeys[i] = OBS_INVALID_HOTKEY_ID;
 	for (size_t i = 0; i < WARP_ZOOM_SLOTS; i++)
 		ctl->slot_hotkeys[i] = OBS_INVALID_HOTKEY_ID;
@@ -776,6 +1045,7 @@ void warp_zoom_control_defaults(obs_data_t *settings, bool with_view)
 {
 	obs_data_set_default_int(settings, WARP_ZOOM_S_GLIDE, WARP_ZOOM_GLIDE_MS);
 	obs_data_set_default_int(settings, WARP_ZOOM_S_NUDGE, WARP_ZOOM_NUDGE_MS);
+	obs_data_set_default_bool(settings, WARP_ZOOM_S_CONFIRM, false);
 
 	if (!with_view)
 		return;
@@ -822,6 +1092,7 @@ void warp_zoom_control_update(struct warp_zoom_control *ctl, obs_data_t *setting
 	obs_data_array_t *presets = obs_data_get_array(settings, WARP_ZOOM_S_PRESETS);
 	uint64_t rev = (uint64_t)obs_data_get_int(settings, WARP_ZOOM_S_PRESETS_REV);
 	size_t count = presets ? obs_data_array_count(presets) : 0;
+	bool confirm = obs_data_get_bool(settings, WARP_ZOOM_S_CONFIRM);
 	int glide = (int)obs_data_get_int(settings, WARP_ZOOM_S_GLIDE);
 	int nudge = (int)obs_data_get_int(settings, WARP_ZOOM_S_NUDGE);
 	struct warp_zoom_view view = warp_zoom_default_view();
@@ -852,6 +1123,21 @@ void warp_zoom_control_update(struct warp_zoom_control *ctl, obs_data_t *setting
 	 * that array is not one from before an edit the dock made: an update
 	 * that leaves them out, or that hands back what the source held before
 	 * a preset was added, keeps what is there. */
+	/* Confirm mode is set from the dock as well as from the properties, so
+	 * it is guarded by the same revision the presets are: settings from
+	 * before the dock changed it are the stale copy they look like. */
+	if (rev >= ctl->presets_rev && ctl->confirm != confirm) {
+		ctl->confirm = confirm;
+		ctl->revision++;
+
+		/* switching confirm mode off drops what was waiting rather
+		 * than putting it on screen */
+		if (!confirm && ctl->staged) {
+			ctl->staged = false;
+			warp_zoom_arm_stage_signal(ctl, &ctl->target, false, WARP_ZOOM_CHANGE_SET, NULL);
+		}
+	}
+
 	if (presets && rev >= ctl->presets_rev) {
 		for (size_t i = 0; i < ctl->presets.num; i++) {
 			if (ctl->presets.array[i].hotkey != OBS_INVALID_HOTKEY_ID)
@@ -879,7 +1165,7 @@ void warp_zoom_control_update(struct warp_zoom_control *ctl, obs_data_t *setting
 	if (ctl->persist_view && !warp_zoom_view_equal(&view, &ctl->target))
 		warp_zoom_aim(ctl, &view, 0);
 
-	pthread_mutex_unlock(&ctl->mutex);
+	warp_zoom_unlock(ctl);
 
 	obs_data_array_release(presets);
 
@@ -893,6 +1179,7 @@ void warp_zoom_control_save(struct warp_zoom_control *ctl, obs_data_t *settings)
 
 	pthread_mutex_lock(&ctl->mutex);
 	obs_data_set_int(settings, WARP_ZOOM_S_PRESETS_REV, (long long)ctl->presets_rev);
+	obs_data_set_bool(settings, WARP_ZOOM_S_CONFIRM, ctl->confirm);
 	pthread_mutex_unlock(&ctl->mutex);
 
 	obs_data_set_array(settings, WARP_ZOOM_S_PRESETS, presets);
@@ -940,6 +1227,9 @@ void warp_zoom_control_properties(obs_properties_t *props, bool with_view)
 					     WARP_ZOOM_GLIDE_MAX, 10);
 	obs_property_int_set_suffix(prop, " ms");
 	obs_property_set_long_description(prop, obs_module_text("Warp.Zoom.Nudge.Desc"));
+
+	prop = obs_properties_add_bool(group, WARP_ZOOM_S_CONFIRM, obs_module_text("Warp.Zoom.Confirm"));
+	obs_property_set_long_description(prop, obs_module_text("Warp.Zoom.Confirm.Desc"));
 
 	prop = obs_properties_add_text(group, "zoom_presets_note", obs_module_text("Warp.Zoom.Presets.Note"),
 				       OBS_TEXT_INFO);
@@ -1026,9 +1316,10 @@ char *warp_zoom_control_add_preset(struct warp_zoom_control *ctl, const char *na
 
 	preset.id = warp_zoom_make_id();
 	preset.name = warp_zoom_unique_name(ctl, name, preset.id);
-	/* nothing handed over means the framing the source is set to right
-	 * now, which is how the dock keeps a shot that has just been found */
-	preset.view = view ? *view : ctl->target;
+	/* Nothing handed over means the framing being looked at, which is how
+	 * the dock keeps a shot that has just been found: the one lined up when
+	 * there is one, and what the source is set to otherwise. */
+	preset.view = view ? *view : warp_zoom_base(ctl);
 	preset.glide_ms = glide_ms > 0 ? (uint32_t)glide_ms : 0;
 	preset.hotkey = OBS_INVALID_HOTKEY_ID;
 
@@ -1250,8 +1541,11 @@ static void warp_zoom_get_proc(void *data, calldata_t *cd)
 	struct warp_zoom_control *ctl = data;
 	struct warp_zoom_view view;
 	struct warp_zoom_view target;
+	struct warp_zoom_view stage;
+	bool staged;
 
 	warp_zoom_control_get(ctl, &view, &target);
+	staged = warp_zoom_control_staged(ctl, &stage);
 
 	calldata_set_float(cd, "zoom", view.zoom);
 	calldata_set_float(cd, "x", view.x);
@@ -1259,6 +1553,34 @@ static void warp_zoom_get_proc(void *data, calldata_t *cd)
 	calldata_set_float(cd, "target_zoom", target.zoom);
 	calldata_set_float(cd, "target_x", target.x);
 	calldata_set_float(cd, "target_y", target.y);
+
+	/* what is waiting behind it, so a control surface can show the shot
+	 * that is lined up as well as the one that is on */
+	calldata_set_bool(cd, "confirm", warp_zoom_control_confirm(ctl));
+	calldata_set_bool(cd, "staged", staged);
+	calldata_set_float(cd, "staged_zoom", stage.zoom);
+	calldata_set_float(cd, "staged_x", stage.x);
+	calldata_set_float(cd, "staged_y", stage.y);
+}
+
+static void warp_zoom_confirm_proc(void *data, calldata_t *cd)
+{
+	bool confirm;
+
+	if (calldata_get_bool(cd, "confirm", &confirm))
+		warp_zoom_control_set_confirm(data, confirm);
+
+	calldata_set_bool(cd, "state", warp_zoom_control_confirm(data));
+}
+
+static void warp_zoom_take_proc(void *data, calldata_t *cd)
+{
+	calldata_set_bool(cd, "taken", warp_zoom_control_take(data));
+}
+
+static void warp_zoom_drop_proc(void *data, calldata_t *cd)
+{
+	calldata_set_bool(cd, "dropped", warp_zoom_control_drop(data));
 }
 
 static void warp_zoom_adjust_proc(void *data, calldata_t *cd)
@@ -1376,7 +1698,8 @@ void warp_zoom_control_register_procs(struct warp_zoom_control *ctl, obs_source_
 			 ctl);
 	proc_handler_add(ph,
 			 "void " WARP_ZOOM_PROC_GET "(out float zoom, out float x, out float y, out float target_zoom, "
-			 "out float target_x, out float target_y)",
+			 "out float target_x, out float target_y, out bool confirm, out bool staged, "
+			 "out float staged_zoom, out float staged_x, out float staged_y)",
 			 warp_zoom_get_proc, ctl);
 	proc_handler_add(ph, "void " WARP_ZOOM_PROC_ADJUST "(float factor, int glide)", warp_zoom_adjust_proc, ctl);
 	proc_handler_add(ph, "void " WARP_ZOOM_PROC_PAN "(float dx, float dy, int glide)", warp_zoom_pan_proc, ctl);
@@ -1394,6 +1717,10 @@ void warp_zoom_control_register_procs(struct warp_zoom_control *ctl, obs_source_
 	proc_handler_add(ph, "void " WARP_ZOOM_PROC_MOVE_PRESET "(string id, int delta, out bool moved)",
 			 warp_zoom_move_preset_proc, ctl);
 	proc_handler_add(ph, "void " WARP_ZOOM_PROC_PRESETS "(out string presets)", warp_zoom_presets_proc, ctl);
+	proc_handler_add(ph, "void " WARP_ZOOM_PROC_CONFIRM "(bool confirm, out bool state)", warp_zoom_confirm_proc,
+			 ctl);
+	proc_handler_add(ph, "void " WARP_ZOOM_PROC_TAKE "(out bool taken)", warp_zoom_take_proc, ctl);
+	proc_handler_add(ph, "void " WARP_ZOOM_PROC_DROP "(out bool dropped)", warp_zoom_drop_proc, ctl);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1537,6 +1864,82 @@ bool warp_zoom_source_recall_slot(obs_source_t *source, int slot)
 		calldata_get_bool(&cd, "found", &found);
 
 	return found;
+}
+
+bool warp_zoom_source_stage(obs_source_t *source, struct warp_zoom_view *staged, bool *is_staged, bool *confirm)
+{
+	struct calldata cd;
+	uint8_t stack[512];
+	double value;
+	bool flag = false;
+
+	calldata_init_fixed(&cd, stack, sizeof(stack));
+
+	if (!warp_zoom_call(source, WARP_ZOOM_PROC_GET, &cd))
+		return false;
+
+	if (staged) {
+		*staged = warp_zoom_default_view();
+
+		if (calldata_get_float(&cd, "staged_zoom", &value))
+			staged->zoom = (float)value;
+		if (calldata_get_float(&cd, "staged_x", &value))
+			staged->x = (float)value;
+		if (calldata_get_float(&cd, "staged_y", &value))
+			staged->y = (float)value;
+	}
+
+	if (is_staged) {
+		calldata_get_bool(&cd, "staged", &flag);
+		*is_staged = flag;
+	}
+
+	if (confirm) {
+		flag = false;
+		calldata_get_bool(&cd, "confirm", &flag);
+		*confirm = flag;
+	}
+
+	return true;
+}
+
+void warp_zoom_source_set_confirm(obs_source_t *source, bool confirm)
+{
+	struct calldata cd;
+	uint8_t stack[128];
+
+	calldata_init_fixed(&cd, stack, sizeof(stack));
+	calldata_set_bool(&cd, "confirm", confirm);
+
+	warp_zoom_call(source, WARP_ZOOM_PROC_CONFIRM, &cd);
+}
+
+bool warp_zoom_source_take(obs_source_t *source)
+{
+	struct calldata cd;
+	uint8_t stack[128];
+	bool taken = false;
+
+	calldata_init_fixed(&cd, stack, sizeof(stack));
+
+	if (warp_zoom_call(source, WARP_ZOOM_PROC_TAKE, &cd))
+		calldata_get_bool(&cd, "taken", &taken);
+
+	return taken;
+}
+
+bool warp_zoom_source_drop(obs_source_t *source)
+{
+	struct calldata cd;
+	uint8_t stack[128];
+	bool dropped = false;
+
+	calldata_init_fixed(&cd, stack, sizeof(stack));
+
+	if (warp_zoom_call(source, WARP_ZOOM_PROC_DROP, &cd))
+		calldata_get_bool(&cd, "dropped", &dropped);
+
+	return dropped;
 }
 
 obs_data_array_t *warp_zoom_source_presets(obs_source_t *source)

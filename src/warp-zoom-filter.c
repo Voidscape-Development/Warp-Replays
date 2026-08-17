@@ -104,7 +104,7 @@ static void warp_zoom_filter_save(void *data, obs_data_t *settings)
 
 static void *warp_zoom_filter_create(obs_data_t *settings, obs_source_t *source)
 {
-	static const char *signals[] = {WARP_SIGNAL_DECL_ZOOM_CHANGED, NULL};
+	static const char *signals[] = {WARP_SIGNAL_DECL_ZOOM_CHANGED, WARP_SIGNAL_DECL_ZOOM_STAGED, NULL};
 
 	struct warp_zoom_filter *f = bzalloc(sizeof(struct warp_zoom_filter));
 	char *path = obs_module_file("shaders/warp-zoom.effect");
