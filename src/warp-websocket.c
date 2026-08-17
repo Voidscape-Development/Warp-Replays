@@ -75,6 +75,9 @@ enum warp_ws_action {
 	WARP_WS_SAVE_ZOOM_PRESET,
 	WARP_WS_REMOVE_ZOOM_PRESET,
 	WARP_WS_GET_ZOOM_PRESETS,
+	WARP_WS_SET_ZOOM_CONFIRM,
+	WARP_WS_TAKE_ZOOM,
+	WARP_WS_DROP_ZOOM,
 	/* reports where playback stands without changing anything: every
 	 * response carries that, so this request has nothing else to do */
 	WARP_WS_GET_STATUS,
@@ -122,6 +125,9 @@ static struct warp_ws_request warp_ws_requests[] = {
 	{"SaveZoomPreset", WARP_WS_SAVE_ZOOM_PRESET, NULL, true},
 	{"RemoveZoomPreset", WARP_WS_REMOVE_ZOOM_PRESET, NULL, true},
 	{"GetZoomPresets", WARP_WS_GET_ZOOM_PRESETS, NULL, true},
+	{"SetZoomConfirm", WARP_WS_SET_ZOOM_CONFIRM, NULL, true},
+	{"TakeZoom", WARP_WS_TAKE_ZOOM, NULL, true},
+	{"DropZoom", WARP_WS_DROP_ZOOM, NULL, true},
 	{"GetStatus", WARP_WS_GET_STATUS, NULL, false},
 };
 
@@ -308,6 +314,23 @@ static void warp_ws_add_status(obs_source_t *source, obs_data_t *response)
 			obs_data_set_double(response, "zoomY", view.y * 100.0);
 		}
 
+		struct warp_zoom_view stage;
+		bool staged = false;
+		bool confirm = false;
+
+		/* what is waiting behind what is on air, so a control surface
+		 * can light its take button and show the shot it would put up */
+		if (warp_zoom_source_stage(zoom, &stage, &staged, &confirm)) {
+			obs_data_set_bool(response, "zoomConfirm", confirm);
+			obs_data_set_bool(response, "zoomStaged", staged);
+
+			if (staged) {
+				obs_data_set_double(response, "zoomStagedZoom", stage.zoom * 100.0);
+				obs_data_set_double(response, "zoomStagedX", stage.x * 100.0);
+				obs_data_set_double(response, "zoomStagedY", stage.y * 100.0);
+			}
+		}
+
 		if (zoom != source)
 			obs_data_set_string(response, "zoomFilter", obs_source_get_name(zoom));
 
@@ -404,6 +427,30 @@ static bool warp_ws_run_zoom(const struct warp_ws_request *req, obs_source_t *so
 	}
 	case WARP_WS_RESET_ZOOM:
 		warp_zoom_source_reset(zoom, glide);
+		break;
+	case WARP_WS_SET_ZOOM_CONFIRM: {
+		if (!obs_data_has_user_value(request, "confirm")) {
+			warp_ws_fail(response, "confirm must say whether framing is lined up before it goes to air");
+			ok = false;
+			break;
+		}
+
+		warp_zoom_source_set_confirm(zoom, obs_data_get_bool(request, "confirm"));
+		break;
+	}
+	case WARP_WS_TAKE_ZOOM:
+		ok = warp_zoom_source_take(zoom);
+
+		if (!ok)
+			warp_ws_fail(response, "there is no framing lined up to take");
+
+		break;
+	case WARP_WS_DROP_ZOOM:
+		ok = warp_zoom_source_drop(zoom);
+
+		if (!ok)
+			warp_ws_fail(response, "there is no framing lined up to drop");
+
 		break;
 	case WARP_WS_RECALL_ZOOM_PRESET: {
 		const char *preset = obs_data_get_string(request, "preset");
@@ -568,6 +615,9 @@ static bool warp_ws_run(const struct warp_ws_request *req, obs_source_t *source,
 	case WARP_WS_SAVE_ZOOM_PRESET:
 	case WARP_WS_REMOVE_ZOOM_PRESET:
 	case WARP_WS_GET_ZOOM_PRESETS:
+	case WARP_WS_SET_ZOOM_CONFIRM:
+	case WARP_WS_TAKE_ZOOM:
+	case WARP_WS_DROP_ZOOM:
 		return warp_ws_run_zoom(req, source, request, response);
 	case WARP_WS_GET_STATUS:
 		return true;

@@ -2590,7 +2590,8 @@ static void warp_playlist_register_procs(struct warp_playlist_source *s, obs_sou
 static void *warp_playlist_create(obs_data_t *settings, obs_source_t *source)
 {
 	static const char *signals[] = {WARP_SIGNAL_DECL_SPEED_CHANGED, WARP_SIGNAL_DECL_FRAMES_STEPPED,
-					WARP_SIGNAL_DECL_MEDIA_ACTION, WARP_SIGNAL_DECL_ZOOM_CHANGED, NULL};
+					WARP_SIGNAL_DECL_MEDIA_ACTION,  WARP_SIGNAL_DECL_ZOOM_CHANGED,
+					WARP_SIGNAL_DECL_ZOOM_STAGED,   NULL};
 
 	struct warp_playlist_source *s = bzalloc(sizeof(struct warp_playlist_source));
 

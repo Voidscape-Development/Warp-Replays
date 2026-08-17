@@ -56,6 +56,13 @@ extern "C" {
  * 100% would, so the picture moves by the same amount either way */
 #define WARP_ZOOM_PAN_STEP 0.05f
 
+/* The directions the pan hotkeys and the dock's pad move in, in the order
+ * their bindings are numbered: the four straight ones, then the corners. A
+ * corner moves a full step on both axes rather than a scaled one, so pushing
+ * into it covers more ground than a straight press, the way a joystick held
+ * into its corner does. */
+#define WARP_ZOOM_NUM_PANS 8
+
 /* How long a move takes, in milliseconds. Recalling a preset eases over the
  * first; the hotkeys and the dock nudge with the second, short enough that
  * held-down presses run into one continuous move rather than stepping. */
@@ -97,6 +104,13 @@ extern "C" {
 #define WARP_ZOOM_S_X "zoom_x"
 #define WARP_ZOOM_S_Y "zoom_y"
 
+/* Whether changes are staged rather than going straight to air. With it on,
+ * anything that would reframe the source - the dock, the hotkeys, the
+ * websocket - lines the shot up instead, and it only moves when something
+ * takes it. Saved with the source, so a hotkey behaves the way the dock says
+ * it will. */
+#define WARP_ZOOM_S_CONFIRM "zoom_confirm"
+
 /* Marks a Warp Zoom filter that is driven by the source that made it rather
  * than by an operator: it renders the view it is handed and keeps no presets
  * or hotkeys of its own. The playlist puts one on every file it plays, and the
@@ -131,6 +145,21 @@ extern "C" {
 #define WARP_ZOOM_CHANGE_RESET "reset"
 #define WARP_ZOOM_CHANGE_SET "set"
 
+/* Emitted as a shot is lined up in confirm mode, and again as it is taken or
+ * dropped:
+ *
+ *   warp_zoom_staged(ptr source, bool staged, float zoom, float x, float y,
+ *                    string change, string preset)
+ *
+ * 'staged' is false when the shot has gone - taken to air, or dropped - and
+ * the view is then the one the source is actually framed with. Nothing has
+ * moved on screen when this is emitted: a shot going to air is a
+ * warp_zoom_changed like any other, which is what a Warp Detection filter
+ * reacts to. */
+#define WARP_SIGNAL_ZOOM_STAGED "warp_zoom_staged"
+#define WARP_SIGNAL_DECL_ZOOM_STAGED \
+	"void warp_zoom_staged(ptr source, bool staged, float zoom, float x, float y, string change, string preset)"
+
 /* The procs every zoom-capable source carries, which is how everything outside
  * the source itself drives it: the zoom dock, the obs-websocket requests, a
  * Warp Detection filter recalling a preset, and any script that can reach the
@@ -147,6 +176,9 @@ extern "C" {
 #define WARP_ZOOM_PROC_REMOVE_PRESET "warp_zoom_remove_preset"
 #define WARP_ZOOM_PROC_MOVE_PRESET "warp_zoom_move_preset"
 #define WARP_ZOOM_PROC_PRESETS "warp_zoom_presets"
+#define WARP_ZOOM_PROC_CONFIRM "warp_zoom_confirm"
+#define WARP_ZOOM_PROC_TAKE "warp_zoom_take"
+#define WARP_ZOOM_PROC_DROP "warp_zoom_drop"
 
 /* How far in the picture is zoomed, and where the middle of what is shown sits
  * in it, from 0 to 1 across the whole file. */
@@ -253,6 +285,16 @@ struct warp_zoom_control {
 	float glide_elapsed;
 	float glide_len;
 
+	/* Confirm mode, and the shot lined up behind it. Nothing about the
+	 * staged shot is on screen: it waits here until it is taken, and is
+	 * dropped by anything that means the video it was lined up on has gone. */
+	bool confirm;
+	bool staged;
+	struct warp_zoom_view stage;
+	int stage_glide;
+	const char *stage_change;
+	char stage_preset[128];
+
 	uint32_t glide_ms;
 	uint32_t nudge_ms;
 
@@ -268,10 +310,12 @@ struct warp_zoom_control {
 	obs_hotkey_id in_hotkey;
 	obs_hotkey_id out_hotkey;
 	obs_hotkey_id reset_hotkey;
-	obs_hotkey_id pan_hotkeys[4];
+	obs_hotkey_id take_hotkey;
+	obs_hotkey_id drop_hotkey;
+	obs_hotkey_id pan_hotkeys[WARP_ZOOM_NUM_PANS];
 	obs_hotkey_id slot_hotkeys[WARP_ZOOM_SLOTS];
 
-	struct warp_zoom_binding pan_bindings[4];
+	struct warp_zoom_binding pan_bindings[WARP_ZOOM_NUM_PANS];
 	struct warp_zoom_binding slot_bindings[WARP_ZOOM_SLOTS];
 
 	/* Hotkeys of presets that have been removed. Registering and dropping a
@@ -281,8 +325,12 @@ struct warp_zoom_control {
 	 * the lock has been dropped. */
 	DARRAY(obs_hotkey_id) orphans;
 
-	/* what to say about the change once the lock has been dropped */
+	/* What to say about the change once the lock has been dropped, and
+	 * which of the two signals says it: a shot being lined up is not a
+	 * change to the picture, so it is reported as a staging of its own. */
 	bool signal_armed;
+	bool signal_is_stage;
+	bool signal_staged;
 	struct warp_zoom_view signal_view;
 	const char *signal_change;
 	char signal_preset[128];
@@ -323,6 +371,17 @@ void warp_zoom_control_adjust(struct warp_zoom_control *ctl, float factor, int g
 /* moves the view by a fraction of what is on screen */
 void warp_zoom_control_pan(struct warp_zoom_control *ctl, float dx, float dy, int glide_ms);
 void warp_zoom_control_reset(struct warp_zoom_control *ctl, int glide_ms);
+
+/* Whether changes are lined up rather than going to air. Turning it off drops
+ * whatever was waiting: switching out of confirm mode must not put a shot up
+ * that nobody took. */
+void warp_zoom_control_set_confirm(struct warp_zoom_control *ctl, bool confirm);
+bool warp_zoom_control_confirm(struct warp_zoom_control *ctl);
+/* the shot that is lined up, if there is one */
+bool warp_zoom_control_staged(struct warp_zoom_control *ctl, struct warp_zoom_view *out);
+/* puts the staged shot on screen, easing into it the way a recall does */
+bool warp_zoom_control_take(struct warp_zoom_control *ctl);
+bool warp_zoom_control_drop(struct warp_zoom_control *ctl);
 /* Puts the view back to the whole picture without a word: this is a video
  * starting, not a change someone asked for. */
 void warp_zoom_control_restore_default(struct warp_zoom_control *ctl);
@@ -365,6 +424,12 @@ void warp_zoom_source_set(obs_source_t *source, const struct warp_zoom_view *vie
 void warp_zoom_source_adjust(obs_source_t *source, float factor, int glide_ms);
 void warp_zoom_source_pan(obs_source_t *source, float dx, float dy, int glide_ms);
 void warp_zoom_source_reset(obs_source_t *source, int glide_ms);
+/* how the source is framed, what is lined up behind it, and whether it stages
+ * changes at all; every out parameter may be NULL */
+bool warp_zoom_source_stage(obs_source_t *source, struct warp_zoom_view *staged, bool *is_staged, bool *confirm);
+void warp_zoom_source_set_confirm(obs_source_t *source, bool confirm);
+bool warp_zoom_source_take(obs_source_t *source);
+bool warp_zoom_source_drop(obs_source_t *source);
 bool warp_zoom_source_recall(obs_source_t *source, const char *id_or_name);
 bool warp_zoom_source_recall_slot(obs_source_t *source, int slot);
 /* the presets of a source, as the array they are saved as, or NULL */

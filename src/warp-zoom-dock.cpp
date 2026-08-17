@@ -24,6 +24,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <obs-frontend-api.h>
 
 #include <graphics/vec4.h>
+#include <util/config-file.h>
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -41,6 +42,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QListWidget>
 #include <QMainWindow>
 #include <QMessageBox>
+#include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPushButton>
@@ -78,6 +80,35 @@ constexpr float WARP_ZOOM_DOCK_PAN = WARP_ZOOM_PAN_STEP;
 /* the speeds the dock offers as buttons, which are the ones the speed hotkeys
  * are bound to */
 const int warpZoomSpeeds[] = {25, 50, 100, 150, 200};
+
+/* Where the dock remembers how it was left. This is how an operator likes to
+ * work rather than anything about the show, so it lives in the user's own
+ * config instead of the scene collection. */
+constexpr const char *WARP_ZOOM_CFG_SECTION = "WarpZoom";
+constexpr const char *WARP_ZOOM_CFG_MINIMAL = "Minimal";
+
+bool warpZoomMinimalSetting()
+{
+	config_t *cfg = obs_frontend_get_user_config();
+
+	if (!cfg)
+		return false;
+
+	config_set_default_bool(cfg, WARP_ZOOM_CFG_SECTION, WARP_ZOOM_CFG_MINIMAL, false);
+
+	return config_get_bool(cfg, WARP_ZOOM_CFG_SECTION, WARP_ZOOM_CFG_MINIMAL);
+}
+
+void warpZoomSetMinimalSetting(bool minimal)
+{
+	config_t *cfg = obs_frontend_get_user_config();
+
+	if (!cfg)
+		return;
+
+	config_set_bool(cfg, WARP_ZOOM_CFG_SECTION, WARP_ZOOM_CFG_MINIMAL, minimal);
+	config_save_safe(cfg, "tmp", nullptr);
+}
 
 /* ------------------------------------------------------------------------- */
 /* the things that can be framed
@@ -285,6 +316,15 @@ public:
 		update();
 	}
 
+	/* The shot being lined up, which is what the picture shows while there
+	 * is one: an operator judges a framing by looking at it, not at a box. */
+	void setStage(const warp_zoom_view &view, bool is_staged)
+	{
+		stage = view;
+		staged = is_staged;
+		update();
+	}
+
 	void setLive(bool value)
 	{
 		if (live == value)
@@ -317,13 +357,67 @@ protected:
 				     area.y() + (area.height() - scaled.height()) / 2),
 			      scaled);
 
-		painter.drawImage(shown, picture);
+		if (staged)
+			drawStaged(painter);
+		else
+			painter.drawImage(shown, picture);
 
 		drawMinimap(painter);
+		drawBadge(painter);
+	}
+
+	/* Draws the staged shot out of the picture that is on air.
+	 *
+	 * The only pixels anyone has are the ones the source is putting out,
+	 * framed as it is now, so a shot lined up inside that - which is what
+	 * tightening in from a wider shot always is - is exact. A shot that
+	 * reaches outside it cannot be drawn from what we have, and those parts
+	 * are left as hatching rather than invented. */
+	void drawStaged(QPainter &painter)
+	{
+		float live_window = 1.0f / framing.zoom;
+		float stage_window = 1.0f / stage.zoom;
+
+		/* the staged window, in fractions of the picture on screen */
+		double u0 = ((stage.x - stage_window * 0.5f) - (framing.x - live_window * 0.5f)) / live_window;
+		double v0 = ((stage.y - stage_window * 0.5f) - (framing.y - live_window * 0.5f)) / live_window;
+		double du = stage_window / live_window;
+
+		QRectF source(u0 * picture.width(), v0 * picture.height(), du * picture.width(), du * picture.height());
+		QRectF have = source.intersected(QRectF(0, 0, picture.width(), picture.height()));
+
+		painter.fillRect(shown, QBrush(QColor(70, 70, 74), Qt::BDiagPattern));
+
+		if (have.isEmpty() || source.width() <= 0.0 || source.height() <= 0.0)
+			return;
+
+		/* whatever part of the shot we do have goes in the matching part
+		 * of the frame, so it stays where it belongs in the composition */
+		QRectF target(shown.x() + (have.left() - source.left()) / source.width() * shown.width(),
+			      shown.y() + (have.top() - source.top()) / source.height() * shown.height(),
+			      have.width() / source.width() * shown.width(),
+			      have.height() / source.height() * shown.height());
+
+		painter.drawImage(target, picture, have);
+
+		painter.setPen(QPen(QColor(224, 152, 44), 2));
+		painter.drawRect(QRectF(shown).adjusted(1, 1, -1, -1));
+	}
+
+	void drawBadge(QPainter &painter)
+	{
+		QRect box = shown.adjusted(6, 4, -6, -4);
 
 		painter.setPen(QColor(255, 255, 255));
-		painter.drawText(shown.adjusted(6, 4, -6, -4), Qt::AlignLeft | Qt::AlignTop,
-				 QString("%1%").arg(qRound(framing.zoom * 100.0f)));
+		painter.drawText(box, Qt::AlignLeft | Qt::AlignTop, QString("%1%").arg(qRound(framing.zoom * 100.0f)));
+
+		if (!staged)
+			return;
+
+		painter.setPen(QColor(224, 152, 44));
+		painter.drawText(
+			box, Qt::AlignRight | Qt::AlignTop,
+			QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Staged")).arg(qRound(stage.zoom * 100.0f)));
 	}
 
 	void mousePressEvent(QMouseEvent *event) override
@@ -352,7 +446,12 @@ protected:
 		/* The picture follows the cursor: moving the mouse right moves
 		 * what is shown right, which means the window it is taken from
 		 * moves left. A drag is direct handling rather than a nudge, so
-		 * it is not eased - the picture stays under the finger. */
+		 * it is not eased - the picture stays under the finger.
+		 *
+		 * While a shot is being lined up the drag moves that one
+		 * instead. Either way the picture on screen is the window being
+		 * moved, and panning works in fractions of that window, so the
+		 * same fraction of the widget is the right amount to ask for. */
 		onPan(-(float)(delta.x() / shown.width()), -(float)(delta.y() / shown.height()));
 	}
 
@@ -381,22 +480,34 @@ private:
 	 * says how much is being left out and which way. */
 	void drawMinimap(QPainter &painter)
 	{
-		if (framing.zoom <= WARP_ZOOM_MIN)
+		if (framing.zoom <= WARP_ZOOM_MIN && !staged)
 			return;
 
 		const int size = 56;
 		QRect box(shown.right() - size - 8, shown.bottom() - (size * 9 / 16) - 8, size, size * 9 / 16);
-		float window = 1.0f / framing.zoom;
 
 		painter.setPen(QColor(255, 255, 255, 140));
 		painter.setBrush(QColor(0, 0, 0, 110));
 		painter.drawRect(box);
 
-		QRectF inner(box.x() + (framing.x - window * 0.5f) * box.width(),
-			     box.y() + (framing.y - window * 0.5f) * box.height(), window * box.width(),
+		/* what is on air, and the shot waiting behind it: with a stage up
+		 * the two boxes are what say where the move is going */
+		drawWindow(painter, box, framing, QColor(255, 255, 255, 150), QColor(255, 255, 255, 60));
+
+		if (staged)
+			drawWindow(painter, box, stage, QColor(224, 152, 44), QColor(224, 152, 44, 70));
+	}
+
+	void drawWindow(QPainter &painter, const QRect &box, const warp_zoom_view &view, const QColor &pen,
+			const QColor &fill)
+	{
+		float window = 1.0f / view.zoom;
+		QRectF inner(box.x() + (view.x - window * 0.5f) * box.width(),
+			     box.y() + (view.y - window * 0.5f) * box.height(), window * box.width(),
 			     window * box.height());
 
-		painter.setBrush(QColor(255, 255, 255, 60));
+		painter.setPen(pen);
+		painter.setBrush(fill);
 		painter.drawRect(inner);
 	}
 
@@ -404,6 +515,8 @@ private:
 	QRect shown;
 	QPointF last;
 	warp_zoom_view framing = warp_zoom_default_view();
+	warp_zoom_view stage = warp_zoom_default_view();
+	bool staged = false;
 	bool dragging = false;
 	bool live = false;
 };
@@ -622,12 +735,50 @@ public:
 		connect(refreshTimer, &QTimer::timeout, this, [this]() { refreshLists(); });
 		refreshTimer->start(WARP_ZOOM_REFRESH_MS);
 
+		setMinimal(warpZoomMinimalSetting());
 		refreshLists();
 	}
 
 	~WarpZoomDock() override { grabber.release(); }
 
+protected:
+	/* Full or Minimal, on the dock itself: a setting you choose once does
+	 * not deserve a control taking up room in a panel meant to be small. */
+	void contextMenuEvent(QContextMenuEvent *event) override
+	{
+		QMenu menu(this);
+		QAction *full = menu.addAction(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Mode.Full")));
+		QAction *small = menu.addAction(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Mode.Minimal")));
+
+		full->setCheckable(true);
+		small->setCheckable(true);
+		full->setChecked(!minimal);
+		small->setChecked(minimal);
+
+		QAction *picked = menu.exec(event->globalPos());
+
+		if (!picked)
+			return;
+
+		bool wanted = picked == small;
+
+		if (wanted == minimal)
+			return;
+
+		setMinimal(wanted);
+		warpZoomSetMinimalSetting(minimal);
+	}
+
 private:
+	/* Minimal drops the picture and nothing else: the pad, the presets and
+	 * the speed are what an operator works, and without the picture there
+	 * is no per-frame grab to pay for either. */
+	void setMinimal(bool value)
+	{
+		minimal = value;
+		preview->setVisible(!minimal);
+	}
+
 	void build()
 	{
 		auto *layout = new QVBoxLayout(this);
@@ -667,31 +818,49 @@ private:
 		zoomRow->addWidget(zoomSlider, 1);
 		zoomRow->addWidget(zoomLabel);
 
-		/* the pad: the four directions around a reset, with the zoom
-		 * either side, laid out the way a PTZ desk is */
+		/* The pad: eight directions around a reset, with the zoom either
+		 * side, laid out the way a PTZ desk is. A corner moves a full
+		 * step on both axes, the way a joystick held into its corner
+		 * covers more ground than one pushed straight. */
 		auto *pad = new QGridLayout();
 		auto *up = new QPushButton(QString::fromUtf8("▲"), this);
 		auto *down = new QPushButton(QString::fromUtf8("▼"), this);
 		auto *left = new QPushButton(QString::fromUtf8("◀"), this);
 		auto *right = new QPushButton(QString::fromUtf8("▶"), this);
+		auto *upLeft = new QPushButton(QString::fromUtf8("◤"), this);
+		auto *upRight = new QPushButton(QString::fromUtf8("◥"), this);
+		auto *downLeft = new QPushButton(QString::fromUtf8("◣"), this);
+		auto *downRight = new QPushButton(QString::fromUtf8("◢"), this);
 		auto *in = new QPushButton(QString::fromUtf8("+"), this);
 		auto *out = new QPushButton(QString::fromUtf8("−"), this);
 
 		resetButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Reset")), this);
 		resetButton->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Reset.Desc")));
 
-		pad->addWidget(out, 1, 0);
+		pad->addWidget(upLeft, 0, 1);
 		pad->addWidget(up, 0, 2);
+		pad->addWidget(upRight, 0, 3);
+		pad->addWidget(out, 1, 0);
 		pad->addWidget(left, 1, 1);
 		pad->addWidget(resetButton, 1, 2);
 		pad->addWidget(right, 1, 3);
-		pad->addWidget(down, 2, 2);
 		pad->addWidget(in, 1, 4);
+		pad->addWidget(downLeft, 2, 1);
+		pad->addWidget(down, 2, 2);
+		pad->addWidget(downRight, 2, 3);
 
 		connect(up, &QPushButton::clicked, this, [this]() { pan(0.0f, -WARP_ZOOM_DOCK_PAN, -1); });
 		connect(down, &QPushButton::clicked, this, [this]() { pan(0.0f, WARP_ZOOM_DOCK_PAN, -1); });
 		connect(left, &QPushButton::clicked, this, [this]() { pan(-WARP_ZOOM_DOCK_PAN, 0.0f, -1); });
 		connect(right, &QPushButton::clicked, this, [this]() { pan(WARP_ZOOM_DOCK_PAN, 0.0f, -1); });
+		connect(upLeft, &QPushButton::clicked, this,
+			[this]() { pan(-WARP_ZOOM_DOCK_PAN, -WARP_ZOOM_DOCK_PAN, -1); });
+		connect(upRight, &QPushButton::clicked, this,
+			[this]() { pan(WARP_ZOOM_DOCK_PAN, -WARP_ZOOM_DOCK_PAN, -1); });
+		connect(downLeft, &QPushButton::clicked, this,
+			[this]() { pan(-WARP_ZOOM_DOCK_PAN, WARP_ZOOM_DOCK_PAN, -1); });
+		connect(downRight, &QPushButton::clicked, this,
+			[this]() { pan(WARP_ZOOM_DOCK_PAN, WARP_ZOOM_DOCK_PAN, -1); });
 		connect(in, &QPushButton::clicked, this, [this]() { adjust(WARP_ZOOM_STEP, -1); });
 		connect(out, &QPushButton::clicked, this, [this]() { adjust(1.0f / WARP_ZOOM_STEP, -1); });
 		connect(resetButton, &QPushButton::clicked, this, [this]() {
@@ -699,6 +868,53 @@ private:
 
 			if (source)
 				warp_zoom_source_reset(source, -1);
+		});
+
+		/* Lining a shot up before it goes to air. The take and drop
+		 * buttons are only there while something is waiting, so the row
+		 * carries nothing dead. */
+		confirm = new QCheckBox(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Confirm")), this);
+		confirm->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Confirm.Desc")));
+
+		takeButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Take")), this);
+		dropButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Drop")), this);
+
+		takeButton->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Take.Desc")));
+		takeButton->setVisible(false);
+		dropButton->setVisible(false);
+
+		auto *confirmRow = new QHBoxLayout();
+
+		confirmRow->addWidget(confirm, 1);
+		confirmRow->addWidget(takeButton);
+		confirmRow->addWidget(dropButton);
+
+		connect(confirm, &QCheckBox::toggled, this, [this](bool on) {
+			OBSSourceAutoRelease source = zoomSource();
+
+			if (loading || !source)
+				return;
+
+			warp_zoom_source_set_confirm(source, on);
+			refreshView();
+		});
+
+		connect(takeButton, &QPushButton::clicked, this, [this]() {
+			OBSSourceAutoRelease source = zoomSource();
+
+			if (source)
+				warp_zoom_source_take(source);
+
+			refreshView();
+		});
+
+		connect(dropButton, &QPushButton::clicked, this, [this]() {
+			OBSSourceAutoRelease source = zoomSource();
+
+			if (source)
+				warp_zoom_source_drop(source);
+
+			refreshView();
 		});
 
 		/* presets */
@@ -750,10 +966,11 @@ private:
 
 			warp_zoom_view view;
 
-			/* the framing it is heading for, so keeping a shot
-			 * partway through a move keeps the shot rather than
-			 * wherever the move had got to */
-			if (warp_zoom_source_get(source, nullptr, &view))
+			/* Whatever is being looked at: the shot lined up when
+			 * there is one, and otherwise the framing it is heading
+			 * for, so keeping a shot partway through a move keeps
+			 * the shot rather than wherever the move had got to. */
+			if (framingNow(source, &view))
 				warp_zoom_source_update_preset(source, WARP_UTF8(id), nullptr, &view, -1);
 
 			refreshLists();
@@ -837,7 +1054,9 @@ private:
 
 			warp_zoom_view view;
 
-			warp_zoom_source_get(source, nullptr, &view);
+			if (!framingNow(source, &view))
+				return;
+
 			view.zoom = (float)value / 100.0f;
 			warp_zoom_source_set(source, &view, -1);
 		});
@@ -851,6 +1070,7 @@ private:
 		layout->addWidget(preview, 1);
 		layout->addLayout(zoomRow);
 		layout->addLayout(pad);
+		layout->addLayout(confirmRow);
 		layout->addWidget(new QLabel(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Presets")), this));
 		layout->addWidget(presets, 1);
 		layout->addLayout(presetButtons);
@@ -859,6 +1079,18 @@ private:
 	}
 
 	obs_source_t *zoomSource() const { return warpZoomTargetSource(target); }
+
+	/* the framing the operator is looking at: the staged shot while one is
+	 * being lined up, and where the picture is heading otherwise */
+	static bool framingNow(obs_source_t *source, warp_zoom_view *out)
+	{
+		bool is_staged = false;
+
+		if (warp_zoom_source_stage(source, out, &is_staged, nullptr) && is_staged)
+			return true;
+
+		return warp_zoom_source_get(source, nullptr, out);
+	}
 
 	QString selectedPreset() const
 	{
@@ -958,6 +1190,18 @@ private:
 			index = 0;
 		}
 
+		/* A shot lined up on the source the dock has just left goes with
+		 * it: nobody is looking at it any more, and one left waiting is
+		 * a hazard the next time somebody presses take. */
+		if (!held.isEmpty() && held != target) {
+			OBSSourceAutoRelease previous = warpZoomTargetSource(held);
+
+			if (previous)
+				warp_zoom_source_drop(previous);
+		}
+
+		held = target;
+
 		targets->setCurrentIndex(index);
 		targets->setEnabled(!follow->isChecked());
 
@@ -1004,16 +1248,33 @@ private:
 	{
 		OBSSourceAutoRelease source = zoomSource();
 		warp_zoom_view view = warp_zoom_default_view();
+		warp_zoom_view stage = warp_zoom_default_view();
 		bool have = source && warp_zoom_source_get(source, &view, nullptr);
+		bool is_staged = false;
+		bool confirming = false;
+
+		if (have)
+			warp_zoom_source_stage(source, &stage, &is_staged, &confirming);
 
 		loading = true;
 
 		zoomSlider->setEnabled(have);
 
-		if (!zoomSlider->isSliderDown())
-			zoomSlider->setValue((int)(view.zoom * 100.0f));
+		/* the slider and the number follow the shot being lined up when
+		 * there is one, since that is the one being worked on */
+		const warp_zoom_view &shown = is_staged ? stage : view;
 
-		zoomLabel->setText(QString("%1%").arg(qRound(view.zoom * 100.0f)));
+		if (!zoomSlider->isSliderDown())
+			zoomSlider->setValue((int)(shown.zoom * 100.0f));
+
+		zoomLabel->setText(QString("%1%").arg(qRound(shown.zoom * 100.0f)));
+
+		confirm->setEnabled(have);
+		confirm->setChecked(confirming);
+		takeButton->setVisible(is_staged);
+		dropButton->setVisible(is_staged);
+
+		preview->setStage(stage, is_staged);
 
 		OBSSourceAutoRelease parent = warpZoomParent(target);
 		calldata_t cd;
@@ -1050,6 +1311,13 @@ private:
 		if (!isVisible())
 			return;
 
+		if (minimal) {
+			/* nothing to draw, so nothing is rendered: the dock
+			 * costs only what its widgets cost while it is minimal */
+			refreshView();
+			return;
+		}
+
 		OBSSourceAutoRelease parent = warpZoomParent(target);
 
 		preview->setLive(parent != nullptr);
@@ -1060,6 +1328,9 @@ private:
 
 	QComboBox *targets = nullptr;
 	QCheckBox *follow = nullptr;
+	QCheckBox *confirm = nullptr;
+	QPushButton *takeButton = nullptr;
+	QPushButton *dropButton = nullptr;
 	WarpZoomPreview *preview = nullptr;
 	QSlider *zoomSlider = nullptr;
 	QLabel *zoomLabel = nullptr;
@@ -1076,8 +1347,12 @@ private:
 	QVector<WarpZoomTarget> chosen;
 	QStringList shownPresets;
 	WarpZoomTarget target;
+	/* what the dock was holding last time round, so leaving a source can
+	 * drop the shot it had waiting */
+	WarpZoomTarget held;
 	WarpZoomGrabber grabber;
 	bool loading = false;
+	bool minimal = false;
 };
 
 /* ------------------------------------------------------------------------- */

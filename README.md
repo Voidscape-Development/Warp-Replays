@@ -50,21 +50,41 @@ The picture is magnified inside the frame the source already fills. Nothing down
 * **Pan** anywhere inside the picture. The window is kept inside the video, so the edge of the video stays at the edge of the frame however far it is pushed: panning right at 400% stops the moment the right-hand edge of the file is at the right-hand edge of the screen.
 * **Presets**: a framing kept under a name, recalled with a smooth move. Every source has as many as it needs, plus a **Default** preset that is always the first in the list, is always the whole picture, and cannot be renamed, moved, overwritten or removed — whatever else is set up, there is always one way back.
 * **Moves glide** rather than jumping. A preset recall eases in and out over 400ms by default, and each preset can be given a glide of its own, so a wide establishing shot can ease in slowly while a tight punch-in snaps across. The zoom and pan hotkeys use a shorter glide, short enough that a held-down key runs its presses into one continuous move.
-* **Hotkeys**, per source, in Settings → Hotkeys: Zoom In, Zoom Out, Reset Zoom, Pan Left / Right / Up / Down, *Recall Zoom Preset 1* through *8*, and one hotkey per preset named after it. The numbered slots fire whichever preset is in that position, so their bindings survive a preset being renamed or removed mid-show; a preset's own hotkey follows it through a rename, because it is bound to the preset rather than to its name.
+* **Confirm framing**, off by default: with it on, nothing reframes the source on the spot. The dock, the hotkeys and the websocket line the shot up instead, and it goes to air when it is taken — see [lining a shot up](#lining-a-shot-up).
+* **Hotkeys**, per source, in Settings → Hotkeys: Zoom In, Zoom Out, Reset Zoom, Pan Left / Right / Up / Down and the four corners, Take and Drop Staged Framing, *Recall Zoom Preset 1* through *8*, and one hotkey per preset named after it. The numbered slots fire whichever preset is in that position, so their bindings survive a preset being renamed or removed mid-show; a preset's own hotkey follows it through a rename, because it is bound to the preset rather than to its name.
 * The **Zoom** group in the source properties sets how long moves take, and, on the Warp Zoom filter, the framing itself.
 
-Zoom In and Zoom Out multiply by 1.25 rather than adding a fixed amount, so a press feels the same at 600% as it does at 150%. Panning moves by a twentieth of what is on screen, which covers the same distance on the stream whatever the zoom is.
+Zoom In and Zoom Out multiply by 1.25 rather than adding a fixed amount, so a press feels the same at 600% as it does at 150%. Panning moves by a twentieth of what is on screen, which covers the same distance on the stream whatever the zoom is. The four corner directions move a full step on both axes at once, so pushing into a corner covers more ground than a straight press, the way a joystick held into its corner does.
 
 On the Warp sources the framing belongs to the **video**, not to the source: a playlist moving to its next file, and a clip landing in a Warp Media source, both put it back to the whole picture without a word, the same way the speed goes back to what the source is set to. Nothing about the framing is saved with those sources — the presets are, the framing is not, because it was that video's. The Warp Zoom filter is the other way round: dropped on a camera or a scene, it keeps the framing it was left with, like any other filter.
+
+#### Lining a shot up
+
+**Confirm framing** turns the zoom into a preview bus. With it on, nothing an operator does reframes the source on the spot: the shot is lined up first, and only goes to air when it is taken. It is a per-source setting, saved with the scene collection and set from either the dock or the source properties, so a replay feed can run on confirm while a camera stays direct.
+
+Everything that would reframe the source stages instead — dragging the picture, the pad, the zoom slider, a preset recall, Reset, the hotkeys and the websocket requests — so a hotkey behaves the way the dock says it will rather than the two disagreeing.
+
+While a shot is waiting:
+
+* The dock's picture shows **the shot you are building** rather than what is on air, so you judge the framing by looking at it. The only pixels anyone has are the ones the source is putting out, so a shot lined up inside the live one — which is what tightening in from a wider shot always is, including the whole-picture start every clip gets — is exact. A shot that reaches outside it cannot be drawn from what is there, and those parts are hatched rather than invented.
+* The corner map shows **both windows**: what is on air in white, and the shot waiting in amber.
+* **Take** puts it up, easing into it the way a preset recall does. **Cancel** drops it. Both have hotkeys of their own, so a shot lined up in the dock can be taken from a Stream Deck, and both are websocket requests.
+
+A shot that is never taken is dropped when the video changes — a playlist reaching its next file, or a clip landing in a Warp Media source — since it was composed against a video that is no longer playing. Turning confirm off drops it too: a framing goes to air because somebody took it, never because a setting was switched.
+
+Sources emit `warp_zoom_staged` as a shot is lined up, taken or dropped, so a control surface can follow it. A shot going to air is a `warp_zoom_changed` like any other, which is what a [Warp Detection filter](#warp-detection-filter) reacts to — it fires when the picture actually moves, not when the shot was lined up.
 
 #### The Warp Zoom dock
 
 A dock called **Warp Zoom** is added to OBS when the plugin loads — turn it on under Docks if it is not showing. It is the panel a framing is found from, laid out like a PTZ desk:
 
 * The **picture** the chosen source is putting out, framed as it is right now. **Drag it to pan** — the picture follows the cursor, so it is moved rather than aimed — and **roll the wheel to zoom** in and out around it. A dragged pan tracks the hand exactly rather than gliding behind it; everything else in the dock eases. A small map in the corner says where the framing sits in the whole picture once there is anything left out.
-* A **zoom slider**, and a pad of pan arrows around a **Reset**, for framing without the mouse on the picture.
+* A **zoom slider**, and an eight-way pad around a **Reset** — the four straight directions and the four corners — for framing without the mouse on the picture.
+* **Confirm framing**, with **Take** and **Cancel** appearing beside it while a shot is waiting.
 * The **presets** of that source. Double-click one, or press Recall, to move to it. **Keep…** stores the framing that is on screen right now under a name you type, the way a PTZ desk stores a shot; **Update** moves a preset that already exists to the framing on screen, keeping its name and its hotkey; Rename and Remove do what they say, and none of them are offered for the Default preset. The number in front of a preset is the numbered recall hotkey that fires it.
 * The **speed** the source is playing at, with the same preset speeds the hotkeys use — framing and speed being the two things ridden live.
+
+Right-click the dock for **Full** or **Minimal**. Minimal drops the picture and keeps everything else — the source list, the zoom, the pad, the presets and the speed — for an operator who frames from presets and the pad and would rather have the room. Nothing is rendered while it is minimal, so the dock costs only what its widgets cost. The choice is saved with your OBS user settings rather than with the scene collection, since it is how you like to work rather than anything about the show.
 
 The dock is pointed at one source with the list at the top, or set to **follow the active source**, in which case it frames whichever Warp source, or source carrying a Warp Zoom filter, is on program right now. Leave it off to set a framing on a feed before it goes on air.
 
@@ -128,9 +148,10 @@ warp_speed_changed(ptr source, int speed, int prev_speed, string change)
 warp_frames_stepped(ptr source, int frames)
 warp_media_action(ptr source, string action)
 warp_zoom_changed(ptr source, float zoom, float x, float y, string change, string preset)
+warp_zoom_staged(ptr source, bool staged, float zoom, float x, float y, string change, string preset)
 ```
 
-On `warp_zoom_changed`, `zoom` is 1 for the whole picture and up to 8 at the tightest, `x` and `y` are where the middle of what is shown sits in the file, and `change` is `manual`, `preset`, `reset` or `set`, with `preset` naming the preset when one was recalled. A Warp Zoom filter emits it on itself.
+On `warp_zoom_changed`, `zoom` is 1 for the whole picture and up to 8 at the tightest, `x` and `y` are where the middle of what is shown sits in the file, and `change` is `manual`, `preset`, `reset` or `set`, with `preset` naming the preset when one was recalled. A Warp Zoom filter emits it on itself. `warp_zoom_staged` reports a shot being [lined up](#lining-a-shot-up), and again with `staged` false as it is taken or dropped; nothing has moved on screen when it fires.
 
 For the rest, `change` is `set`, `increased` or `decreased`; `frames` is negative when stepping backward; `action` is `play`, `pause` or `restart`. The speed a file starts at is not a change: a playlist moving to its next file resets the speed without emitting anything. `warp_media_action` reports commands, so playback a source drives by itself — restarting as it goes on screen, the pause a frame step does first, a playlist rolling on to its next file — emits nothing.
 
@@ -189,6 +210,9 @@ Nine more frame the source rather than driving playback, and are the one group t
 | `SaveZoomPreset` | `name` | Keeps the framing the source has right now as a preset, and answers with its `presetId` |
 | `RemoveZoomPreset` | `preset` | Removes a preset. The Default preset cannot be removed and answers with an error |
 | `GetZoomPresets` | | Changes nothing, and answers with the presets |
+| `SetZoomConfirm` | `confirm` | Turns [lining shots up](#lining-a-shot-up) on or off for that source. Turning it off drops whatever was waiting |
+| `TakeZoom` | | Puts the shot that is lined up on air. Answers with an error when there is nothing waiting |
+| `DropZoom` | | Drops the shot that is lined up, leaving the picture where it is |
 
 `glide` is how long the move takes, in milliseconds; leave it out for the source's own preset glide, or send `0` for a move that lands at once. Every one of these answers with `zoomPresets`, so a control surface can lay out its buttons from the reply it already has.
 
@@ -207,7 +231,7 @@ Every response says whether the request was carried out, and reports where playb
 }
 ```
 
-Every response also reports `zoom`, `zoomX` and `zoomY` — how the source is framed, in percent — along with `zoomFilter` when the framing lives in a filter rather than in the source itself, so a zoom can be followed without asking for it separately. A Warp Playlist source also reports `playlistIndex` (-1 when nothing is playing), `playlistLength` and `currentFile`. A request that could not be carried out — no such source, a source that is not a Warp source, or a value outside the range the action takes — answers with `"success": false` and an `error` saying what was wrong, and changes nothing.
+Every response also reports `zoom`, `zoomX` and `zoomY` — how the source is framed, in percent — along with `zoomFilter` when the framing lives in a filter rather than in the source itself, so a zoom can be followed without asking for it separately. `zoomConfirm` says whether that source lines shots up, and `zoomStaged` whether one is waiting; when one is, `zoomStagedZoom`, `zoomStagedX` and `zoomStagedY` are the shot it would take. A Warp Playlist source also reports `playlistIndex` (-1 when nothing is playing), `playlistLength` and `currentFile`. A request that could not be carried out — no such source, a source that is not a Warp source, or a value outside the range the action takes — answers with `"success": false` and an `error` saying what was wrong, and changes nothing.
 
 The requests do exactly what the matching hotkeys do, including emitting the signals above, so a Warp Detection filter reacts to a speed change driven over the websocket the same way it reacts to the hotkey. The difference is that a hotkey only applies to a source that is on screen, because the operator is pressing it at whatever is in front of them, while a request names the source it means and is carried out whether or not it is being shown. `Restart` on a Warp Media source is the exception: the source only restarts playback while it is being shown, over the websocket as from the hotkey.
 
@@ -253,6 +277,8 @@ warp_zoom_pan(float dx, float dy, int glide)       warp_zoom_update_preset(strin
 warp_zoom_reset(int glide)                         warp_zoom_remove_preset(string id, out bool removed)
 warp_zoom_recall(string preset, int slot, out bool found)  warp_zoom_move_preset(string id, int delta, out bool moved)
 warp_zoom_presets(out string presets)
+warp_zoom_confirm(bool confirm, out bool state)    warp_zoom_take(out bool taken)
+warp_zoom_drop(out bool dropped)
 ```
 
 These take the zoom as a factor from 1 to 8 and the position from 0 to 1, rather than the percentages the websocket requests and the properties use. `warp_zoom_presets` answers with the presets as JSON, since a calldata cannot carry an array.
