@@ -1320,9 +1320,9 @@ private:
 	{
 		OBSSourceAutoRelease source = zoomSource();
 		warp_zoom_view view = warp_zoom_default_view();
-		warp_zoom_view target = warp_zoom_default_view();
+		warp_zoom_view heading = warp_zoom_default_view();
 		warp_zoom_view stage = warp_zoom_default_view();
-		bool have = source && warp_zoom_source_get(source, &view, &target);
+		bool have = source && warp_zoom_source_get(source, &view, &heading);
 		bool is_staged = false;
 		bool confirming = false;
 
@@ -1341,7 +1341,7 @@ private:
 		 * own destination behind the operator's hand, and a step taken
 		 * with the keys would be pulled back the moment it was made. The
 		 * picture itself shows the move, in the badge and the minimap. */
-		const warp_zoom_view &shown = is_staged ? stage : target;
+		const warp_zoom_view &shown = is_staged ? stage : heading;
 
 		if (!zoomSlider->isSliderDown())
 			zoomSlider->setValue((int)(shown.zoom * 100.0f));
