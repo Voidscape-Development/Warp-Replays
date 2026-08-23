@@ -23,7 +23,47 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <util/dstr.h>
 #include <util/platform.h>
 
+#include "warp-events.h"
 #include "warp-zoom.h"
+
+/* ------------------------------------------------------------------------- */
+/* the stacks the signals and the procs are carried on
+ *
+ * Every one of these is worked out from the parameters that go on it, the way
+ * WARP_CD_PARAM in warp-events.h describes: a stack that is short does not
+ * merely truncate, it drops parameters and says so in the log every time the
+ * call is made. Anything carrying a string an operator typed - a preset name or
+ * the presets themselves - has no length to size for at all, and is allocated
+ * instead. */
+
+/* The two zoom signals: the source, the view, how it got there, the name of the
+ * preset it came from, and whether a shot is being lined up or has gone. */
+#define WARP_ZOOM_CD_SIGNAL \
+	WARP_CD_STACK(WARP_CD_PARAM("source", sizeof(void *)) + 3 * WARP_CD_PARAM("zoom", sizeof(double)) + \
+		      WARP_CD_PARAM("change", sizeof(WARP_ZOOM_CHANGE_MANUAL)) + \
+		      WARP_CD_PARAM("preset", WARP_ZOOM_PRESET_NAME_MAX) + \
+		      WARP_CD_PARAM("staged", sizeof(bool)))
+
+/* The reply to warp_zoom_get, which is the widest of the procs: eleven
+ * parameters, none of them named longer than staged_zoom and none of them
+ * carrying more than a float. */
+#define WARP_ZOOM_CD_GET WARP_CD_STACK(11 * WARP_CD_PARAM("staged_zoom", sizeof(double)))
+
+/* a view and how long the move to it takes */
+#define WARP_ZOOM_CD_SET \
+	WARP_CD_STACK(3 * WARP_CD_PARAM("zoom", sizeof(double)) + WARP_CD_PARAM("glide", sizeof(long long)))
+/* a nudge: a factor, or a pair of deltas, and the glide */
+#define WARP_ZOOM_CD_NUDGE \
+	WARP_CD_STACK(2 * WARP_CD_PARAM("factor", sizeof(double)) + WARP_CD_PARAM("glide", sizeof(long long)))
+/* the glide on its own */
+#define WARP_ZOOM_CD_GLIDE WARP_CD_STACK(WARP_CD_PARAM("glide", sizeof(long long)))
+/* a flag in and a flag back out, which is as much as the confirm, take and drop
+ * procs carry */
+#define WARP_ZOOM_CD_FLAGS WARP_CD_STACK(2 * WARP_CD_PARAM("dropped", sizeof(bool)))
+/* recalling by slot, which names no preset */
+#define WARP_ZOOM_CD_SLOT \
+	WARP_CD_STACK(WARP_CD_PARAM("preset", sizeof("")) + WARP_CD_PARAM("slot", sizeof(long long)) + \
+		      WARP_CD_PARAM("found", sizeof(bool)))
 
 /* ------------------------------------------------------------------------- */
 /* the view
@@ -213,7 +253,7 @@ static void warp_zoom_unlock(struct warp_zoom_control *ctl)
 		return;
 
 	struct calldata cd;
-	uint8_t stack[256];
+	uint8_t stack[WARP_ZOOM_CD_SIGNAL];
 
 	calldata_init_fixed(&cd, stack, sizeof(stack));
 	calldata_set_ptr(&cd, "source", ctl->source);
@@ -1736,23 +1776,18 @@ static bool warp_zoom_call(obs_source_t *source, const char *proc, calldata_t *c
 
 bool warp_zoom_source_capable(obs_source_t *source)
 {
-	struct calldata cd;
-	uint8_t stack[256];
-	bool called;
-
-	if (!source)
-		return false;
-
-	calldata_init_fixed(&cd, stack, sizeof(stack));
-	called = warp_zoom_call(source, WARP_ZOOM_PROC_GET, &cd);
-
-	return called;
+	/* Whether the source answers warp_zoom_get at all, which is asked of
+	 * every source in the collection while the dock's lists are looked
+	 * over. The reply is thrown away, but it is still written, so it goes
+	 * through the same call as any other read rather than on a stack of its
+	 * own that would have to be kept the same size as this one. */
+	return warp_zoom_source_get(source, NULL, NULL);
 }
 
 bool warp_zoom_source_get(obs_source_t *source, struct warp_zoom_view *view, struct warp_zoom_view *target)
 {
 	struct calldata cd;
-	uint8_t stack[512];
+	uint8_t stack[WARP_ZOOM_CD_GET];
 	double value;
 
 	calldata_init_fixed(&cd, stack, sizeof(stack));
@@ -1788,7 +1823,7 @@ bool warp_zoom_source_get(obs_source_t *source, struct warp_zoom_view *view, str
 void warp_zoom_source_set(obs_source_t *source, const struct warp_zoom_view *view, int glide_ms)
 {
 	struct calldata cd;
-	uint8_t stack[256];
+	uint8_t stack[WARP_ZOOM_CD_SET];
 
 	calldata_init_fixed(&cd, stack, sizeof(stack));
 	calldata_set_float(&cd, "zoom", view->zoom);
@@ -1802,7 +1837,7 @@ void warp_zoom_source_set(obs_source_t *source, const struct warp_zoom_view *vie
 void warp_zoom_source_adjust(obs_source_t *source, float factor, int glide_ms)
 {
 	struct calldata cd;
-	uint8_t stack[256];
+	uint8_t stack[WARP_ZOOM_CD_NUDGE];
 
 	calldata_init_fixed(&cd, stack, sizeof(stack));
 	calldata_set_float(&cd, "factor", factor);
@@ -1814,7 +1849,7 @@ void warp_zoom_source_adjust(obs_source_t *source, float factor, int glide_ms)
 void warp_zoom_source_pan(obs_source_t *source, float dx, float dy, int glide_ms)
 {
 	struct calldata cd;
-	uint8_t stack[256];
+	uint8_t stack[WARP_ZOOM_CD_NUDGE];
 
 	calldata_init_fixed(&cd, stack, sizeof(stack));
 	calldata_set_float(&cd, "dx", dx);
@@ -1827,7 +1862,7 @@ void warp_zoom_source_pan(obs_source_t *source, float dx, float dy, int glide_ms
 void warp_zoom_source_reset(obs_source_t *source, int glide_ms)
 {
 	struct calldata cd;
-	uint8_t stack[128];
+	uint8_t stack[WARP_ZOOM_CD_GLIDE];
 
 	calldata_init_fixed(&cd, stack, sizeof(stack));
 	calldata_set_int(&cd, "glide", glide_ms);
@@ -1837,15 +1872,20 @@ void warp_zoom_source_reset(obs_source_t *source, int glide_ms)
 
 bool warp_zoom_source_recall(obs_source_t *source, const char *id_or_name)
 {
-	struct calldata cd;
-	uint8_t stack[256];
+	/* A preset is named by whoever recalls it, so there is no length to set
+	 * a stack aside for: this one is allocated. Recalling a shot is
+	 * something somebody does, not something that happens every frame, so
+	 * the allocation costs nothing worth saving. */
+	calldata_t cd;
 	bool found = false;
 
-	calldata_init_fixed(&cd, stack, sizeof(stack));
+	calldata_init(&cd);
 	calldata_set_string(&cd, "preset", id_or_name ? id_or_name : "");
 
 	if (warp_zoom_call(source, WARP_ZOOM_PROC_RECALL, &cd))
 		calldata_get_bool(&cd, "found", &found);
+
+	calldata_free(&cd);
 
 	return found;
 }
@@ -1853,7 +1893,7 @@ bool warp_zoom_source_recall(obs_source_t *source, const char *id_or_name)
 bool warp_zoom_source_recall_slot(obs_source_t *source, int slot)
 {
 	struct calldata cd;
-	uint8_t stack[256];
+	uint8_t stack[WARP_ZOOM_CD_SLOT];
 	bool found = false;
 
 	calldata_init_fixed(&cd, stack, sizeof(stack));
@@ -1869,7 +1909,7 @@ bool warp_zoom_source_recall_slot(obs_source_t *source, int slot)
 bool warp_zoom_source_stage(obs_source_t *source, struct warp_zoom_view *staged, bool *is_staged, bool *confirm)
 {
 	struct calldata cd;
-	uint8_t stack[512];
+	uint8_t stack[WARP_ZOOM_CD_GET];
 	double value;
 	bool flag = false;
 
@@ -1906,7 +1946,7 @@ bool warp_zoom_source_stage(obs_source_t *source, struct warp_zoom_view *staged,
 void warp_zoom_source_set_confirm(obs_source_t *source, bool confirm)
 {
 	struct calldata cd;
-	uint8_t stack[128];
+	uint8_t stack[WARP_ZOOM_CD_FLAGS];
 
 	calldata_init_fixed(&cd, stack, sizeof(stack));
 	calldata_set_bool(&cd, "confirm", confirm);
@@ -1917,7 +1957,7 @@ void warp_zoom_source_set_confirm(obs_source_t *source, bool confirm)
 bool warp_zoom_source_take(obs_source_t *source)
 {
 	struct calldata cd;
-	uint8_t stack[128];
+	uint8_t stack[WARP_ZOOM_CD_FLAGS];
 	bool taken = false;
 
 	calldata_init_fixed(&cd, stack, sizeof(stack));
@@ -1931,7 +1971,7 @@ bool warp_zoom_source_take(obs_source_t *source)
 bool warp_zoom_source_drop(obs_source_t *source)
 {
 	struct calldata cd;
-	uint8_t stack[128];
+	uint8_t stack[WARP_ZOOM_CD_FLAGS];
 	bool dropped = false;
 
 	calldata_init_fixed(&cd, stack, sizeof(stack));
@@ -1944,58 +1984,68 @@ bool warp_zoom_source_drop(obs_source_t *source)
 
 obs_data_array_t *warp_zoom_source_presets(obs_source_t *source)
 {
-	struct calldata cd;
-	uint8_t stack[256];
-	obs_data_array_t *array;
+	/* The whole preset list comes back as JSON, which is as long as the
+	 * presets are: no stack can be set aside for that, so this one is
+	 * allocated. */
+	calldata_t cd;
+	obs_data_array_t *array = NULL;
 	obs_data_t *wrapper;
 	const char *json;
 
-	calldata_init_fixed(&cd, stack, sizeof(stack));
+	calldata_init(&cd);
 
-	if (!warp_zoom_call(source, WARP_ZOOM_PROC_PRESETS, &cd))
+	if (!warp_zoom_call(source, WARP_ZOOM_PROC_PRESETS, &cd)) {
+		calldata_free(&cd);
 		return NULL;
+	}
 
 	json = calldata_string(&cd, "presets");
 
-	if (!json || !*json)
-		return NULL;
+	if (json && *json) {
+		wrapper = obs_data_create_from_json(json);
 
-	wrapper = obs_data_create_from_json(json);
+		if (wrapper) {
+			array = obs_data_get_array(wrapper, WARP_ZOOM_S_PRESETS);
+			obs_data_release(wrapper);
+		}
+	}
 
-	if (!wrapper)
-		return NULL;
-
-	array = obs_data_get_array(wrapper, WARP_ZOOM_S_PRESETS);
-	obs_data_release(wrapper);
+	calldata_free(&cd);
 
 	return array;
 }
 
 char *warp_zoom_source_save_preset(obs_source_t *source, const char *name)
 {
-	struct calldata cd;
-	uint8_t stack[512];
+	/* the name is typed by an operator and the id is made from it, so both
+	 * are as long as they are */
+	calldata_t cd;
+	char *saved = NULL;
 	const char *id;
 
-	calldata_init_fixed(&cd, stack, sizeof(stack));
+	calldata_init(&cd);
 	calldata_set_string(&cd, "name", name ? name : "");
 
-	if (!warp_zoom_call(source, WARP_ZOOM_PROC_SAVE_PRESET, &cd))
-		return NULL;
+	if (warp_zoom_call(source, WARP_ZOOM_PROC_SAVE_PRESET, &cd)) {
+		id = calldata_string(&cd, "id");
 
-	id = calldata_string(&cd, "id");
+		if (id && *id)
+			saved = bstrdup(id);
+	}
 
-	return id && *id ? bstrdup(id) : NULL;
+	calldata_free(&cd);
+
+	return saved;
 }
 
 bool warp_zoom_source_update_preset(obs_source_t *source, const char *id, const char *name,
 				    const struct warp_zoom_view *view, int glide_ms)
 {
-	struct calldata cd;
-	uint8_t stack[512];
+	/* names and ids again, so this one is allocated too */
+	calldata_t cd;
 	bool found = false;
 
-	calldata_init_fixed(&cd, stack, sizeof(stack));
+	calldata_init(&cd);
 	calldata_set_string(&cd, "id", id ? id : "");
 	calldata_set_string(&cd, "name", name ? name : "");
 
@@ -2011,36 +2061,40 @@ bool warp_zoom_source_update_preset(obs_source_t *source, const char *id, const 
 	if (warp_zoom_call(source, WARP_ZOOM_PROC_UPDATE_PRESET, &cd))
 		calldata_get_bool(&cd, "found", &found);
 
+	calldata_free(&cd);
+
 	return found;
 }
 
 bool warp_zoom_source_remove_preset(obs_source_t *source, const char *id)
 {
-	struct calldata cd;
-	uint8_t stack[256];
+	calldata_t cd;
 	bool removed = false;
 
-	calldata_init_fixed(&cd, stack, sizeof(stack));
+	calldata_init(&cd);
 	calldata_set_string(&cd, "id", id ? id : "");
 
 	if (warp_zoom_call(source, WARP_ZOOM_PROC_REMOVE_PRESET, &cd))
 		calldata_get_bool(&cd, "removed", &removed);
+
+	calldata_free(&cd);
 
 	return removed;
 }
 
 bool warp_zoom_source_move_preset(obs_source_t *source, const char *id, int delta)
 {
-	struct calldata cd;
-	uint8_t stack[256];
+	calldata_t cd;
 	bool moved = false;
 
-	calldata_init_fixed(&cd, stack, sizeof(stack));
+	calldata_init(&cd);
 	calldata_set_string(&cd, "id", id ? id : "");
 	calldata_set_int(&cd, "delta", delta);
 
 	if (warp_zoom_call(source, WARP_ZOOM_PROC_MOVE_PRESET, &cd))
 		calldata_get_bool(&cd, "moved", &moved);
+
+	calldata_free(&cd);
 
 	return moved;
 }
