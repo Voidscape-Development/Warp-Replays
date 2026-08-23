@@ -78,6 +78,12 @@ extern "C" {
  * cannot be allowed to grow without bound. */
 #define WARP_ZOOM_MAX_PRESETS 64
 
+/* How much of a preset's name is carried with a change, which is what the zoom
+ * signals say the shot came from. A name is kept whole in the preset itself and
+ * cut to this only on its way out, so the signals have a length to be sized
+ * for. */
+#define WARP_ZOOM_PRESET_NAME_MAX 128
+
 /* Settings the zoom of a source is saved with. The revision counts the edits
  * the presets have had: presets are made in the dock rather than in the
  * properties, so a properties window that was opened before a preset was made
@@ -293,7 +299,7 @@ struct warp_zoom_control {
 	struct warp_zoom_view stage;
 	int stage_glide;
 	const char *stage_change;
-	char stage_preset[128];
+	char stage_preset[WARP_ZOOM_PRESET_NAME_MAX];
 
 	uint32_t glide_ms;
 	uint32_t nudge_ms;
@@ -333,7 +339,7 @@ struct warp_zoom_control {
 	bool signal_staged;
 	struct warp_zoom_view signal_view;
 	const char *signal_change;
-	char signal_preset[128];
+	char signal_preset[WARP_ZOOM_PRESET_NAME_MAX];
 };
 
 /* ------------------------------------------------------------------------- */

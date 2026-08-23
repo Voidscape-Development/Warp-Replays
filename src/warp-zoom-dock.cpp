@@ -64,9 +64,16 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 namespace {
 
-/* how often the picture in the dock is redrawn, and how often the lists are
- * looked over for sources and presets that have come or gone */
+/* How often the picture in the dock is redrawn, and how often the lists are
+ * looked over for sources and presets that have come or gone.
+ *
+ * Grabbing the picture costs a render and a read back off the card, so the
+ * resting rate is the one a dock that is being watched needs. While something
+ * is being ridden - the zoom bar, or the picture under a drag - it is grabbed
+ * twice as often, so a move is seen as it is made rather than a frame or two
+ * after it. */
 constexpr int WARP_ZOOM_PREVIEW_MS = 66;
+constexpr int WARP_ZOOM_PREVIEW_RIDE_MS = 33;
 constexpr int WARP_ZOOM_REFRESH_MS = 1000;
 
 /* the longest side of the picture the dock grabs; a framing pad does not need
@@ -303,6 +310,9 @@ public:
 	 * and as the wheel is turned, as what to multiply the zoom by. */
 	std::function<void(float, float)> onPan;
 	std::function<void(float)> onZoom;
+	/* whether the picture is being held, so the dock can keep up with a
+	 * drag while there is one */
+	std::function<void(bool)> onHold;
 
 	void setImage(const QImage &image)
 	{
@@ -428,6 +438,9 @@ protected:
 		dragging = true;
 		last = event->position();
 		setCursor(Qt::ClosedHandCursor);
+
+		if (onHold)
+			onHold(true);
 	}
 
 	void mouseMoveEvent(QMouseEvent *event) override
@@ -458,6 +471,9 @@ protected:
 	void mouseReleaseEvent(QMouseEvent *event) override
 	{
 		UNUSED_PARAMETER(event);
+
+		if (dragging && onHold)
+			onHold(false);
 
 		dragging = false;
 		setCursor(Qt::OpenHandCursor);
@@ -802,6 +818,9 @@ private:
 		preview->onZoom = [this](float factor) {
 			adjust(factor, -1);
 		};
+		preview->onHold = [this](bool holding) {
+			setRiding(holding);
+		};
 
 		/* zoom */
 		zoomSlider = new QSlider(Qt::Horizontal, this);
@@ -1053,13 +1072,31 @@ private:
 				return;
 
 			warp_zoom_view view;
+			bool staging = false;
 
-			if (!framingNow(source, &view))
+			if (!framingNow(source, &view, &staging))
 				return;
 
 			view.zoom = (float)value / 100.0f;
-			warp_zoom_source_set(source, &view, -1);
+
+			/* Riding the bar is direct handling, the same as dragging
+			 * the picture: where the handle is put is where the
+			 * picture is, with nothing eased behind it. Naming no
+			 * glide - which is what this used to do - asks for the
+			 * source's preset glide instead, so every step of a drag
+			 * started a fresh move of most of a second and the
+			 * picture crawled along behind the handle without ever
+			 * catching it. A step from a click on the groove or from
+			 * the arrow keys is one move rather than a run of them,
+			 * so it is nudged the way the pad's presses are. */
+			warp_zoom_source_set(source, &view, zoomSlider->isSliderDown() ? 0 : WARP_ZOOM_NUDGE_MS);
+
+			warp_zoom_clamp(&view);
+			showFraming(view, staging);
 		});
+
+		connect(zoomSlider, &QSlider::sliderPressed, this, [this]() { setRiding(true); });
+		connect(zoomSlider, &QSlider::sliderReleased, this, [this]() { setRiding(false); });
 
 		connect(speedSlider, &QSlider::valueChanged, this, [this](int value) {
 			if (!loading)
@@ -1080,16 +1117,51 @@ private:
 
 	obs_source_t *zoomSource() const { return warpZoomTargetSource(target); }
 
-	/* the framing the operator is looking at: the staged shot while one is
-	 * being lined up, and where the picture is heading otherwise */
-	static bool framingNow(obs_source_t *source, warp_zoom_view *out)
+	/* The picture is grabbed twice as often while a control is being ridden,
+	 * so what the operator is doing is seen as they do it rather than at the
+	 * resting rate. */
+	void setRiding(bool riding)
+	{
+		int wanted = riding ? WARP_ZOOM_PREVIEW_RIDE_MS : WARP_ZOOM_PREVIEW_MS;
+
+		if (previewTimer && previewTimer->interval() != wanted)
+			previewTimer->setInterval(wanted);
+	}
+
+	/* The framing the operator is looking at: the staged shot while one is
+	 * being lined up, and where the picture is heading otherwise.
+	 * 'staging' answers whether a change made to it would be lined up
+	 * rather than go to air, which is what confirm mode says and is not the
+	 * same question as whether a shot is waiting already. */
+	static bool framingNow(obs_source_t *source, warp_zoom_view *out, bool *staging = nullptr)
 	{
 		bool is_staged = false;
+		bool confirming = false;
+		bool have = warp_zoom_source_stage(source, out, &is_staged, &confirming);
 
-		if (warp_zoom_source_stage(source, out, &is_staged, nullptr) && is_staged)
+		if (staging)
+			*staging = have && confirming;
+
+		if (have && is_staged)
 			return true;
 
 		return warp_zoom_source_get(source, nullptr, out);
+	}
+
+	/* What the readout says the framing is, without waiting for the next
+	 * tick of the preview timer. A control that answers fifteen times a
+	 * second reads as one that is lagging behind the hand on it, and saying
+	 * so costs a label and a repaint rather than another grab. */
+	void showFraming(const warp_zoom_view &view, bool staging)
+	{
+		zoomLabel->setText(QString("%1%").arg(qRound(view.zoom * 100.0f)));
+
+		/* in confirm mode nothing has moved on screen, so what is drawn
+		 * is the shot being lined up rather than the picture */
+		if (staging)
+			preview->setStage(view, true);
+		else
+			preview->setView(view);
 	}
 
 	QString selectedPreset() const
@@ -1248,8 +1320,9 @@ private:
 	{
 		OBSSourceAutoRelease source = zoomSource();
 		warp_zoom_view view = warp_zoom_default_view();
+		warp_zoom_view target = warp_zoom_default_view();
 		warp_zoom_view stage = warp_zoom_default_view();
-		bool have = source && warp_zoom_source_get(source, &view, nullptr);
+		bool have = source && warp_zoom_source_get(source, &view, &target);
 		bool is_staged = false;
 		bool confirming = false;
 
@@ -1260,9 +1333,15 @@ private:
 
 		zoomSlider->setEnabled(have);
 
-		/* the slider and the number follow the shot being lined up when
-		 * there is one, since that is the one being worked on */
-		const warp_zoom_view &shown = is_staged ? stage : view;
+		/* The slider and the number follow the shot being lined up when
+		 * there is one, since that is the one being worked on, and
+		 * otherwise what the picture was asked for rather than where the
+		 * move has got to: a control says what it has been set to. Read
+		 * from a move in flight instead, the handle would crawl to its
+		 * own destination behind the operator's hand, and a step taken
+		 * with the keys would be pulled back the moment it was made. The
+		 * picture itself shows the move, in the badge and the minimap. */
+		const warp_zoom_view &shown = is_staged ? stage : target;
 
 		if (!zoomSlider->isSliderDown())
 			zoomSlider->setValue((int)(shown.zoom * 100.0f));

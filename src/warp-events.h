@@ -24,6 +24,27 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define WARP_MEDIA_SOURCE_ID "warp_media_source"
 #define WARP_PLAYLIST_SOURCE_ID "warp_playlist_source"
 
+/* ------------------------------------------------------------------------- */
+/* fixed calldata stacks
+ *
+ * Signals and procs are handed their parameters on a stack the caller sets
+ * aside, which keeps an allocation off paths that run every frame. libobs does
+ * not grow one: a stack that fills up logs "Tried to go above fixed calldata
+ * stack size" and drops the parameter that overflowed along with every one
+ * after it, so a stack that is a few bytes short is not a tight fit but a call
+ * that half happens, over and over, with the log filling up behind it.
+ *
+ * The sizes below are therefore worked out from what is actually put in. A
+ * parameter costs its name and its value, each behind a length of its own, and
+ * the block ends with a length of zero. Names are passed as string literals so
+ * that sizeof counts the terminator libobs stores with them; where several
+ * parameters take the same kind of value, the longest of their names stands for
+ * all of them. */
+#define WARP_CD_PARAM(name, value_size) (sizeof(name) + (value_size) + sizeof(size_t) * 2)
+/* the stack a set of parameters needs: the zero length that ends the block, and
+ * a word over it, since libobs fills a stack only to just under its size */
+#define WARP_CD_STACK(params) ((params) + sizeof(size_t) * 2)
+
 /* number of percentage points each speed up/down hotkey press applies */
 #define WARP_SPEED_STEP 10
 
@@ -107,10 +128,22 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define WARP_MEDIA_LOAD_PLAY "play"
 #define WARP_MEDIA_LOAD_HOLD "hold"
 
+/* what each of the three signals below carries; 'change' and 'action' are one
+ * of the words listed above, so the longest of them is what they are sized for */
+#define WARP_CD_SPEED_CHANGED \
+	WARP_CD_STACK(WARP_CD_PARAM("source", sizeof(void *)) + \
+		      2 * WARP_CD_PARAM("prev_speed", sizeof(long long)) + \
+		      WARP_CD_PARAM("change", sizeof(WARP_SPEED_CHANGE_DECREASED)))
+#define WARP_CD_FRAMES_STEPPED \
+	WARP_CD_STACK(WARP_CD_PARAM("source", sizeof(void *)) + WARP_CD_PARAM("frames", sizeof(long long)))
+#define WARP_CD_MEDIA_ACTION \
+	WARP_CD_STACK(WARP_CD_PARAM("source", sizeof(void *)) + \
+		      WARP_CD_PARAM("action", sizeof(WARP_MEDIA_ACTION_RESTART)))
+
 static inline void warp_signal_speed_changed(obs_source_t *source, int speed, int prev_speed, const char *change)
 {
 	struct calldata cd;
-	uint8_t stack[256];
+	uint8_t stack[WARP_CD_SPEED_CHANGED];
 
 	calldata_init_fixed(&cd, stack, sizeof(stack));
 	calldata_set_ptr(&cd, "source", source);
@@ -124,7 +157,7 @@ static inline void warp_signal_speed_changed(obs_source_t *source, int speed, in
 static inline void warp_signal_frames_stepped(obs_source_t *source, int frames)
 {
 	struct calldata cd;
-	uint8_t stack[128];
+	uint8_t stack[WARP_CD_FRAMES_STEPPED];
 
 	calldata_init_fixed(&cd, stack, sizeof(stack));
 	calldata_set_ptr(&cd, "source", source);
@@ -136,7 +169,7 @@ static inline void warp_signal_frames_stepped(obs_source_t *source, int frames)
 static inline void warp_signal_media_action(obs_source_t *source, const char *action)
 {
 	struct calldata cd;
-	uint8_t stack[128];
+	uint8_t stack[WARP_CD_MEDIA_ACTION];
 
 	calldata_init_fixed(&cd, stack, sizeof(stack));
 	calldata_set_ptr(&cd, "source", source);
