@@ -45,7 +45,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPalette>
 #include <QPushButton>
+#include <QSizePolicy>
 #include <QSlider>
 #include <QSpinBox>
 #include <QTimer>
@@ -87,6 +89,26 @@ constexpr float WARP_ZOOM_DOCK_PAN = WARP_ZOOM_PAN_STEP;
 /* the speeds the dock offers as buttons, which are the ones the speed hotkeys
  * are bound to */
 const int warpZoomSpeeds[] = {25, 50, 100, 150, 200};
+
+/* How big the pad and the zoom beside it are drawn.
+ *
+ * The dock is meant to sit in a narrow column beside the preview, and a row of
+ * ordinary buttons puts a floor under how narrow that column can be. These
+ * give up their padding first and stop at a size that is still worth aiming a
+ * mouse at mid-show: comfortable at rest, and out of the way of a resize. */
+constexpr int WARP_ZOOM_PAD_SIZE = 24;
+constexpr int WARP_ZOOM_PAD_MIN = 18;
+
+void warpZoomCompact(QPushButton *button)
+{
+	button->setMinimumSize(WARP_ZOOM_PAD_MIN, WARP_ZOOM_PAD_MIN);
+	button->setMaximumSize(WARP_ZOOM_PAD_SIZE, WARP_ZOOM_PAD_SIZE);
+	button->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+	/* a pad worked during a show should not take the keyboard away from
+	 * whatever the operator is typing into */
+	button->setFocusPolicy(Qt::NoFocus);
+	button->setStyleSheet(QString::fromUtf8("padding: 0px;"));
+}
 
 /* Where the dock remembers how it was left. This is how an operator likes to
  * work rather than anything about the show, so it lives in the user's own
@@ -666,6 +688,7 @@ struct WarpZoomPresetRow {
 	QString name;
 	warp_zoom_view view;
 	int glide;
+	int path;
 	bool fixed;
 };
 
@@ -687,6 +710,7 @@ QVector<WarpZoomPresetRow> warpZoomReadPresets(obs_source_t *source)
 		row.view.x = (float)obs_data_get_double(item, WARP_ZOOM_P_X);
 		row.view.y = (float)obs_data_get_double(item, WARP_ZOOM_P_Y);
 		row.glide = (int)obs_data_get_int(item, WARP_ZOOM_P_GLIDE);
+		row.path = (int)obs_data_get_int(item, WARP_ZOOM_P_PATH);
 		row.fixed = obs_data_get_bool(item, WARP_ZOOM_P_FIXED);
 
 		rows.append(row);
@@ -698,12 +722,12 @@ QVector<WarpZoomPresetRow> warpZoomReadPresets(obs_source_t *source)
 	return rows;
 }
 
-/* How a preset reads in a list: the reset position says as much, and the ones
- * after it carry the number of the slot hotkey that fires them. */
+/* How a preset reads in a list: the reset position stands on its name, and the
+ * ones after it carry the number of the slot hotkey that fires them. */
 QString warpZoomPresetLabel(const WarpZoomPresetRow &row, int index)
 {
 	if (row.fixed)
-		return QString("%1 - %2").arg(row.name, QString::fromUtf8(obs_module_text("Warp.Zoom.Preset.Reset")));
+		return row.name;
 
 	if (index >= 1 && index <= WARP_ZOOM_SLOTS)
 		return QString("%1.  %2  (%3%)").arg(index).arg(row.name).arg(qRound(row.view.zoom * 100.0f));
@@ -733,6 +757,29 @@ void warpZoomSavePreset(QWidget *parent, obs_source_t *source)
 
 	bfree(id);
 }
+
+/* The reset position, drawn as what it is on a PTZ desk: the dot in the middle
+ * of the pad. A word does not fit in a button this small, and the dot is read
+ * at a glance by anyone who has worked a camera desk. */
+class WarpZoomDotButton : public QPushButton {
+public:
+	explicit WarpZoomDotButton(QWidget *parent = nullptr) : QPushButton(parent) {}
+
+protected:
+	void paintEvent(QPaintEvent *event) override
+	{
+		QPushButton::paintEvent(event);
+
+		QPainter painter(this);
+		qreal radius = qMin(width(), height()) * 0.17;
+
+		painter.setRenderHint(QPainter::Antialiasing, true);
+		painter.setPen(Qt::NoPen);
+		painter.setBrush(
+			palette().brush(isEnabled() ? QPalette::Active : QPalette::Disabled, QPalette::ButtonText));
+		painter.drawEllipse(QPointF(width() / 2.0, height() / 2.0), radius, radius);
+	}
+};
 
 /* ------------------------------------------------------------------------- */
 /* the dock */
@@ -803,13 +850,11 @@ private:
 		targets = new QComboBox(this);
 		targets->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
 
+		/* what the dropdown is set from when it is left to itself, so it
+		 * reads as the setting on the control above it rather than as
+		 * something competing with it for the same row */
 		follow = new QCheckBox(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Follow")), this);
 		follow->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Follow.Desc")));
-
-		auto *targetRow = new QHBoxLayout();
-
-		targetRow->addWidget(targets, 1);
-		targetRow->addWidget(follow);
 
 		preview = new WarpZoomPreview(this);
 		preview->onPan = [this](float dx, float dy) {
@@ -837,10 +882,12 @@ private:
 		zoomRow->addWidget(zoomSlider, 1);
 		zoomRow->addWidget(zoomLabel);
 
-		/* The pad: eight directions around a reset, with the zoom either
-		 * side, laid out the way a PTZ desk is. A corner moves a full
-		 * step on both axes, the way a joystick held into its corner
-		 * covers more ground than one pushed straight. */
+		/* The pad: eight directions around the reset dot, laid out the
+		 * way a PTZ desk is, with the zoom standing beside it as its
+		 * own column - in on top, out below - the way the rocker on a
+		 * camera desk sits to the right of the stick. A corner moves a
+		 * full step on both axes, the way a joystick held into its
+		 * corner covers more ground than one pushed straight. */
 		auto *pad = new QGridLayout();
 		auto *up = new QPushButton(QString::fromUtf8("▲"), this);
 		auto *down = new QPushButton(QString::fromUtf8("▼"), this);
@@ -853,20 +900,41 @@ private:
 		auto *in = new QPushButton(QString::fromUtf8("+"), this);
 		auto *out = new QPushButton(QString::fromUtf8("−"), this);
 
-		resetButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Reset")), this);
+		resetButton = new WarpZoomDotButton(this);
 		resetButton->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Reset.Desc")));
+		resetButton->setAccessibleName(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Reset")));
 
-		pad->addWidget(upLeft, 0, 1);
-		pad->addWidget(up, 0, 2);
-		pad->addWidget(upRight, 0, 3);
-		pad->addWidget(out, 1, 0);
-		pad->addWidget(left, 1, 1);
-		pad->addWidget(resetButton, 1, 2);
-		pad->addWidget(right, 1, 3);
-		pad->addWidget(in, 1, 4);
-		pad->addWidget(downLeft, 2, 1);
-		pad->addWidget(down, 2, 2);
-		pad->addWidget(downRight, 2, 3);
+		in->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.In")));
+		out->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Out")));
+
+		pad->addWidget(upLeft, 0, 0);
+		pad->addWidget(up, 0, 1);
+		pad->addWidget(upRight, 0, 2);
+		pad->addWidget(left, 1, 0);
+		pad->addWidget(resetButton, 1, 1);
+		pad->addWidget(right, 1, 2);
+		pad->addWidget(downLeft, 2, 0);
+		pad->addWidget(down, 2, 1);
+		pad->addWidget(downRight, 2, 2);
+		pad->addWidget(in, 0, 4);
+		pad->addWidget(out, 2, 4);
+
+		pad->setSpacing(2);
+		/* a gap between the two, so the zoom reads as a control of its
+		 * own rather than as a fourth column of the pad */
+		pad->setColumnMinimumWidth(3, 6);
+
+		for (QPushButton *button :
+		     {up, down, left, right, upLeft, upRight, downLeft, downRight, in, out, resetButton})
+			warpZoomCompact(button);
+
+		/* the pad keeps its size and sits in the middle of whatever
+		 * width the dock is given */
+		auto *padRow = new QHBoxLayout();
+
+		padRow->addStretch(1);
+		padRow->addLayout(pad);
+		padRow->addStretch(1);
 
 		connect(up, &QPushButton::clicked, this, [this]() { pan(0.0f, -WARP_ZOOM_DOCK_PAN, -1); });
 		connect(down, &QPushButton::clicked, this, [this]() { pan(0.0f, WARP_ZOOM_DOCK_PAN, -1); });
@@ -959,6 +1027,32 @@ private:
 		presetButtons->addWidget(removeButton);
 		presetButtons->addStretch(1);
 
+		/* The route the move to the picked preset takes, which is worth
+		 * changing while watching it happen rather than in a window
+		 * somewhere else: it is a thing you judge by eye. */
+		path = new QComboBox(this);
+		path->addItem(QString::fromUtf8(obs_module_text("Warp.Zoom.Preset.Path.Direct")),
+			      WARP_ZOOM_PATH_DIRECT);
+		path->addItem(QString::fromUtf8(obs_module_text("Warp.Zoom.Preset.Path.Arc")), WARP_ZOOM_PATH_ARC);
+		path->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Preset.Path.Desc")));
+
+		auto *pathRow = new QHBoxLayout();
+
+		pathRow->addWidget(new QLabel(QString::fromUtf8(obs_module_text("Warp.Zoom.Preset.Path")), this));
+		pathRow->addWidget(path, 1);
+
+		connect(path, &QComboBox::currentIndexChanged, this, [this](int index) {
+			OBSSourceAutoRelease source = zoomSource();
+			QString id = selectedPreset();
+
+			if (loading || !source || id.isEmpty() || index < 0)
+				return;
+
+			warp_zoom_source_update_preset(source, WARP_UTF8(id), nullptr, nullptr, -1,
+						       path->itemData(index).toInt());
+			refreshLists();
+		});
+
 		connect(recallButton, &QPushButton::clicked, this, [this]() { recall(presets->currentItem()); });
 
 		/* Recalling is a double-click or the button, never a single click:
@@ -990,7 +1084,7 @@ private:
 			 * for, so keeping a shot partway through a move keeps
 			 * the shot rather than wherever the move had got to. */
 			if (framingNow(source, &view))
-				warp_zoom_source_update_preset(source, WARP_UTF8(id), nullptr, &view, -1);
+				warp_zoom_source_update_preset(source, WARP_UTF8(id), nullptr, &view, -1, -1);
 
 			refreshLists();
 		});
@@ -1010,7 +1104,7 @@ private:
 
 			if (ok && !name.trimmed().isEmpty())
 				warp_zoom_source_update_preset(source, WARP_UTF8(id), WARP_UTF8(name.trimmed()),
-							       nullptr, -1);
+							       nullptr, -1, -1);
 
 			refreshLists();
 		});
@@ -1103,14 +1197,16 @@ private:
 				setSpeed(value);
 		});
 
-		layout->addLayout(targetRow);
+		layout->addWidget(targets);
+		layout->addWidget(follow);
 		layout->addWidget(preview, 1);
 		layout->addLayout(zoomRow);
-		layout->addLayout(pad);
+		layout->addLayout(padRow);
 		layout->addLayout(confirmRow);
 		layout->addWidget(new QLabel(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Presets")), this));
 		layout->addWidget(presets, 1);
 		layout->addLayout(presetButtons);
+		layout->addLayout(pathRow);
 		layout->addLayout(speedRow);
 		layout->addLayout(speedButtons);
 	}
@@ -1229,6 +1325,13 @@ private:
 		updateButton->setEnabled(editable);
 		renameButton->setEnabled(editable);
 		removeButton->setEnabled(editable);
+
+		loading = true;
+
+		path->setEnabled(editable);
+		path->setCurrentIndex(item ? path->findData(item->data(Qt::UserRole + 3).toInt()) : 0);
+
+		loading = false;
 	}
 
 	/* the sources that can be framed, and the presets of the one that is */
@@ -1290,16 +1393,22 @@ private:
 		QString selected = selectedPreset();
 
 		QStringList labels;
+		/* What the list is compared against, which is what is shown plus
+		 * what is carried without being shown: a preset whose route was
+		 * changed reads the same and still has to be taken again. */
+		QStringList shape;
 
-		for (int i = 0; i < rows.size(); i++)
+		for (int i = 0; i < rows.size(); i++) {
 			labels << warpZoomPresetLabel(rows[i], i);
+			shape << QString("%1\n%2").arg(labels.last()).arg(rows[i].path);
+		}
 
 		/* the list is rebuilt only when it has actually changed, so a
 		 * preset stays selected while the dock ticks over */
-		if (labels == shownPresets)
+		if (shape == shownPresets)
 			return;
 
-		shownPresets = labels;
+		shownPresets = shape;
 		presets->clear();
 
 		for (int i = 0; i < rows.size(); i++) {
@@ -1308,6 +1417,7 @@ private:
 			item->setData(Qt::UserRole, rows[i].id);
 			item->setData(Qt::UserRole + 1, rows[i].name);
 			item->setData(Qt::UserRole + 2, rows[i].fixed);
+			item->setData(Qt::UserRole + 3, rows[i].path);
 
 			if (rows[i].id == selected)
 				presets->setCurrentItem(item);
@@ -1406,6 +1516,7 @@ private:
 	}
 
 	QComboBox *targets = nullptr;
+	QComboBox *path = nullptr;
 	QCheckBox *follow = nullptr;
 	QCheckBox *confirm = nullptr;
 	QPushButton *takeButton = nullptr;
@@ -1475,12 +1586,19 @@ public:
 		glide->setSuffix(QString::fromUtf8(" ms"));
 		glide->setSpecialValueText(QString::fromUtf8(obs_module_text("Warp.Zoom.Preset.Glide.Default")));
 
+		path = new QComboBox(this);
+		path->addItem(QString::fromUtf8(obs_module_text("Warp.Zoom.Preset.Path.Direct")),
+			      WARP_ZOOM_PATH_DIRECT);
+		path->addItem(QString::fromUtf8(obs_module_text("Warp.Zoom.Preset.Path.Arc")), WARP_ZOOM_PATH_ARC);
+		path->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Preset.Path.Desc")));
+
 		auto *form = new QFormLayout();
 
 		form->addRow(QString::fromUtf8(obs_module_text("Warp.Zoom.Zoom")), zoom);
 		form->addRow(QString::fromUtf8(obs_module_text("Warp.Zoom.CentreX")), x);
 		form->addRow(QString::fromUtf8(obs_module_text("Warp.Zoom.CentreY")), y);
 		form->addRow(QString::fromUtf8(obs_module_text("Warp.Zoom.Preset.Glide")), glide);
+		form->addRow(QString::fromUtf8(obs_module_text("Warp.Zoom.Preset.Path")), path);
 
 		auto *applyButton =
 			new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Presets.Apply")), this);
@@ -1527,7 +1645,8 @@ public:
 			view.x = (float)(x->value() / 100.0);
 			view.y = (float)(y->value() / 100.0);
 
-			warp_zoom_source_update_preset(source, WARP_UTF8(id), nullptr, &view, glide->value());
+			warp_zoom_source_update_preset(source, WARP_UTF8(id), nullptr, &view, glide->value(),
+						       path->currentData().toInt());
 			refresh();
 		});
 
@@ -1546,7 +1665,7 @@ public:
 
 			if (ok && !name.trimmed().isEmpty())
 				warp_zoom_source_update_preset(source, WARP_UTF8(id), WARP_UTF8(name.trimmed()),
-							       nullptr, -1);
+							       nullptr, -1, -1);
 
 			refresh();
 		});
@@ -1636,12 +1755,14 @@ private:
 			x->setValue(rows[index].view.x * 100.0);
 			y->setValue(rows[index].view.y * 100.0);
 			glide->setValue(rows[index].glide);
+			path->setCurrentIndex(path->findData(rows[index].path));
 		}
 
 		zoom->setEnabled(editable);
 		x->setEnabled(editable);
 		y->setEnabled(editable);
 		glide->setEnabled(editable);
+		path->setEnabled(editable);
 	}
 
 	QComboBox *sources = nullptr;
@@ -1650,6 +1771,7 @@ private:
 	QDoubleSpinBox *x = nullptr;
 	QDoubleSpinBox *y = nullptr;
 	QSpinBox *glide = nullptr;
+	QComboBox *path = nullptr;
 
 	QVector<WarpZoomTarget> chosen;
 	QVector<WarpZoomPresetRow> rows;

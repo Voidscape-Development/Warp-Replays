@@ -1758,6 +1758,7 @@ static obs_properties_t *warp_playlist_getproperties(void *data)
 	obs_property_t *prop;
 
 	obs_properties_t *props = obs_properties_create();
+	obs_properties_t *playback;
 
 	dstr_copy(&filter, obs_module_text("Warp.FileFilter.AllMedia"));
 	dstr_cat(&filter, media_filter);
@@ -1783,6 +1784,24 @@ static obs_properties_t *warp_playlist_getproperties(void *data)
 		pthread_mutex_unlock(&s->mutex);
 	}
 
+	/* Speed and volume ride at the top, in a group of their own: they are
+	 * the two an operator reaches for while a clip is up, and everything
+	 * below them is set once when the source is built. */
+	playback = obs_properties_create();
+
+	prop = obs_properties_add_int_slider(playback, "speed_percent", obs_module_text("Warp.Video.Speed"),
+					     MP_SPEED_MIN, MP_SPEED_MAX, 1);
+	obs_property_int_set_suffix(prop, "%");
+	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.Speed.Desc"));
+
+	prop = obs_properties_add_int_slider(playback, "volume_percent", obs_module_text("Warp.Playlist.Volume"),
+					     WARP_PL_VOLUME_MIN, WARP_PL_VOLUME_MAX, 1);
+	obs_property_int_set_suffix(prop, "%");
+	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.Volume.Desc"));
+
+	obs_properties_add_group(props, "playback_group", obs_module_text("Warp.Playlist.Group.Playback"),
+				 OBS_GROUP_NORMAL, playback);
+
 	obs_properties_add_editable_list(props, "playlist", obs_module_text("Warp.Playlist.Files"),
 					 OBS_EDITABLE_LIST_TYPE_FILES, filter.array, path.array);
 	dstr_free(&filter);
@@ -1805,16 +1824,6 @@ static obs_properties_t *warp_playlist_getproperties(void *data)
 
 	obs_properties_add_group(props, "back_transition_group", obs_module_text("Warp.Playlist.Group.Transition.Back"),
 				 OBS_GROUP_NORMAL, warp_pl_transition_properties(s, WARP_PL_DIR_BACKWARD));
-
-	prop = obs_properties_add_int_slider(props, "speed_percent", obs_module_text("Warp.Video.Speed"), MP_SPEED_MIN,
-					     MP_SPEED_MAX, 1);
-	obs_property_int_set_suffix(prop, "%");
-	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.Speed.Desc"));
-
-	prop = obs_properties_add_int_slider(props, "volume_percent", obs_module_text("Warp.Playlist.Volume"),
-					     WARP_PL_VOLUME_MIN, WARP_PL_VOLUME_MAX, 1);
-	obs_property_int_set_suffix(prop, "%");
-	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.Volume.Desc"));
 
 	warp_zoom_control_properties(props, false);
 

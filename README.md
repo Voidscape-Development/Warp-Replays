@@ -79,16 +79,16 @@ Sources emit `warp_zoom_staged` as a shot is lined up, taken or dropped, so a co
 A dock called **Warp Zoom** is added to OBS when the plugin loads — turn it on under Docks if it is not showing. It is the panel a framing is found from, laid out like a PTZ desk:
 
 * The **picture** the chosen source is putting out, framed as it is right now. **Drag it to pan** — the picture follows the cursor, so it is moved rather than aimed — and **roll the wheel to zoom** in and out around it. A dragged pan tracks the hand exactly rather than gliding behind it; everything else in the dock eases. A small map in the corner says where the framing sits in the whole picture once there is anything left out.
-* A **zoom slider**, and an eight-way pad around a **Reset** — the four straight directions and the four corners — for framing without the mouse on the picture.
+* A **zoom slider**, and an eight-way pad — the four straight directions and the four corners — around a dot that resets the framing, with zoom in and out standing beside it as their own column. The pad and the zoom are kept small so the dock can be narrowed to a strip beside the picture.
 * **Confirm framing**, with **Take** and **Cancel** appearing beside it while a shot is waiting.
-* The **presets** of that source. Double-click one, or press Recall, to move to it. **Keep…** stores the framing that is on screen right now under a name you type, the way a PTZ desk stores a shot; **Update** moves a preset that already exists to the framing on screen, keeping its name and its hotkey; Rename and Remove do what they say, and none of them are offered for the Default preset. The number in front of a preset is the numbered recall hotkey that fires it.
+* The **presets** of that source. Double-click one, or press Recall, to move to it. **Save** stores the framing that is on screen right now under a name you type, the way a PTZ desk stores a shot; **Update** moves a preset that already exists to the framing on screen, keeping its name and its hotkey; Rename and Remove do what they say, and none of them are offered for the Default preset. The number in front of a preset is the numbered recall hotkey that fires it. **Path** says how the picture travels to the preset that is picked: *Direct* holds the shot in its place in the frame the whole way across, so the move lands without a swing, and *Arc* walks it across the picture at a flat rate instead, which throws it out to the side of the frame as the move starts and lets it creep back as the zoom catches up.
 * The **speed** the source is playing at, with the same preset speeds the hotkeys use — framing and speed being the two things ridden live.
 
 Right-click the dock for **Full** or **Minimal**. Minimal drops the picture and keeps everything else — the source list, the zoom, the pad, the presets and the speed — for an operator who frames from presets and the pad and would rather have the room. Nothing is rendered while it is minimal, so the dock costs only what its widgets cost. The choice is saved with your OBS user settings rather than with the scene collection, since it is how you like to work rather than anything about the show.
 
 The dock is pointed at one source with the list at the top, or set to **follow the active source**, in which case it frames whichever Warp source, or source carrying a Warp Zoom filter, is on program right now. Leave it off to set a framing on a feed before it goes on air.
 
-Presets can also be set up by number, which is what the **Zoom Presets…** button in the [Warp window](#warp-flows) opens: every source that can be zoomed, its presets, and the zoom, centre and glide of each one written out.
+Presets can also be set up by number, which is what the **Zoom Presets…** button in the [Warp window](#warp-flows) opens: every source that can be zoomed, its presets, and the zoom, centre, glide and path of each one written out.
 
 #### The Warp Zoom filter
 
