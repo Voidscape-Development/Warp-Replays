@@ -103,7 +103,28 @@ extern "C" {
 #define WARP_ZOOM_P_X "x"
 #define WARP_ZOOM_P_Y "y"
 #define WARP_ZOOM_P_GLIDE "glide_ms"
+#define WARP_ZOOM_P_PATH "path"
 #define WARP_ZOOM_P_FIXED "fixed"
+
+/* The route the picture takes on the way to a preset.
+ *
+ * The window is always kept inside the picture, so how far the middle of a shot
+ * may sit from the centre of it depends on how far in it is zoomed: at 100%
+ * there is nowhere to go at all, and the room opens up as the zoom comes in.
+ *
+ * Arc walks the middle of the shot across the picture at a flat rate, which
+ * takes no account of that. Early in a move that zooms in, while the picture is
+ * still wide, a small step across it is most of the travel the frame allows, so
+ * the shot is thrown out to the side of the frame in the first tenth of the
+ * move and creeps back to where it belongs as the zoom catches up - and the
+ * same in reverse on the way out, where it hangs at the side and snaps back at
+ * the last moment. That swing is the motion Warp had before there was a choice.
+ *
+ * Direct works in the frame instead: the shot holds its place in the frame the
+ * whole way across, so it travels evenly and lands without a swing. Presets
+ * written before there was a choice are Direct. */
+#define WARP_ZOOM_PATH_DIRECT 0
+#define WARP_ZOOM_PATH_ARC 1
 
 /* the view a source that keeps one is saved with */
 #define WARP_ZOOM_S_ZOOM "zoom"
@@ -202,6 +223,8 @@ struct warp_zoom_preset {
 	struct warp_zoom_view view;
 	/* how long moving to this preset takes; zero uses the source's own */
 	uint32_t glide_ms;
+	/* the route the move takes, one of WARP_ZOOM_PATH_* */
+	int path;
 	obs_hotkey_id hotkey;
 };
 
@@ -290,6 +313,9 @@ struct warp_zoom_control {
 	struct warp_zoom_view target;
 	float glide_elapsed;
 	float glide_len;
+	/* the route that move is taking; only a preset asks for anything but
+	 * the direct one */
+	int glide_path;
 
 	/* Confirm mode, and the shot lined up behind it. Nothing about the
 	 * staged shot is on screen: it waits here until it is taken, and is
@@ -298,6 +324,7 @@ struct warp_zoom_control {
 	bool staged;
 	struct warp_zoom_view stage;
 	int stage_glide;
+	int stage_path;
 	const char *stage_change;
 	char stage_preset[WARP_ZOOM_PRESET_NAME_MAX];
 
@@ -400,11 +427,12 @@ bool warp_zoom_control_recall(struct warp_zoom_control *ctl, const char *id_or_n
  * 'view' is NULL to keep the view the source is framed with right now. */
 char *warp_zoom_control_add_preset(struct warp_zoom_control *ctl, const char *name, const struct warp_zoom_view *view,
 				   int glide_ms);
-/* Applies whichever of the three a caller passes to a preset that is already
+/* Applies whichever of the four a caller passes to a preset that is already
  * there: 'name' to rename it, 'view' to reframe it, 'glide_ms' from zero up to
- * change how long the move to it takes, -1 to leave it alone. */
+ * change how long the move to it takes, 'path' from zero up to change the route
+ * it takes, -1 for either to leave it alone. */
 bool warp_zoom_control_update_preset(struct warp_zoom_control *ctl, const char *id, const char *name,
-				     const struct warp_zoom_view *view, int glide_ms);
+				     const struct warp_zoom_view *view, int glide_ms, int path);
 bool warp_zoom_control_remove_preset(struct warp_zoom_control *ctl, const char *id);
 /* moves a preset up or down the list, which is what the numbered recall
  * hotkeys go by */
@@ -442,7 +470,7 @@ bool warp_zoom_source_recall_slot(obs_source_t *source, int slot);
 obs_data_array_t *warp_zoom_source_presets(obs_source_t *source);
 char *warp_zoom_source_save_preset(obs_source_t *source, const char *name);
 bool warp_zoom_source_update_preset(obs_source_t *source, const char *id, const char *name,
-				    const struct warp_zoom_view *view, int glide_ms);
+				    const struct warp_zoom_view *view, int glide_ms, int path);
 bool warp_zoom_source_remove_preset(obs_source_t *source, const char *id);
 bool warp_zoom_source_move_preset(obs_source_t *source, const char *id, int delta);
 
