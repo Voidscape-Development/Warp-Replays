@@ -31,13 +31,14 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
+#include <QFontMetrics>
 #include <QFormLayout>
-#include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QImage>
 #include <QInputDialog>
 #include <QLabel>
+#include <QLayout>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMainWindow>
@@ -47,9 +48,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QPainter>
 #include <QPalette>
 #include <QPushButton>
+#include <QResizeEvent>
 #include <QSizePolicy>
 #include <QSlider>
 #include <QSpinBox>
+#include <QStyle>
+#include <QStyleOptionButton>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QVector>
@@ -92,23 +96,215 @@ const int warpZoomSpeeds[] = {25, 50, 100, 150, 200};
 
 /* How big the pad and the zoom beside it are drawn.
  *
- * The dock is meant to sit in a narrow column beside the preview, and a row of
- * ordinary buttons puts a floor under how narrow that column can be. These
- * give up their padding first and stop at a size that is still worth aiming a
- * mouse at mid-show: comfortable at rest, and out of the way of a resize. */
-constexpr int WARP_ZOOM_PAD_SIZE = 24;
+ * The pad is what a hand goes to mid-show, so it takes whatever room the dock
+ * has rather than sitting at one size: the buttons are square and grow with
+ * the dock's width up to something worth aiming at without looking, and give
+ * that back down to a still-usable minimum when the dock is squeezed into a
+ * strip beside the picture. The picture is the other thing a wide dock is for,
+ * so the pad stops well short of filling it - except with the picture put
+ * away, where the pad is what the panel is and is let grow further. */
 constexpr int WARP_ZOOM_PAD_MIN = 18;
+constexpr int WARP_ZOOM_PAD_MAX = 60;
+constexpr int WARP_ZOOM_PAD_MAX_MINIMAL = 96;
+
+/* between the buttons, and the least that stands between the pad and the zoom
+ * column, so the zoom reads as a control of its own rather than as a fourth
+ * column of the pad */
+constexpr int WARP_ZOOM_PAD_SPACING = 3;
+constexpr int WARP_ZOOM_PAD_GAP = 6;
+
+/* What the bars and their readouts hold open. A slider asks for a length worth
+ * dragging and a readout for room to say "1000%", and between them they set
+ * the floor for a dock that is meant to narrow to a strip; these are as small
+ * as either goes while still being worth having. */
+constexpr int WARP_ZOOM_SLIDER_MIN = 48;
+constexpr int WARP_ZOOM_READOUT_MIN = 36;
 
 void warpZoomCompact(QPushButton *button)
 {
-	button->setMinimumSize(WARP_ZOOM_PAD_MIN, WARP_ZOOM_PAD_MIN);
-	button->setMaximumSize(WARP_ZOOM_PAD_SIZE, WARP_ZOOM_PAD_SIZE);
-	button->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+	/* the pad hands out the geometry itself, so the button asks for
+	 * nothing of its own and takes what it is given */
+	button->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
 	/* a pad worked during a show should not take the keyboard away from
 	 * whatever the operator is typing into */
 	button->setFocusPolicy(Qt::NoFocus);
 	button->setStyleSheet(QString::fromUtf8("padding: 0px;"));
 }
+
+/* ------------------------------------------------------------------------- */
+/* rows that wrap
+ *
+ * A row of ordinary buttons is what puts a floor under how narrow a panel can
+ * be: five preset buttons side by side ask for more width than the pad and the
+ * picture put together. Laid out like this they take the next line down
+ * instead of holding the dock open, so the dock narrows to the width of one
+ * button and the labels stay words rather than becoming guesswork. */
+class WarpZoomFlow : public QLayout {
+public:
+	explicit WarpZoomFlow(int gap = 4)
+	{
+		setContentsMargins(0, 0, 0, 0);
+		setSpacing(gap);
+	}
+
+	~WarpZoomFlow() override
+	{
+		while (QLayoutItem *item = takeAt(0))
+			delete item;
+	}
+
+	void addItem(QLayoutItem *item) override { items.append(item); }
+
+	int count() const override { return (int)items.size(); }
+
+	QLayoutItem *itemAt(int index) const override { return items.value(index); }
+
+	QLayoutItem *takeAt(int index) override
+	{
+		if (index < 0 || index >= items.size())
+			return nullptr;
+
+		return items.takeAt(index);
+	}
+
+	Qt::Orientations expandingDirections() const override { return {}; }
+
+	bool hasHeightForWidth() const override { return true; }
+
+	int heightForWidth(int width) const override { return run(QRect(0, 0, width, 0), false); }
+
+	void setGeometry(const QRect &rect) override
+	{
+		QLayout::setGeometry(rect);
+		run(rect, true);
+	}
+
+	QSize sizeHint() const override { return minimumSize(); }
+
+	/* one button wide is as narrow as a row of them goes */
+	QSize minimumSize() const override
+	{
+		QMargins margins = contentsMargins();
+		QSize size;
+
+		for (QLayoutItem *item : items) {
+			if (item->isEmpty())
+				continue;
+
+			size = size.expandedTo(item->minimumSize());
+		}
+
+		return size + QSize(margins.left() + margins.right(), margins.top() + margins.bottom());
+	}
+
+private:
+	/* Walks the row, wrapping whatever does not fit onto the next line, and
+	 * answers how tall that came to. The take and cancel buttons are only
+	 * there while a shot is waiting, so anything hidden is stepped over
+	 * rather than left holding a space. */
+	int run(const QRect &outer, bool place) const
+	{
+		QMargins margins = contentsMargins();
+		QRect rect = outer.adjusted(margins.left(), margins.top(), -margins.right(), -margins.bottom());
+		int x = rect.x();
+		int y = rect.y();
+		int line = 0;
+
+		for (QLayoutItem *item : items) {
+			if (item->isEmpty())
+				continue;
+
+			/* a control wider than the dock is given the dock's
+			 * width and shortens what it says to suit */
+			QSize wanted = item->sizeHint().boundedTo(QSize(rect.width(), QWIDGETSIZE_MAX));
+
+			if (line && x + wanted.width() > rect.right() + 1) {
+				x = rect.x();
+				y += line + spacing();
+				line = 0;
+			}
+
+			if (place)
+				item->setGeometry(QRect(QPoint(x, y), wanted));
+
+			x += wanted.width() + spacing();
+			line = qMax(line, wanted.height());
+		}
+
+		return y + line - outer.y() + margins.bottom();
+	}
+
+	QList<QLayoutItem *> items;
+};
+
+/* A checkbox that gives up its words rather than the dock's width: the label
+ * is shortened to whatever room there is, with the whole of it in the tooltip.
+ * A sentence on a control is otherwise the widest thing in the panel and
+ * decides how narrow the panel can be. */
+class WarpZoomCheck : public QCheckBox {
+public:
+	explicit WarpZoomCheck(const QString &text, QWidget *parent = nullptr) : QCheckBox(text, parent), full(text)
+	{
+		setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+		setToolTip(text);
+	}
+
+	/* The room the whole label would want, asked for however short the one
+	 * on screen has been cut. Answered from the label as it stands, the
+	 * control would ask for less every time it was laid out - each answer
+	 * shorter than the last - and the words would walk off it a piece at a
+	 * time until there were none left. */
+	QSize sizeHint() const override
+	{
+		QSize hint = QCheckBox::sizeHint();
+
+		return QSize(hint.width() - fontMetrics().horizontalAdvance(text()) +
+				     fontMetrics().horizontalAdvance(full),
+			     hint.height());
+	}
+
+	/* the box and a word's worth beside it, which is as little as a control
+	 * that can still be read and aimed at comes down to */
+	QSize minimumSizeHint() const override
+	{
+		QSize hint = sizeHint();
+
+		return QSize(qMin(hint.width(), boxWidth() + fontMetrics().averageCharWidth() * 4), hint.height());
+	}
+
+protected:
+	void resizeEvent(QResizeEvent *event) override
+	{
+		QCheckBox::resizeEvent(event);
+		elide();
+	}
+
+private:
+	/* the box and the space beside it, which is what the words are left
+	 * with once the control itself has had its room */
+	int boxWidth() const
+	{
+		QStyleOptionButton option;
+
+		initStyleOption(&option);
+
+		return style()->pixelMetric(QStyle::PM_IndicatorWidth, &option, this) +
+		       style()->pixelMetric(QStyle::PM_CheckBoxLabelSpacing, &option, this) +
+		       style()->pixelMetric(QStyle::PM_FocusFrameHMargin, &option, this) * 2;
+	}
+
+	void elide()
+	{
+		QString shown = fontMetrics().elidedText(full, Qt::ElideRight, qMax(0, width() - boxWidth()));
+
+		/* set only when it has actually changed: a label put back the
+		 * same asks for the layout again and would not settle */
+		if (shown != text())
+			QCheckBox::setText(shown);
+	}
+
+	QString full;
+};
 
 /* Where the dock remembers how it was left. This is how an operator likes to
  * work rather than anything about the show, so it lives in the user's own
@@ -781,6 +977,123 @@ protected:
 	}
 };
 
+/* The pad itself: eight directions around the reset dot, with the zoom
+ * standing beside it as its own column.
+ *
+ * The buttons are placed by hand rather than by a grid, because what matters
+ * is that they stay square and as big as the dock's width allows: a grid would
+ * hand out whatever space there was and leave the arrows in letterboxes. The
+ * pad works out the biggest square that four columns of them fit into, lays
+ * itself out at that size, and sits in the middle of whatever it was given. */
+class WarpZoomPad : public QWidget {
+public:
+	explicit WarpZoomPad(QWidget *parent = nullptr) : QWidget(parent)
+	{
+		QSizePolicy policy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+
+		/* the buttons are square, so the row the pad sits in takes only
+		 * the height the width it was given works out to */
+		policy.setHeightForWidth(true);
+		setSizePolicy(policy);
+	}
+
+	/* Columns 0 to 2 are the pad; column 3 is the zoom beside it. */
+	void place(QWidget *widget, int row, int column)
+	{
+		Cell cell;
+
+		widget->setParent(this);
+
+		cell.widget = widget;
+		cell.row = row;
+		cell.column = column;
+
+		cells.append(cell);
+	}
+
+	/* How big a button is allowed to get, which is the whole difference
+	 * between the pad beside a picture and the pad on its own. */
+	void setLargest(int size)
+	{
+		if (largest == size)
+			return;
+
+		largest = size;
+		updateGeometry();
+		arrange();
+	}
+
+	bool hasHeightForWidth() const override { return true; }
+
+	int heightForWidth(int width) const override { return down(sizeFor(width)); }
+
+	QSize minimumSizeHint() const override { return QSize(across(WARP_ZOOM_PAD_MIN), down(WARP_ZOOM_PAD_MIN)); }
+
+	QSize sizeHint() const override { return QSize(across(largest), down(largest)); }
+
+protected:
+	void resizeEvent(QResizeEvent *event) override
+	{
+		QWidget::resizeEvent(event);
+		arrange();
+	}
+
+private:
+	struct Cell {
+		QWidget *widget;
+		int row;
+		int column;
+	};
+
+	/* the gap grows with the buttons, so the zoom keeps standing apart
+	 * rather than crowding the pad as both get bigger */
+	static int gapFor(int size) { return qMax(WARP_ZOOM_PAD_GAP, size / 3); }
+
+	static int down(int size) { return size * 3 + WARP_ZOOM_PAD_SPACING * 2; }
+
+	static int across(int size) { return size * 4 + WARP_ZOOM_PAD_SPACING * 2 + gapFor(size); }
+
+	/* The biggest square four columns of them fit into: worked out once
+	 * against the smallest gap there can be, and again against the gap that
+	 * size asks for. */
+	int sizeFor(int width) const
+	{
+		int size =
+			qBound(WARP_ZOOM_PAD_MIN, (width - WARP_ZOOM_PAD_SPACING * 2 - WARP_ZOOM_PAD_GAP) / 4, largest);
+
+		return qBound(WARP_ZOOM_PAD_MIN, (width - WARP_ZOOM_PAD_SPACING * 2 - gapFor(size)) / 4, largest);
+	}
+
+	void arrange()
+	{
+		int size = sizeFor(width());
+		int gap = gapFor(size);
+		int left = (width() - across(size)) / 2;
+		int top = (height() - down(size)) / 2;
+		QFont glyphs = font();
+
+		/* the arrows are drawn out of the button's own font, so they
+		 * grow with the button they sit in rather than staying a mark
+		 * in the middle of it */
+		glyphs.setPixelSize(qMax(8, size / 2));
+
+		for (const Cell &cell : cells) {
+			int x = cell.column < 3 ? left + cell.column * (size + WARP_ZOOM_PAD_SPACING)
+						: left + size * 3 + WARP_ZOOM_PAD_SPACING * 2 + gap;
+
+			/* asked for only when it has changed: a font set again
+			 * asks the panel to lay itself out once more */
+			if (cell.widget->font().pixelSize() != glyphs.pixelSize())
+				cell.widget->setFont(glyphs);
+
+			cell.widget->setGeometry(x, top + cell.row * (size + WARP_ZOOM_PAD_SPACING), size, size);
+		}
+	}
+
+	QVector<Cell> cells;
+	int largest = WARP_ZOOM_PAD_MAX;
+};
+
 /* ------------------------------------------------------------------------- */
 /* the dock */
 
@@ -832,28 +1145,64 @@ protected:
 		warpZoomSetMinimalSetting(minimal);
 	}
 
+	void resizeEvent(QResizeEvent *event) override
+	{
+		QWidget::resizeEvent(event);
+		fitPad();
+	}
+
 private:
+	/* How big the pad is let grow, which is a question about the dock's
+	 * height rather than its width.
+	 *
+	 * The pad takes its size from the width it is given, and a dock kept
+	 * short and wide - one along the bottom of the window - would hand it
+	 * a pad taller than the panel it is in, with the picture and the
+	 * presets squeezed out behind it. So the width it works from is
+	 * capped by the share of the height the pad can have: a third of the
+	 * dock beside a picture, half of it with the picture put away. */
+	void fitPad()
+	{
+		int share = minimal ? height() / 2 : height() / 3;
+		int room = (share - WARP_ZOOM_PAD_SPACING * 2) / 3;
+
+		pad->setLargest(
+			qBound(WARP_ZOOM_PAD_MIN, room, minimal ? WARP_ZOOM_PAD_MAX_MINIMAL : WARP_ZOOM_PAD_MAX));
+	}
+
 	/* Minimal drops the picture and nothing else: the pad, the presets and
 	 * the speed are what an operator works, and without the picture there
-	 * is no per-frame grab to pay for either. */
+	 * is no per-frame grab to pay for either.
+	 *
+	 * With the picture gone the pad is what the panel is for, so it is let
+	 * grow past what it stops at while it is sharing the dock with one. */
 	void setMinimal(bool value)
 	{
 		minimal = value;
 		preview->setVisible(!minimal);
+		fitPad();
 	}
 
 	void build()
 	{
 		auto *layout = new QVBoxLayout(this);
 
-		/* which source is being framed */
+		/* the dock is meant to go down to a strip beside the picture,
+		 * and margins are width like anything else */
+		layout->setContentsMargins(4, 4, 4, 4);
+
+		/* which source is being framed; the name of a source is longer
+		 * than a narrow dock, so the list is let shrink past it and
+		 * says the whole of it in the tooltip instead */
 		targets = new QComboBox(this);
 		targets->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+		targets->setMinimumContentsLength(8);
+		targets->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
 
 		/* what the dropdown is set from when it is left to itself, so it
 		 * reads as the setting on the control above it rather than as
 		 * something competing with it for the same row */
-		follow = new QCheckBox(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Follow")), this);
+		follow = new WarpZoomCheck(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Follow")), this);
 		follow->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Follow.Desc")));
 
 		preview = new WarpZoomPreview(this);
@@ -871,9 +1220,12 @@ private:
 		zoomSlider = new QSlider(Qt::Horizontal, this);
 		zoomSlider->setRange((int)(WARP_ZOOM_MIN * 100), (int)(WARP_ZOOM_MAX * 100));
 		zoomSlider->setValue((int)(WARP_ZOOM_MIN * 100));
+		/* a bar has a length it would rather be; in a dock narrowed to a
+		 * strip it takes what is left over instead */
+		zoomSlider->setMinimumWidth(WARP_ZOOM_SLIDER_MIN);
 
 		zoomLabel = new QLabel(this);
-		zoomLabel->setMinimumWidth(48);
+		zoomLabel->setMinimumWidth(WARP_ZOOM_READOUT_MIN);
 		zoomLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
 
 		auto *zoomRow = new QHBoxLayout();
@@ -888,53 +1240,41 @@ private:
 		 * camera desk sits to the right of the stick. A corner moves a
 		 * full step on both axes, the way a joystick held into its
 		 * corner covers more ground than one pushed straight. */
-		auto *pad = new QGridLayout();
-		auto *up = new QPushButton(QString::fromUtf8("▲"), this);
-		auto *down = new QPushButton(QString::fromUtf8("▼"), this);
-		auto *left = new QPushButton(QString::fromUtf8("◀"), this);
-		auto *right = new QPushButton(QString::fromUtf8("▶"), this);
-		auto *upLeft = new QPushButton(QString::fromUtf8("◤"), this);
-		auto *upRight = new QPushButton(QString::fromUtf8("◥"), this);
-		auto *downLeft = new QPushButton(QString::fromUtf8("◣"), this);
-		auto *downRight = new QPushButton(QString::fromUtf8("◢"), this);
-		auto *in = new QPushButton(QString::fromUtf8("+"), this);
-		auto *out = new QPushButton(QString::fromUtf8("−"), this);
+		pad = new WarpZoomPad(this);
 
-		resetButton = new WarpZoomDotButton(this);
+		auto *up = new QPushButton(QString::fromUtf8("▲"), pad);
+		auto *down = new QPushButton(QString::fromUtf8("▼"), pad);
+		auto *left = new QPushButton(QString::fromUtf8("◀"), pad);
+		auto *right = new QPushButton(QString::fromUtf8("▶"), pad);
+		auto *upLeft = new QPushButton(QString::fromUtf8("◤"), pad);
+		auto *upRight = new QPushButton(QString::fromUtf8("◥"), pad);
+		auto *downLeft = new QPushButton(QString::fromUtf8("◣"), pad);
+		auto *downRight = new QPushButton(QString::fromUtf8("◢"), pad);
+		auto *in = new QPushButton(QString::fromUtf8("+"), pad);
+		auto *out = new QPushButton(QString::fromUtf8("−"), pad);
+
+		resetButton = new WarpZoomDotButton(pad);
 		resetButton->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Reset.Desc")));
 		resetButton->setAccessibleName(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Reset")));
 
 		in->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.In")));
 		out->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Out")));
 
-		pad->addWidget(upLeft, 0, 0);
-		pad->addWidget(up, 0, 1);
-		pad->addWidget(upRight, 0, 2);
-		pad->addWidget(left, 1, 0);
-		pad->addWidget(resetButton, 1, 1);
-		pad->addWidget(right, 1, 2);
-		pad->addWidget(downLeft, 2, 0);
-		pad->addWidget(down, 2, 1);
-		pad->addWidget(downRight, 2, 2);
-		pad->addWidget(in, 0, 4);
-		pad->addWidget(out, 2, 4);
-
-		pad->setSpacing(2);
-		/* a gap between the two, so the zoom reads as a control of its
-		 * own rather than as a fourth column of the pad */
-		pad->setColumnMinimumWidth(3, 6);
+		pad->place(upLeft, 0, 0);
+		pad->place(up, 0, 1);
+		pad->place(upRight, 0, 2);
+		pad->place(left, 1, 0);
+		pad->place(resetButton, 1, 1);
+		pad->place(right, 1, 2);
+		pad->place(downLeft, 2, 0);
+		pad->place(down, 2, 1);
+		pad->place(downRight, 2, 2);
+		pad->place(in, 0, 3);
+		pad->place(out, 2, 3);
 
 		for (QPushButton *button :
 		     {up, down, left, right, upLeft, upRight, downLeft, downRight, in, out, resetButton})
 			warpZoomCompact(button);
-
-		/* the pad keeps its size and sits in the middle of whatever
-		 * width the dock is given */
-		auto *padRow = new QHBoxLayout();
-
-		padRow->addStretch(1);
-		padRow->addLayout(pad);
-		padRow->addStretch(1);
 
 		connect(up, &QPushButton::clicked, this, [this]() { pan(0.0f, -WARP_ZOOM_DOCK_PAN, -1); });
 		connect(down, &QPushButton::clicked, this, [this]() { pan(0.0f, WARP_ZOOM_DOCK_PAN, -1); });
@@ -960,7 +1300,7 @@ private:
 		/* Lining a shot up before it goes to air. The take and drop
 		 * buttons are only there while something is waiting, so the row
 		 * carries nothing dead. */
-		confirm = new QCheckBox(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Confirm")), this);
+		confirm = new WarpZoomCheck(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Confirm")), this);
 		confirm->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Confirm.Desc")));
 
 		takeButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Take")), this);
@@ -970,9 +1310,9 @@ private:
 		takeButton->setVisible(false);
 		dropButton->setVisible(false);
 
-		auto *confirmRow = new QHBoxLayout();
+		auto *confirmRow = new WarpZoomFlow();
 
-		confirmRow->addWidget(confirm, 1);
+		confirmRow->addWidget(confirm);
 		confirmRow->addWidget(takeButton);
 		confirmRow->addWidget(dropButton);
 
@@ -1007,6 +1347,10 @@ private:
 		/* presets */
 		presets = new QListWidget(this);
 		presets->setSelectionMode(QAbstractItemView::SingleSelection);
+		/* a preset reads as much of its name as there is room for, which
+		 * is not a reason to hold the dock open */
+		presets->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
+		presets->setTextElideMode(Qt::ElideRight);
 
 		auto *saveButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Save")), this);
 		auto *recallButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Recall")), this);
@@ -1018,14 +1362,13 @@ private:
 		saveButton->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Save.Desc")));
 		updateButton->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Update.Desc")));
 
-		auto *presetButtons = new QHBoxLayout();
+		auto *presetButtons = new WarpZoomFlow();
 
 		presetButtons->addWidget(recallButton);
 		presetButtons->addWidget(saveButton);
 		presetButtons->addWidget(updateButton);
 		presetButtons->addWidget(renameButton);
 		presetButtons->addWidget(removeButton);
-		presetButtons->addStretch(1);
 
 		/* The route the move to the picked preset takes, which is worth
 		 * changing while watching it happen rather than in a window
@@ -1035,6 +1378,7 @@ private:
 			      WARP_ZOOM_PATH_DIRECT);
 		path->addItem(QString::fromUtf8(obs_module_text("Warp.Zoom.Preset.Path.Arc")), WARP_ZOOM_PATH_ARC);
 		path->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Preset.Path.Desc")));
+		path->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
 
 		auto *pathRow = new QHBoxLayout();
 
@@ -1124,9 +1468,10 @@ private:
 		speedSlider = new QSlider(Qt::Horizontal, this);
 		speedSlider->setRange(WARP_FLOW_SPEED_MIN, WARP_FLOW_SPEED_MAX);
 		speedSlider->setValue(100);
+		speedSlider->setMinimumWidth(WARP_ZOOM_SLIDER_MIN);
 
 		speedLabel = new QLabel(this);
-		speedLabel->setMinimumWidth(48);
+		speedLabel->setMinimumWidth(WARP_ZOOM_READOUT_MIN);
 		speedLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
 
 		auto *speedRow = new QHBoxLayout();
@@ -1135,7 +1480,7 @@ private:
 		speedRow->addWidget(speedSlider, 1);
 		speedRow->addWidget(speedLabel);
 
-		auto *speedButtons = new QHBoxLayout();
+		auto *speedButtons = new WarpZoomFlow();
 
 		for (int speed : warpZoomSpeeds) {
 			auto *button = new QPushButton(QString("%1%").arg(speed), this);
@@ -1143,8 +1488,6 @@ private:
 			connect(button, &QPushButton::clicked, this, [this, speed]() { setSpeed(speed); });
 			speedButtons->addWidget(button);
 		}
-
-		speedButtons->addStretch(1);
 
 		connect(targets, &QComboBox::currentIndexChanged, this, [this](int index) {
 			if (loading || index < 0 || index >= chosen.size())
@@ -1201,7 +1544,7 @@ private:
 		layout->addWidget(follow);
 		layout->addWidget(preview, 1);
 		layout->addLayout(zoomRow);
-		layout->addLayout(padRow);
+		layout->addWidget(pad);
 		layout->addLayout(confirmRow);
 		layout->addWidget(new QLabel(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Presets")), this));
 		layout->addWidget(presets, 1);
@@ -1379,6 +1722,9 @@ private:
 
 		targets->setCurrentIndex(index);
 		targets->setEnabled(!follow->isChecked());
+		/* what the list says is cut to the dock's width, so the whole
+		 * name is kept where it can still be read */
+		targets->setToolTip(targets->currentText());
 
 		loading = false;
 
@@ -1522,6 +1868,7 @@ private:
 	QPushButton *takeButton = nullptr;
 	QPushButton *dropButton = nullptr;
 	WarpZoomPreview *preview = nullptr;
+	WarpZoomPad *pad = nullptr;
 	QSlider *zoomSlider = nullptr;
 	QLabel *zoomLabel = nullptr;
 	QPushButton *resetButton = nullptr;
