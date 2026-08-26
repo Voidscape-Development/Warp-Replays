@@ -1,0 +1,16 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/warp-zoom">
+    <file>icons/pan-up.svg</file>
+    <file>icons/pan-down.svg</file>
+    <file>icons/pan-left.svg</file>
+    <file>icons/pan-right.svg</file>
+    <file>icons/pan-up-left.svg</file>
+    <file>icons/pan-up-right.svg</file>
+    <file>icons/pan-down-left.svg</file>
+    <file>icons/pan-down-right.svg</file>
+    <file>icons/zoom-in.svg</file>
+    <file>icons/zoom-out.svg</file>
+    <file>icons/reset.svg</file>
+  </qresource>
+</RCC>

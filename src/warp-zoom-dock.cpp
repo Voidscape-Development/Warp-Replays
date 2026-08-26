@@ -53,6 +53,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QSizePolicy>
 #include <QSlider>
 #include <QSpinBox>
+#include <QSvgRenderer>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QVector>
@@ -124,6 +125,11 @@ constexpr int WARP_ZOOM_PAD_GAP = 6;
  * and this is the size below which it stops giving that back. */
 constexpr int WARP_ZOOM_PAD_FLOOR = 8;
 
+/* How much of a button its drawing takes across the middle, the rest being the
+ * room a button's face wants around anything on it. Half is what the arrows
+ * came to while they were letters, so a pad looks the way it did. */
+constexpr qreal WARP_ZOOM_GLYPH_SHARE = 0.5;
+
 /* What the bars and their readouts hold open. A slider asks for a length worth
  * dragging and a readout for room to say "1000%", and between them they set
  * the floor for a dock that is meant to narrow to a strip; these are as small
@@ -153,6 +159,24 @@ void warpZoomFreeSize(QWidget *widget)
 
 	if (widget->maximumWidth() != QWIDGETSIZE_MAX || widget->maximumHeight() != QWIDGETSIZE_MAX)
 		widget->setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+}
+
+/* Where the pad's drawings are, which is inside the plugin rather than beside
+ * it: an arrow that has to be found on disk is an arrow that goes missing when
+ * a plugin is copied about with less care than it was installed with. */
+QString warpZoomDrawing(const char *name)
+{
+	return QString::fromUtf8(":/warp-zoom/icons/%1.svg").arg(QString::fromUtf8(name));
+}
+
+/* what a button with a drawing on it and no words says it is, to a tooltip and
+ * to a screen reader alike */
+void warpZoomName(QPushButton *button, const char *key)
+{
+	QString said = QString::fromUtf8(obs_module_text(key));
+
+	button->setToolTip(said);
+	button->setAccessibleName(said);
 }
 
 void warpZoomCompact(QPushButton *button)
@@ -427,6 +451,10 @@ struct WarpZoomTarget {
 
 	bool isEmpty() const { return parentUuid.isEmpty(); }
 
+	/* Which thing this is, which is not the same question as what it is
+	 * called: a source renamed mid-show is the source the dock was already
+	 * on, and the dock stays on it rather than counting it as gone and
+	 * moving off to whatever is first in the list. */
 	bool operator==(const WarpZoomTarget &other) const
 	{
 		return parentUuid == other.parentUuid && filterName == other.filterName;
@@ -434,6 +462,26 @@ struct WarpZoomTarget {
 
 	bool operator!=(const WarpZoomTarget &other) const { return !(*this == other); }
 };
+
+/* Whether the list on screen is still the list there is - the same things, in
+ * the same order, under the same names.
+ *
+ * The names are asked about here and nowhere else. Being the same thing is what
+ * `operator==' answers, and a rename does not change that, so a list compared
+ * on that alone reads as unchanged and the dock goes on offering the name the
+ * source used to have. */
+bool warpZoomSameList(const QVector<WarpZoomTarget> &shown, const QVector<WarpZoomTarget> &found)
+{
+	if (shown.size() != found.size())
+		return false;
+
+	for (int index = 0; index < shown.size(); index++) {
+		if (shown[index] != found[index] || shown[index].label != found[index].label)
+			return false;
+	}
+
+	return true;
+}
 
 /* the source the picture is taken from; the caller releases it */
 obs_source_t *warpZoomParent(const WarpZoomTarget &target)
@@ -1034,24 +1082,85 @@ void warpZoomSavePreset(QWidget *parent, obs_source_t *source)
 /* The reset position, drawn as what it is on a PTZ desk: the dot in the middle
  * of the pad. A word does not fit in a button this small, and the dot is read
  * at a glance by anyone who has worked a camera desk. */
-class WarpZoomDotButton : public QPushButton {
+/* A pad button, which is a drawing on a button rather than a letter on one.
+ *
+ * The arrows were characters typed into the buttons - the same ones a document
+ * would use for them - and a character is only ever as good as the font it is
+ * asked of: the corners in particular are missing from plenty of them, and what
+ * stands in for a missing one is a box or somebody else's idea of the shape.
+ * They were sized by setting the font, so how much of the button an arrow took
+ * was the typeface's business too, and the four corners never quite agreed with
+ * the four straights.
+ *
+ * These are drawn from vectors of the plugin's own instead, compiled in rather
+ * than read off disk, and drawn at whatever size the button has been given -
+ * so they are as sharp on a large pad as a small one, and the same on every
+ * machine. The drawing says only the shape; the colour is the theme's, taken
+ * from the same place the words on any other button take theirs. */
+class WarpZoomPadButton : public QPushButton {
 public:
-	explicit WarpZoomDotButton(QWidget *parent = nullptr) : QPushButton(parent) {}
+	WarpZoomPadButton(const QString &drawing, QWidget *parent = nullptr) : QPushButton(parent), glyph(drawing) {}
 
 protected:
 	void paintEvent(QPaintEvent *event) override
 	{
 		QPushButton::paintEvent(event);
 
+		int room = side();
+		QPixmap mark = drawn(room);
 		QPainter painter(this);
-		qreal radius = qMin(width(), height()) * 0.17;
 
-		painter.setRenderHint(QPainter::Antialiasing, true);
-		painter.setPen(Qt::NoPen);
-		painter.setBrush(
-			palette().brush(isEnabled() ? QPalette::Active : QPalette::Disabled, QPalette::ButtonText));
-		painter.drawEllipse(QPointF(width() / 2.0, height() / 2.0), radius, radius);
+		painter.drawPixmap(QPointF((width() - room) / 2.0, (height() - room) / 2.0), mark);
 	}
+
+private:
+	/* how much of the button the drawing takes, the rest being the room a
+	 * button's face needs around anything on it */
+	int side() const { return qMax(1, qRound(qMin(width(), height()) * WARP_ZOOM_GLYPH_SHARE)); }
+
+	/* Kept until something about it changes rather than drawn again every
+	 * time the button is painted, since a pad is repainted for every hover
+	 * and every press. The theme's colour is part of what is asked for, so
+	 * a theme picked mid-show redraws it by asking for something else. */
+	QPixmap drawn(int room)
+	{
+		qreal ratio = devicePixelRatioF();
+		QColor ink = palette().color(isEnabled() ? QPalette::Active : QPalette::Disabled, QPalette::ButtonText);
+
+		if (!sheet.isNull() && room == sheetSide && ink == sheetInk && qFuzzyCompare(ratio, sheetRatio))
+			return sheet;
+
+		QPainter painter;
+
+		/* asked for in the screen's own pixels and told what they are
+		 * worth, so the drawing is sharp on a display that has more of
+		 * them than it has points */
+		sheet = QPixmap(QSize(room, room) * ratio);
+		sheet.setDevicePixelRatio(ratio);
+		sheet.fill(Qt::transparent);
+
+		painter.begin(&sheet);
+		painter.setRenderHint(QPainter::Antialiasing, true);
+		glyph.render(&painter, QRectF(0, 0, room, room));
+
+		/* the shape is kept and the colour thrown away: what is left
+		 * where the drawing put ink is the theme's colour instead */
+		painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
+		painter.fillRect(QRectF(0, 0, room, room), ink);
+		painter.end();
+
+		sheetSide = room;
+		sheetInk = ink;
+		sheetRatio = ratio;
+
+		return sheet;
+	}
+
+	QSvgRenderer glyph;
+	QPixmap sheet;
+	QColor sheetInk;
+	int sheetSide = 0;
+	qreal sheetRatio = 0.0;
 };
 
 /* The pad itself: eight directions around the reset dot, with the zoom
@@ -1170,21 +1279,10 @@ private:
 		int gap = gapFor(size);
 		int left = (width() - across(size)) / 2;
 		int top = (height() - down(size)) / 2;
-		QFont glyphs = font();
-
-		/* the arrows are drawn out of the button's own font, so they
-		 * grow with the button they sit in rather than staying a mark
-		 * in the middle of it */
-		glyphs.setPixelSize(qMax(8, size / 2));
 
 		for (const Cell &cell : cells) {
 			int x = cell.column < 3 ? left + cell.column * (size + WARP_ZOOM_PAD_SPACING)
 						: left + size * 3 + WARP_ZOOM_PAD_SPACING * 2 + gap;
-
-			/* asked for only when it has changed: a font set again
-			 * asks the panel to lay itself out once more */
-			if (cell.widget->font().pixelSize() != glyphs.pixelSize())
-				cell.widget->setFont(glyphs);
 
 			/* the square is only handed out if the widget will take
 			 * one: whatever the theme has capped it at is put back
@@ -1347,23 +1445,38 @@ private:
 		 * corner covers more ground than one pushed straight. */
 		pad = new WarpZoomPad(this);
 
-		auto *up = new QPushButton(QString::fromUtf8("▲"), pad);
-		auto *down = new QPushButton(QString::fromUtf8("▼"), pad);
-		auto *left = new QPushButton(QString::fromUtf8("◀"), pad);
-		auto *right = new QPushButton(QString::fromUtf8("▶"), pad);
-		auto *upLeft = new QPushButton(QString::fromUtf8("◤"), pad);
-		auto *upRight = new QPushButton(QString::fromUtf8("◥"), pad);
-		auto *downLeft = new QPushButton(QString::fromUtf8("◣"), pad);
-		auto *downRight = new QPushButton(QString::fromUtf8("◢"), pad);
-		auto *in = new QPushButton(QString::fromUtf8("+"), pad);
-		auto *out = new QPushButton(QString::fromUtf8("−"), pad);
+		auto *up = new WarpZoomPadButton(warpZoomDrawing("pan-up"), pad);
+		auto *down = new WarpZoomPadButton(warpZoomDrawing("pan-down"), pad);
+		auto *left = new WarpZoomPadButton(warpZoomDrawing("pan-left"), pad);
+		auto *right = new WarpZoomPadButton(warpZoomDrawing("pan-right"), pad);
+		auto *upLeft = new WarpZoomPadButton(warpZoomDrawing("pan-up-left"), pad);
+		auto *upRight = new WarpZoomPadButton(warpZoomDrawing("pan-up-right"), pad);
+		auto *downLeft = new WarpZoomPadButton(warpZoomDrawing("pan-down-left"), pad);
+		auto *downRight = new WarpZoomPadButton(warpZoomDrawing("pan-down-right"), pad);
+		auto *in = new WarpZoomPadButton(warpZoomDrawing("zoom-in"), pad);
+		auto *out = new WarpZoomPadButton(warpZoomDrawing("zoom-out"), pad);
 
-		resetButton = new WarpZoomDotButton(pad);
+		resetButton = new WarpZoomPadButton(warpZoomDrawing("reset"), pad);
 		resetButton->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Reset.Desc")));
 		resetButton->setAccessibleName(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Reset")));
 
 		in->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.In")));
 		out->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Out")));
+
+		/* A drawing says which way a button goes to anyone looking at it
+		 * and nothing at all to anyone who is not, which the arrows it
+		 * replaced at least did by being letters. Every one of them says
+		 * what it is in words, for the tooltip and for a reader. */
+		warpZoomName(up, "Warp.Zoom.Dock.Pan.Up");
+		warpZoomName(down, "Warp.Zoom.Dock.Pan.Down");
+		warpZoomName(left, "Warp.Zoom.Dock.Pan.Left");
+		warpZoomName(right, "Warp.Zoom.Dock.Pan.Right");
+		warpZoomName(upLeft, "Warp.Zoom.Dock.Pan.UpLeft");
+		warpZoomName(upRight, "Warp.Zoom.Dock.Pan.UpRight");
+		warpZoomName(downLeft, "Warp.Zoom.Dock.Pan.DownLeft");
+		warpZoomName(downRight, "Warp.Zoom.Dock.Pan.DownRight");
+		in->setAccessibleName(in->toolTip());
+		out->setAccessibleName(out->toolTip());
 
 		pad->place(upLeft, 0, 0);
 		pad->place(up, 0, 1);
@@ -1377,7 +1490,7 @@ private:
 		pad->place(in, 0, 3);
 		pad->place(out, 2, 3);
 
-		for (QPushButton *button :
+		for (WarpZoomPadButton *button :
 		     {up, down, left, right, upLeft, upRight, downLeft, downRight, in, out, resetButton})
 			warpZoomCompact(button);
 
@@ -1796,7 +1909,7 @@ private:
 
 		loading = true;
 
-		if (found != chosen) {
+		if (!warpZoomSameList(chosen, found)) {
 			chosen = found;
 			targets->clear();
 
@@ -1812,6 +1925,12 @@ private:
 			target = chosen.first();
 			index = 0;
 		}
+
+		/* the same thing, under whatever it is called now: what the dock
+		 * holds on to carries the old name until it is taken from the
+		 * list again */
+		if (index >= 0)
+			target = chosen[index];
 
 		/* A shot lined up on the source the dock has just left goes with
 		 * it: nobody is looking at it any more, and one left waiting is
@@ -1976,7 +2095,7 @@ private:
 	WarpZoomPad *pad = nullptr;
 	QSlider *zoomSlider = nullptr;
 	QLabel *zoomLabel = nullptr;
-	QPushButton *resetButton = nullptr;
+	WarpZoomPadButton *resetButton = nullptr;
 	QPushButton *updateButton = nullptr;
 	QPushButton *renameButton = nullptr;
 	QPushButton *removeButton = nullptr;

@@ -33,8 +33,10 @@ if(ENABLE_FRONTEND_API)
 endif()
 
 if(ENABLE_QT)
-  find_package(Qt6 COMPONENTS Widgets Core)
-  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::Core Qt6::Widgets)
+  # Svg draws the zoom dock's pad, whose arrows are vectors rather than
+  # letters borrowed from whatever font the theme happens to be using
+  find_package(Qt6 COMPONENTS Widgets Core Svg)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::Core Qt6::Widgets Qt6::Svg)
   target_compile_options(
     ${CMAKE_PROJECT_NAME}
     PRIVATE $<$<C_COMPILER_ID:Clang,AppleClang>:-Wno-quoted-include-in-framework-header -Wno-comma>
@@ -70,7 +72,10 @@ if(ENABLE_FRONTEND_API)
 endif()
 
 if(ENABLE_FRONTEND_API AND ENABLE_QT)
-  target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/warp-flow-dialog.cpp src/warp-window.cpp src/warp-zoom-dock.cpp)
+  target_sources(
+    ${CMAKE_PROJECT_NAME}
+    PRIVATE src/warp-flow-dialog.cpp src/warp-window.cpp src/warp-zoom-dock.cpp src/warp-zoom-icons.qrc
+  )
   target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE WARP_HAVE_FRONTEND)
 endif()
 
