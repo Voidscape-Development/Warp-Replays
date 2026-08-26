@@ -31,6 +31,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
+#include <QEvent>
 #include <QFontMetrics>
 #include <QFormLayout>
 #include <QGroupBox>
@@ -52,8 +53,6 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QSizePolicy>
 #include <QSlider>
 #include <QSpinBox>
-#include <QStyle>
-#include <QStyleOptionButton>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QVector>
@@ -100,12 +99,18 @@ const int warpZoomSpeeds[] = {25, 50, 100, 150, 200};
  * has rather than sitting at one size: the buttons are square and grow with
  * the dock's width up to something worth aiming at without looking, and give
  * that back down to a still-usable minimum when the dock is squeezed into a
- * strip beside the picture. The picture is the other thing a wide dock is for,
- * so the pad stops well short of filling it - except with the picture put
- * away, where the pad is what the panel is and is let grow further. */
+ * strip beside the picture.
+ *
+ * What keeps the pad from crowding out the picture is the share of the dock's
+ * height it is allowed - see `fitPad' - rather than these, which are only a
+ * ceiling on how big a button is worth drawing at all: past a point an arrow is
+ * aimed at without looking either way, and the room is better left to the
+ * picture and the presets. Up to there the pad takes the dock's width, so the
+ * buttons are as big as the row they sit in and stand a hair apart rather than
+ * leaving a margin down either side. */
 constexpr int WARP_ZOOM_PAD_MIN = 18;
-constexpr int WARP_ZOOM_PAD_MAX = 60;
-constexpr int WARP_ZOOM_PAD_MAX_MINIMAL = 96;
+constexpr int WARP_ZOOM_PAD_MAX = 96;
+constexpr int WARP_ZOOM_PAD_MAX_MINIMAL = 128;
 
 /* between the buttons, and the least that stands between the pad and the zoom
  * column, so the zoom reads as a control of its own rather than as a fourth
@@ -126,6 +131,30 @@ constexpr int WARP_ZOOM_PAD_FLOOR = 8;
 constexpr int WARP_ZOOM_SLIDER_MIN = 48;
 constexpr int WARP_ZOOM_READOUT_MIN = 36;
 
+/* Puts back the whole range a widget's size can take.
+ *
+ * A theme sizes a button for the words on it, and the height it holds one to is
+ * a height it stays at however big a square the pad hands out: geometry given
+ * to a widget is cut to fit what its size is capped at, so the buttons come out
+ * as wide as the pad has grown and as tall as a button with a word in it,
+ * standing apart from the rows above and below by the difference.
+ *
+ * The cap is the theme's to set and it sets it whenever it dresses the widget,
+ * which is after the button is built rather than during: answering it once at
+ * build time is answering it too early. So this is asked again from the pad
+ * each time it lays the buttons out, which is after anything that would have
+ * put a cap back. */
+void warpZoomFreeSize(QWidget *widget)
+{
+	/* asked only when it is not already so: a size constraint set again is
+	 * a layout asked for again */
+	if (widget->minimumWidth() || widget->minimumHeight())
+		widget->setMinimumSize(0, 0);
+
+	if (widget->maximumWidth() != QWIDGETSIZE_MAX || widget->maximumHeight() != QWIDGETSIZE_MAX)
+		widget->setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+}
+
 void warpZoomCompact(QPushButton *button)
 {
 	/* the pad hands out the geometry itself, so the button asks for
@@ -135,24 +164,16 @@ void warpZoomCompact(QPushButton *button)
 	 * whatever the operator is typing into */
 	button->setFocusPolicy(Qt::NoFocus);
 
-	/* A theme sizes a button for the words on it, and the height it sets
-	 * one to is a height the button is held to however big a square the pad
-	 * hands out: the buttons come out as wide as the pad has grown and as
-	 * tall as a button with a word in it, standing apart from the rows above
-	 * and below by the difference. These carry an arrow rather than words,
-	 * so they take off the padding the theme leaves around it and put what
-	 * it holds their size to back to the whole range a widget has, leaving
-	 * the pad to say how big they are. */
+	/* These carry an arrow rather than words, so they take off the padding
+	 * the theme leaves around one and say the same thing to it about their
+	 * size as `warpZoomFreeSize' does, leaving the pad to be what says how
+	 * big they are. */
 	button->setStyleSheet(QString::fromUtf8("padding: 0px;"
 						" min-width: 0px; min-height: 0px;"
 						" max-width: %1px; max-height: %1px;")
 				      .arg(QWIDGETSIZE_MAX));
 
-	/* the theme is answered again here rather than only in the sheet: a
-	 * style that has already sized the button holds it to that until it is
-	 * told otherwise */
-	button->setMinimumSize(0, 0);
-	button->setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+	warpZoomFreeSize(button);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -278,14 +299,7 @@ public:
 	 * control would ask for less every time it was laid out - each answer
 	 * shorter than the last - and the words would walk off it a piece at a
 	 * time until there were none left. */
-	QSize sizeHint() const override
-	{
-		QSize hint = QCheckBox::sizeHint();
-
-		return QSize(hint.width() - fontMetrics().horizontalAdvance(text()) +
-				     fontMetrics().horizontalAdvance(full),
-			     hint.height());
-	}
+	QSize sizeHint() const override { return QSize(beside() + wordsWidth(full), QCheckBox::sizeHint().height()); }
 
 	/* the box and a word's worth beside it, which is as little as a control
 	 * that can still be read and aimed at comes down to */
@@ -293,7 +307,7 @@ public:
 	{
 		QSize hint = sizeHint();
 
-		return QSize(qMin(hint.width(), boxWidth() + fontMetrics().averageCharWidth() * 4), hint.height());
+		return QSize(qMin(hint.width(), beside() + fontMetrics().averageCharWidth() * 4), hint.height());
 	}
 
 protected:
@@ -303,23 +317,60 @@ protected:
 		elide();
 	}
 
-private:
-	/* the box and the space beside it, which is what the words are left
-	 * with once the control itself has had its room */
-	int boxWidth() const
+	/* What the control takes up beside its words is the style's to say, and
+	 * a theme or a font picked mid-show is it saying something else. The
+	 * whole label goes back on to be measured again, since what is on screen
+	 * has been cut to a room that no longer applies. */
+	void changeEvent(QEvent *event) override
 	{
-		QStyleOptionButton option;
+		QCheckBox::changeEvent(event);
 
-		initStyleOption(&option);
+		if (event->type() != QEvent::StyleChange && event->type() != QEvent::FontChange)
+			return;
 
-		return style()->pixelMetric(QStyle::PM_IndicatorWidth, &option, this) +
-		       style()->pixelMetric(QStyle::PM_CheckBoxLabelSpacing, &option, this) +
-		       style()->pixelMetric(QStyle::PM_FocusFrameHMargin, &option, this) * 2;
+		room = -1;
+		QCheckBox::setText(full);
+		updateGeometry();
+		elide();
+	}
+
+private:
+	/* the words as the label lays them out, which is what has to be
+	 * measured for the two answers below to agree */
+	int wordsWidth(const QString &words) const { return fontMetrics().size(Qt::TextShowMnemonic, words).width(); }
+
+	/* What the control takes up beside its words: the box, the space next to
+	 * it, and whatever else the style puts around the whole thing.
+	 *
+	 * Taken off the control's own answer with the whole label on it rather
+	 * than added up from the style's measurements by hand, because the two
+	 * have to agree exactly. A hand-summed guess that comes to a few pixels
+	 * more than the style leaves is a label cut short at the very width it
+	 * asked for - the last word going to an ellipsis in a dock with room to
+	 * spare - and one that comes to a few less is a label cut off by the
+	 * edge of the control instead.
+	 *
+	 * Measured the once, while the label is still whole: asked again from a
+	 * label already cut, the answer would be a style's minimum width shared
+	 * out differently and the control would not settle. */
+	int beside() const
+	{
+		if (room < 0 && text() == full)
+			room = QCheckBox::sizeHint().width() - wordsWidth(full);
+
+		return qMax(0, room);
 	}
 
 	void elide()
 	{
-		QString shown = fontMetrics().elidedText(full, Qt::ElideRight, qMax(0, width() - boxWidth()));
+		int words = qMax(0, width() - beside());
+		QString shown = full;
+
+		/* cut only once it will not fit as it stands, so that the last
+		 * of the label is not lost to a rounding between how the words
+		 * are measured and how the cut is made */
+		if (wordsWidth(full) > words)
+			shown = fontMetrics().elidedText(full, Qt::ElideRight, words);
 
 		/* set only when it has actually changed: a label put back the
 		 * same asks for the layout again and would not settle */
@@ -328,6 +379,8 @@ private:
 	}
 
 	QString full;
+	/* what the style leaves for the words, once it has been asked for */
+	mutable int room = -1;
 };
 
 /* Where the dock remembers how it was left. This is how an operator likes to
@@ -1062,6 +1115,18 @@ protected:
 		arrange();
 	}
 
+	/* A theme is dressed onto the buttons after they are built, and again
+	 * whenever the operator picks another one, and what it has to say about
+	 * how big a button may be would hold from then on. The pad lays itself
+	 * out once more here so that what it hands out is what is on screen. */
+	void changeEvent(QEvent *event) override
+	{
+		QWidget::changeEvent(event);
+
+		if (event->type() == QEvent::StyleChange)
+			arrange();
+	}
+
 private:
 	struct Cell {
 		QWidget *widget;
@@ -1120,6 +1185,11 @@ private:
 			 * asks the panel to lay itself out once more */
 			if (cell.widget->font().pixelSize() != glyphs.pixelSize())
 				cell.widget->setFont(glyphs);
+
+			/* the square is only handed out if the widget will take
+			 * one: whatever the theme has capped it at is put back
+			 * first */
+			warpZoomFreeSize(cell.widget);
 
 			cell.widget->setGeometry(x, top + cell.row * (size + WARP_ZOOM_PAD_SPACING), size, size);
 		}
