@@ -113,6 +113,12 @@ constexpr int WARP_ZOOM_PAD_MAX_MINIMAL = 96;
 constexpr int WARP_ZOOM_PAD_SPACING = 3;
 constexpr int WARP_ZOOM_PAD_GAP = 6;
 
+/* What a button comes down to rather than being laid out past the bottom of the
+ * pad. A pad handed less height than the width it was given asks for draws
+ * smaller buttons instead of hanging its top and bottom rows outside the panel,
+ * and this is the size below which it stops giving that back. */
+constexpr int WARP_ZOOM_PAD_FLOOR = 8;
+
 /* What the bars and their readouts hold open. A slider asks for a length worth
  * dragging and a readout for room to say "1000%", and between them they set
  * the floor for a dock that is meant to narrow to a strip; these are as small
@@ -128,7 +134,25 @@ void warpZoomCompact(QPushButton *button)
 	/* a pad worked during a show should not take the keyboard away from
 	 * whatever the operator is typing into */
 	button->setFocusPolicy(Qt::NoFocus);
-	button->setStyleSheet(QString::fromUtf8("padding: 0px;"));
+
+	/* A theme sizes a button for the words on it, and the height it sets
+	 * one to is a height the button is held to however big a square the pad
+	 * hands out: the buttons come out as wide as the pad has grown and as
+	 * tall as a button with a word in it, standing apart from the rows above
+	 * and below by the difference. These carry an arrow rather than words,
+	 * so they take off the padding the theme leaves around it and put what
+	 * it holds their size to back to the whole range a widget has, leaving
+	 * the pad to say how big they are. */
+	button->setStyleSheet(QString::fromUtf8("padding: 0px;"
+						" min-width: 0px; min-height: 0px;"
+						" max-width: %1px; max-height: %1px;")
+				      .arg(QWIDGETSIZE_MAX));
+
+	/* the theme is answered again here rather than only in the sheet: a
+	 * style that has already sized the button holds it to that until it is
+	 * told otherwise */
+	button->setMinimumSize(0, 0);
+	button->setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1053,6 +1077,15 @@ private:
 
 	static int across(int size) { return size * 4 + WARP_ZOOM_PAD_SPACING * 2 + gapFor(size); }
 
+	/* The biggest square three rows of them fit down into - `down' asked the
+	 * other way round.
+	 *
+	 * The pad asks for the height the width it was given works out to, and
+	 * in a dock with a picture, a preset list and the rows under them all
+	 * wanting height at once it can be handed less than it asked for. What
+	 * it is given is the answer, not what it asked for. */
+	static int downTo(int height) { return (height - WARP_ZOOM_PAD_SPACING * 2) / 3; }
+
 	/* The biggest square four columns of them fit into: worked out once
 	 * against the smallest gap there can be, and again against the gap that
 	 * size asks for. */
@@ -1066,7 +1099,9 @@ private:
 
 	void arrange()
 	{
-		int size = sizeFor(width());
+		/* square: the size the width allows, or the height, whichever
+		 * there is less room for */
+		int size = qMax(WARP_ZOOM_PAD_FLOOR, qMin(sizeFor(width()), downTo(height())));
 		int gap = gapFor(size);
 		int left = (width() - across(size)) / 2;
 		int top = (height() - down(size)) / 2;
