@@ -2305,6 +2305,13 @@ static void warp_pl_clear_playlist(struct warp_playlist_source *s)
 	obs_data_release(settings);
 }
 
+/* Clearing is the one hotkey that is not gated on the source being shown. The
+ * others drive playback, so they are aimed at whatever the operator has in
+ * front of them; this one edits the source's file list, which is a settings
+ * change that stands whether or not the playlist happens to be on screen. A
+ * playlist is most often emptied while it is off air — between rounds, or
+ * before the next thing is queued into it — so gating it there left the press
+ * doing nothing at all. */
 static void warp_playlist_clear_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
 {
 	UNUSED_PARAMETER(id);
@@ -2312,7 +2319,7 @@ static void warp_playlist_clear_hotkey(void *data, obs_hotkey_id id, obs_hotkey_
 
 	struct warp_playlist_source *s = data;
 
-	if (!pressed || !obs_source_showing(s->source))
+	if (!pressed)
 		return;
 
 	warp_pl_clear_playlist(s);
