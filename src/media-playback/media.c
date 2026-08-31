@@ -570,7 +570,16 @@ bool mp_media_reset(mp_media_t *m)
 		start_time = 0;
 
 	m->eof = false;
-	m->base_ts += next_ts;
+	/* Warp addition: what a restart hands over to base_ts is the span that
+	 * was played under the anchor being retired, not the position the file
+	 * reached. The two are the same thing only while the anchor is the
+	 * start of the file; an unpause or a speed change moves start_ts to
+	 * wherever playback was when the clock was last re-anchored, and from
+	 * then on the position counts everything before that point a second
+	 * time, which lands as a jump in the emitted timeline at the loop point
+	 * of a file that has been paused or had its speed changed. See
+	 * mp_media_apply_speed() for what such a jump costs. */
+	m->base_ts += next_ts - m->start_ts;
 	m->seek_next_ts = false;
 
 	seek_to(m, start_time);
@@ -784,8 +793,9 @@ static void mp_media_resume(mp_media_t *m)
 /* Warp addition: apply a speed change without restarting playback.
  * Decoded frame timestamps are scaled by 100/speed at decode time
  * (see mp_decode_next), so rescale the pending decoder state to the
- * new factor and re-anchor the wall clock; the current position and
- * open decoders are preserved. */
+ * new factor and move the anchor those timestamps are measured from
+ * into the new scale; the current position and open decoders are
+ * preserved. */
 static void mp_media_apply_speed(mp_media_t *m, int new_speed)
 {
 	if (new_speed < MP_SPEED_MIN)
@@ -797,6 +807,9 @@ static void mp_media_apply_speed(mp_media_t *m, int new_speed)
 		return;
 
 	const int old_speed = m->speed;
+	/* where playback has got to, in the scale the timestamps handed out
+	 * so far were counted in */
+	const int64_t played_to = m->next_pts_ns;
 
 	if (m->has_video) {
 		m->v.frame_pts = av_rescale(m->v.frame_pts, old_speed, new_speed);
@@ -810,15 +823,33 @@ static void mp_media_apply_speed(mp_media_t *m, int new_speed)
 	}
 
 	m->speed = new_speed;
-	reset_ts(m);
 
-	/* reset_ts() zeroes next_ns expecting the caller to pass through
-	 * mp_media_sleep() before playing again (as the unpause path does),
-	 * but a speed change falls through to playback in the same thread
-	 * iteration. Re-anchor the pacing clock here, otherwise it stays
-	 * permanently in the past and playback runs unthrottled, flooding
-	 * the frontend with frames. */
-	m->next_ns = os_gettime_ns();
+	/* Frames are handed over timestamped base_ts + frame_pts - start_ts,
+	 * so rescaling every pts under the frontend's feet takes the emitted
+	 * timeline with it unless the anchor moves by the same amount. What a
+	 * speed change is not, though, is a restart or an unpause: it spends
+	 * none of the timeline, because the file is in the same place it was a
+	 * moment ago and the next frame is due when it was always due. So
+	 * base_ts takes over only the span that has actually been played under
+	 * this anchor, and start_ts moves to where the position sits in the new
+	 * scale, which leaves the next frame timestamped where the last one
+	 * left off.
+	 *
+	 * Handing that over to reset_ts() instead is what put a hitch in the
+	 * picture: it adds the whole rescaled position to base_ts, as a restart
+	 * wants, which throws the next frame a position's worth into the
+	 * future. libobs holds frames back until its own clock has caught up
+	 * with them and only writes the clock off as invalid once a jump passes
+	 * two seconds, so a jump short of that freezes the picture for as long
+	 * as the jump lasts. Hence a hitch on a file that had only just started
+	 * -- 3 seconds into a clip is 2 seconds of jump at 150% -- and none
+	 * further in, where the jump cleared two seconds and libobs re-anchored.
+	 *
+	 * next_ns is left alone: it is the pacing deadline in wall-clock terms,
+	 * the thread is midway between two of them here, and the next interval
+	 * added to it is worked out from the rescaled timestamps. */
+	m->base_ts += played_to - m->start_ts;
+	m->start_ts = m->next_pts_ns = av_rescale(played_to, old_speed, new_speed);
 }
 
 /* Warp addition: ring buffer of recently decoded video frames. Frames are
