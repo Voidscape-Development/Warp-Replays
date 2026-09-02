@@ -34,6 +34,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QEvent>
 #include <QFontMetrics>
 #include <QFormLayout>
+#include <QFrame>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QImage>
@@ -136,6 +137,45 @@ constexpr qreal WARP_ZOOM_GLYPH_SHARE = 0.5;
  * as either goes while still being worth having. */
 constexpr int WARP_ZOOM_SLIDER_MIN = 48;
 constexpr int WARP_ZOOM_READOUT_MIN = 36;
+
+/* The height the picture would like, and the least it is worth drawing in.
+ *
+ * The dock is a column with the picture at the top of it, and a dock dragged
+ * short has to take that height off something.
+ *
+ * A dock panel is a child of the OBS window rather than a window of its own,
+ * so nothing stops it being handed less height than the column inside it says
+ * it needs, and a squeezed box layout hands its widgets slots smaller than
+ * their minimums. A widget that has been told outright how short it may be
+ * refuses that slot and is laid out at its own minimum from the top of it
+ * instead - down over whatever comes after it, and behind them, since they
+ * were built later and so are stacked above it. A picture with a floor of 180
+ * is that widget: it is why the picture ends up behind the zoom bar and the
+ * pad in a short dock.
+ *
+ * So the height it would rather have is a hint, which a layout is free to take
+ * back, and the only height it holds is the floor here - the least it is worth
+ * drawing a framing picture in at all. Below that there is no room for it and
+ * it is put away, so the floor is never a slot it has to overflow, and the
+ * room goes to the controls that are still worth working. */
+constexpr int WARP_ZOOM_PREVIEW_WANT = 180;
+constexpr int WARP_ZOOM_PREVIEW_FLOOR = 64;
+
+/* How far under the dock the presets are shaded.
+ *
+ * A step of its own, so the slab is seen on the dark themes most of OBS is
+ * worked in, where a share of a lightness that is already low comes to a
+ * couple of values and to nothing anyone would notice; and a share of the
+ * theme's lightness where that is the bigger of the two, so a light theme is
+ * not given the same small step against a much brighter ground.
+ *
+ * A theme already as good as black has nothing left below it to take away, so
+ * under the floor here the slab is lifted by the step instead - that it stands
+ * out is the point, and which way round it stands out is the theme's business
+ * rather than ours. */
+constexpr int WARP_ZOOM_SECTION_STEP = 14;
+constexpr int WARP_ZOOM_SECTION_SHARE = 8;
+constexpr int WARP_ZOOM_SECTION_FLOOR = 24;
 
 /* Puts back the whole range a widget's size can take.
  *
@@ -407,6 +447,75 @@ private:
 	mutable int room = -1;
 };
 
+/* ------------------------------------------------------------------------- */
+/* a section of the dock
+ *
+ * The presets are a thing of their own inside the dock - a list, the buttons
+ * that work it, and the route a recall takes - and standing them on a slab a
+ * shade under the panel behind them says so, rather than leaving them as more
+ * rows in a column of rows. */
+
+/* The slab's colour, taken from whatever the theme paints its panels rather
+ * than written down here, so it follows OBS from a dark theme to a light one
+ * and back without the dock having to know which one is on. */
+QColor warpZoomSectionShade(const QColor &panel)
+{
+	int hue = 0;
+	int saturation = 0;
+	int lightness = 0;
+	int alpha = 0;
+
+	panel.getHsl(&hue, &saturation, &lightness, &alpha);
+
+	int step = qMax(WARP_ZOOM_SECTION_STEP, lightness / WARP_ZOOM_SECTION_SHARE);
+	int wanted = lightness > WARP_ZOOM_SECTION_FLOOR ? lightness - step : lightness + WARP_ZOOM_SECTION_STEP;
+
+	return QColor::fromHsl(hue, saturation, qBound(0, wanted, 255), alpha);
+}
+
+class WarpZoomSection : public QFrame {
+public:
+	explicit WarpZoomSection(QWidget *parent = nullptr) : QFrame(parent)
+	{
+		setObjectName(QString::fromUtf8("warpZoomSection"));
+		setFrameShape(QFrame::NoFrame);
+		/* a plain container paints nothing of its own, and this is what
+		 * has it draw the background the stylesheet below gives it */
+		setAttribute(Qt::WA_StyledBackground, true);
+		dress();
+	}
+
+protected:
+	/* an operator picking another OBS theme is the palette changing under
+	 * the dock, and the shade on it was mixed from the old one */
+	void changeEvent(QEvent *event) override
+	{
+		QFrame::changeEvent(event);
+
+		if (event->type() == QEvent::PaletteChange || event->type() == QEvent::StyleChange)
+			dress();
+	}
+
+private:
+	/* Dressed only when the colour has actually moved. Setting a stylesheet
+	 * is itself a style change, which is one of the things that brings us
+	 * here, so dressing on every pass would never settle. */
+	void dress()
+	{
+		QColor wanted = warpZoomSectionShade(palette().color(QPalette::Window));
+
+		if (wanted == shade)
+			return;
+
+		shade = wanted;
+		setStyleSheet(QString::fromUtf8("QFrame#warpZoomSection { background-color: %1;"
+						" border-radius: 4px; }")
+				      .arg(shade.name(QColor::HexRgb)));
+	}
+
+	QColor shade;
+};
+
 /* Where the dock remembers how it was left. This is how an operator likes to
  * work rather than anything about the show, so it lives in the user's own
  * config instead of the scene collection. */
@@ -644,10 +753,23 @@ class WarpZoomPreview : public QWidget {
 public:
 	explicit WarpZoomPreview(QWidget *parent = nullptr) : QWidget(parent)
 	{
-		setMinimumHeight(180);
+		/* The height it would rather have is asked for in the hint and
+		 * the floor is all it holds, so a dock dragged short takes the
+		 * room out of the picture - which has the most to give and the
+		 * least to lose by giving it - before anything is squeezed.
+		 *
+		 * Nothing is asked for across: a picture is drawn to whatever
+		 * width there is, and a dock meant to narrow to a strip beside
+		 * the canvas cannot be held open by one. */
+		setMinimumHeight(WARP_ZOOM_PREVIEW_FLOOR);
+		setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
 		setCursor(Qt::OpenHandCursor);
 		setMouseTracking(false);
 	}
+
+	/* sixteen by nine of the height it wants, so the room it asks for is the
+	 * shape of what goes in it */
+	QSize sizeHint() const override { return QSize(WARP_ZOOM_PREVIEW_WANT * 16 / 9, WARP_ZOOM_PREVIEW_WANT); }
 
 	/* Called as the picture is dragged, in fractions of what is on screen,
 	 * and as the wheel is turned, as what to multiply the zoom by. */
@@ -1351,10 +1473,75 @@ protected:
 	void resizeEvent(QResizeEvent *event) override
 	{
 		QWidget::resizeEvent(event);
-		fitPad();
+		fitParts();
+	}
+
+	/* A theme or a font picked mid-show changes what every row in the dock
+	 * takes up, and with it how much height there is left for the picture. */
+	void changeEvent(QEvent *event) override
+	{
+		QWidget::changeEvent(event);
+
+		if (event->type() == QEvent::StyleChange || event->type() == QEvent::FontChange)
+			fitParts();
 	}
 
 private:
+	/* What the dock's height is shared out to, worked out from the top down:
+	 * whether there is room for the picture at all, and then how big the pad
+	 * may grow in what is left. */
+	void fitParts()
+	{
+		fitPreview();
+		fitPad();
+	}
+
+	/* The height the rest of the dock holds, which is what says whether the
+	 * picture has anywhere to go.
+	 *
+	 * Asked of the rows themselves rather than counted up here, so a theme
+	 * with taller buttons or an operator on a bigger font is answered as it
+	 * stands rather than against a number written down when this was
+	 * written. The picture is left out of it - it is the one being placed -
+	 * and so is anything hidden, since a row that is not there holds
+	 * nothing. */
+	int restHeight() const
+	{
+		QLayout *box = layout();
+		QMargins margins = box->contentsMargins();
+		int total = margins.top() + margins.bottom();
+		int rows = 0;
+
+		for (int i = 0; i < box->count(); i++) {
+			QLayoutItem *item = box->itemAt(i);
+
+			if (item->widget() == preview || item->isEmpty())
+				continue;
+
+			total += item->minimumSize().height();
+			rows++;
+		}
+
+		/* the gaps between them, and the one the picture would stand
+		 * above if it were put back */
+		return total + box->spacing() * rows;
+	}
+
+	/* Whether the picture is worth the room it would take. Below the floor
+	 * it is a strip too thin to frame a shot in, and the pad, the presets
+	 * and the speed are what an operator can still work in a dock that
+	 * short, so it is put away rather than laid out under them. */
+	void fitPreview()
+	{
+		bool room = !minimal && height() - restHeight() >= WARP_ZOOM_PREVIEW_FLOOR;
+
+		/* asked of what the dock was told rather than of what is on
+		 * screen: a child of a panel that has not been shown yet is not
+		 * visible whatever the dock has decided about it */
+		if (room == preview->isHidden())
+			preview->setVisible(room);
+	}
+
 	/* How big the pad is let grow, which is a question about the dock's
 	 * height rather than its width.
 	 *
@@ -1382,8 +1569,7 @@ private:
 	void setMinimal(bool value)
 	{
 		minimal = value;
-		preview->setVisible(!minimal);
-		fitPad();
+		fitParts();
 	}
 
 	void build()
@@ -1758,16 +1944,28 @@ private:
 				setSpeed(value);
 		});
 
+		/* The presets stand on a slab of their own: the list, the
+		 * buttons that work it and the route a recall takes are one
+		 * thing an operator sets a show up with, and the dock says so
+		 * by shading the ground under them rather than by running them
+		 * in with the rows above and below. */
+		auto *presetSection = new WarpZoomSection(this);
+		auto *presetBox = new QVBoxLayout(presetSection);
+
+		presetBox->setContentsMargins(6, 6, 6, 6);
+		presetBox->addWidget(
+			new QLabel(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Presets")), presetSection));
+		presetBox->addWidget(presets, 1);
+		presetBox->addLayout(presetButtons);
+		presetBox->addLayout(pathRow);
+
 		layout->addWidget(targets);
 		layout->addWidget(follow);
 		layout->addWidget(preview, 1);
 		layout->addLayout(zoomRow);
 		layout->addWidget(pad);
 		layout->addLayout(confirmRow);
-		layout->addWidget(new QLabel(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Presets")), this));
-		layout->addWidget(presets, 1);
-		layout->addLayout(presetButtons);
-		layout->addLayout(pathRow);
+		layout->addWidget(presetSection, 1);
 		layout->addLayout(speedRow);
 		layout->addLayout(speedButtons);
 	}
@@ -2070,9 +2268,11 @@ private:
 		if (!isVisible())
 			return;
 
-		if (minimal) {
-			/* nothing to draw, so nothing is rendered: the dock
-			 * costs only what its widgets cost while it is minimal */
+		/* With the picture away - put away for good in minimal, or for
+		 * want of height in a dock dragged short - there is nothing to
+		 * draw, so nothing is rendered and the dock costs only what its
+		 * widgets cost. */
+		if (preview->isHidden()) {
 			refreshView();
 			return;
 		}
