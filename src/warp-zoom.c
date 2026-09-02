@@ -1321,10 +1321,6 @@ void warp_zoom_control_properties(obs_properties_t *props, bool with_view)
 	prop = obs_properties_add_bool(group, WARP_ZOOM_S_CONFIRM, obs_module_text("Warp.Zoom.Confirm"));
 	obs_property_set_long_description(prop, obs_module_text("Warp.Zoom.Confirm.Desc"));
 
-	prop = obs_properties_add_text(group, "zoom_presets_note", obs_module_text("Warp.Zoom.Presets.Note"),
-				       OBS_TEXT_INFO);
-	obs_property_set_long_description(prop, obs_module_text("Warp.Zoom.Presets.Note.Desc"));
-
 	obs_properties_add_group(props, "zoom_group", obs_module_text("Warp.Zoom.Group"), OBS_GROUP_NORMAL, group);
 }
 
