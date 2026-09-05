@@ -2267,6 +2267,25 @@ static const char *audio_filter = " (*.mp3 *.aac *.ogg *.wav);;";
 
 /* Only what the playlist puts around the transition is shown here; what the
  * transition itself is configured with belongs to the transition. */
+/* Shows the level a transition's own sound is played at, which only a stinger
+ * has: everything else is nothing but the two files it is holding, and there is
+ * no second level for it to set. Going back is only asked about when it has a
+ * transition of its own; without one it runs through the forward transition
+ * like everything else. */
+static void warp_pl_show_transition_volume(obs_properties_t *props, obs_data_t *settings)
+{
+	obs_property_t *prop = obs_properties_get(props, "transition_volume_percent");
+	bool stinger =
+		strcmp(obs_data_get_string(settings, warp_pl_keys[WARP_PL_DIR_FORWARD].id), WARP_PL_TR_STINGER) == 0;
+
+	if (!stinger && obs_data_get_bool(settings, "separate_back_transition"))
+		stinger = strcmp(obs_data_get_string(settings, warp_pl_keys[WARP_PL_DIR_BACKWARD].id),
+				 WARP_PL_TR_STINGER) == 0;
+
+	if (prop)
+		obs_property_set_visible(prop, stinger);
+}
+
 static bool warp_pl_transition_changed_dir(obs_properties_t *props, obs_data_t *settings, size_t dir)
 {
 	const char *id = obs_data_get_string(settings, warp_pl_keys[dir].id);
@@ -2278,6 +2297,8 @@ static bool warp_pl_transition_changed_dir(obs_properties_t *props, obs_data_t *
 
 	if (warp_pl_keys[dir].timing)
 		obs_property_set_visible(obs_properties_get(props, warp_pl_keys[dir].timing), !is_cut);
+
+	warp_pl_show_transition_volume(props, settings);
 
 	return true;
 }
@@ -2313,6 +2334,10 @@ static bool warp_pl_separate_back_changed(obs_properties_t *props, obs_property_
 								      : "Warp.Playlist.Group.Transition"));
 
 	obs_property_set_visible(obs_properties_get(props, "back_transition_group"), separate);
+
+	/* a stinger for going back is only played when going back has a
+	 * transition of its own */
+	warp_pl_show_transition_volume(props, settings);
 
 	return true;
 }
