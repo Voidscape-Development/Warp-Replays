@@ -56,9 +56,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  * playlist moves on, in seconds */
 #define WARP_PL_STALL_SECONDS 3.0f
 
-/* what the volume property is allowed to ask for, in percent. Unity is the
- * ceiling: the files are played as they are at 100%, and the property is there
- * to turn them down rather than to boost them into clipping. */
+/* what the volume properties are allowed to ask for, in percent. Unity is the
+ * ceiling: the files are played as they are at 100%, and the properties are
+ * there to turn them down rather than to boost them into clipping. */
 #define WARP_PL_VOLUME_MIN 0
 #define WARP_PL_VOLUME_MAX 100
 
@@ -227,6 +227,11 @@ struct warp_pl_transition {
 struct warp_pl_deck {
 	/* the item being tapped; the deck holds a reference while it is */
 	obs_source_t *source;
+	/* Whether this is something the transition brought along rather than a
+	 * file out of the playlist, which is what decides the level it is
+	 * played at: the two are set apart so a playlist of silent replays can
+	 * still be stingered with sound. */
+	bool from_transition;
 	/* what its samples are scaled by, written by the tick */
 	float gain;
 	/* the gain the last packet ended on, so a change rides across the next
@@ -273,8 +278,10 @@ struct warp_pl_audio {
 	uint64_t next_ts;
 	bool flushed;
 
-	/* what the volume property scales everything by */
+	/* what the volume properties scale the files, and whatever the
+	 * transition plays of its own, by */
 	float volume;
+	float transition_volume;
 };
 
 struct warp_playlist_source {
@@ -929,7 +936,8 @@ static void warp_pl_mix_submit(struct warp_playlist_source *s, obs_source_t *sou
 					frames = 0;
 			}
 
-			float target = muted ? 0.0f : deck->gain * a->volume;
+			float level = deck->from_transition ? a->transition_volume : a->volume;
+			float target = muted ? 0.0f : deck->gain * level;
 			float step = frames ? (target - deck->applied_gain) / (float)frames : 0.0f;
 
 			for (size_t ch = 0; ch < channels && frames; ch++) {
@@ -1004,6 +1012,7 @@ static void warp_pl_transition_gains(const struct warp_pl_transition_audio *info
 struct warp_pl_audio_scan {
 	obs_source_t *want[WARP_PL_NUM_DECKS];
 	float gain[WARP_PL_NUM_DECKS];
+	bool from_transition[WARP_PL_NUM_DECKS];
 	size_t num;
 };
 
@@ -1022,7 +1031,8 @@ static size_t warp_pl_audio_scan_find(const struct warp_pl_audio_scan *scan, obs
  * that stands in more than one place is played once, at everything it is asked
  * for put together: the two halves of a transition are the same item for a
  * moment whenever the picture is handed from one transition to the other. */
-static void warp_pl_audio_scan_add(struct warp_pl_audio_scan *scan, obs_source_t *source, float gain)
+static void warp_pl_audio_scan_add(struct warp_pl_audio_scan *scan, obs_source_t *source, float gain,
+				   bool from_transition)
 {
 	if (!source)
 		return;
@@ -1039,6 +1049,7 @@ static void warp_pl_audio_scan_add(struct warp_pl_audio_scan *scan, obs_source_t
 
 	scan->want[scan->num] = obs_source_get_ref(source);
 	scan->gain[scan->num] = gain;
+	scan->from_transition[scan->num] = from_transition;
 	scan->num++;
 }
 
@@ -1057,7 +1068,7 @@ static void warp_pl_audio_scan_transition(obs_source_t *parent, obs_source_t *ch
 	if (warp_pl_audio_scan_find(scan, child) != DARRAY_INVALID)
 		return;
 
-	warp_pl_audio_scan_add(scan, child, 1.0f);
+	warp_pl_audio_scan_add(scan, child, 1.0f, true);
 }
 
 /* Points the mixer at the sources the transition on screen is playing and sets
@@ -1088,8 +1099,8 @@ static void warp_pl_audio_sync(struct warp_playlist_source *s)
 			warp_pl_transition_gains(&info, obs_transition_get_time(transition), &from_gain, &into_gain);
 		}
 
-		warp_pl_audio_scan_add(&scan, from, from_gain);
-		warp_pl_audio_scan_add(&scan, into, into_gain);
+		warp_pl_audio_scan_add(&scan, from, from_gain, false);
+		warp_pl_audio_scan_add(&scan, into, into_gain, false);
 
 		/* the two halves are already in, so this only adds what the
 		 * transition brought along itself */
@@ -1136,6 +1147,7 @@ static void warp_pl_audio_sync(struct warp_playlist_source *s)
 				continue;
 
 			a->deck[i].gain = gain[j];
+			a->deck[i].from_transition = scan.from_transition[j];
 			placed[j] = true;
 			break;
 		}
@@ -1152,6 +1164,7 @@ static void warp_pl_audio_sync(struct warp_playlist_source *s)
 			memset(&a->deck[i], 0, sizeof(a->deck[i]));
 			a->deck[i].source = obs_source_get_ref(want[j]);
 			a->deck[i].gain = gain[j];
+			a->deck[i].from_transition = scan.from_transition[j];
 
 			taken[i] = a->deck[i].source;
 			placed[j] = true;
@@ -2237,6 +2250,7 @@ static void warp_playlist_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "back_transition_alignment", "center");
 	obs_data_set_default_int(settings, "speed_percent", 100);
 	obs_data_set_default_int(settings, "volume_percent", 100);
+	obs_data_set_default_int(settings, "transition_volume_percent", 100);
 	obs_data_set_default_bool(settings, "restart_on_activate", true);
 	obs_data_set_default_bool(settings, "clear_on_media_end", true);
 	obs_data_set_default_bool(settings, "linear_alpha", false);
@@ -2453,9 +2467,9 @@ static obs_properties_t *warp_playlist_getproperties(void *data)
 		pthread_mutex_unlock(&s->mutex);
 	}
 
-	/* Speed and volume ride at the top, in a group of their own: they are
-	 * the two an operator reaches for while a clip is up, and everything
-	 * below them is set once when the source is built. */
+	/* Speed and the two levels ride at the top, in a group of their own:
+	 * they are what an operator reaches for while a clip is up, and
+	 * everything below them is set once when the source is built. */
 	playback = obs_properties_create();
 
 	prop = obs_properties_add_int_slider(playback, "speed_percent", obs_module_text("Warp.Video.Speed"),
@@ -2467,6 +2481,12 @@ static obs_properties_t *warp_playlist_getproperties(void *data)
 					     WARP_PL_VOLUME_MIN, WARP_PL_VOLUME_MAX, 1);
 	obs_property_int_set_suffix(prop, "%");
 	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.Volume.Desc"));
+
+	prop = obs_properties_add_int_slider(playback, "transition_volume_percent",
+					     obs_module_text("Warp.Playlist.TransitionVolume"), WARP_PL_VOLUME_MIN,
+					     WARP_PL_VOLUME_MAX, 1);
+	obs_property_int_set_suffix(prop, "%");
+	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.TransitionVolume.Desc"));
 
 	obs_properties_add_group(props, "playback_group", obs_module_text("Warp.Playlist.Group.Playback"),
 				 OBS_GROUP_NORMAL, playback);
@@ -2650,6 +2670,7 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 	bool separate_back = obs_data_get_bool(settings, "separate_back_transition");
 	int speed = (int)obs_data_get_int(settings, "speed_percent");
 	int volume = (int)obs_data_get_int(settings, "volume_percent");
+	int transition_volume = (int)obs_data_get_int(settings, "transition_volume_percent");
 
 	if (speed < MP_SPEED_MIN || speed > MP_SPEED_MAX)
 		speed = 100;
@@ -2658,6 +2679,11 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 		volume = WARP_PL_VOLUME_MIN;
 	else if (volume > WARP_PL_VOLUME_MAX)
 		volume = WARP_PL_VOLUME_MAX;
+
+	if (transition_volume < WARP_PL_VOLUME_MIN)
+		transition_volume = WARP_PL_VOLUME_MIN;
+	else if (transition_volume > WARP_PL_VOLUME_MAX)
+		transition_volume = WARP_PL_VOLUME_MAX;
 
 	/* the transitions' own properties write to the transitions rather than
 	 * to these settings, so what they are running with is read back before
@@ -2691,12 +2717,13 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 
 	bool overlap = strcmp(obs_data_get_string(settings, "transition_timing"), WARP_PL_TIMING_AFTER) != 0;
 
-	/* The mixer's lock is a leaf, so the volume is set before s->mutex is
-	 * picked up rather than under it. The next packet of every item that is
+	/* The mixer's lock is a leaf, so the levels are set before s->mutex is
+	 * picked up rather than under it. The next packet of everything that is
 	 * playing rides to the new level, so this applies to the file that is
 	 * up as well as to the ones after it. */
 	pthread_mutex_lock(&s->audio.mutex);
 	s->audio.volume = (float)volume / 100.0f;
+	s->audio.transition_volume = (float)transition_volume / 100.0f;
 	pthread_mutex_unlock(&s->audio.mutex);
 
 	pthread_mutex_lock(&s->mutex);
@@ -3291,6 +3318,7 @@ static void *warp_playlist_create(obs_data_t *settings, obs_source_t *source)
 	s->state = OBS_MEDIA_STATE_NONE;
 	s->base_speed = 100;
 	s->audio.volume = 1.0f;
+	s->audio.transition_volume = 1.0f;
 	/* s->speed is left at zero: the update below fills it in, and a speed
 	 * that was never played at is not a change to report */
 	s->rand_state = os_gettime_ns() | 1;
