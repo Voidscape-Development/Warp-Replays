@@ -24,6 +24,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <util/dstr.h>
 #include <util/platform.h>
 #include <util/threading.h>
+#include <util/util_uint64.h>
 
 #include <media-playback/media-playback.h>
 
@@ -55,11 +56,39 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  * playlist moves on, in seconds */
 #define WARP_PL_STALL_SECONDS 3.0f
 
-/* what the volume property is allowed to ask for, in percent. Unity is the
- * ceiling: the files are played as they are at 100%, and the property is there
- * to turn them down rather than to boost them into clipping. */
+/* what the volume properties are allowed to ask for, in percent. Unity is the
+ * ceiling: the files are played as they are at 100%, and the properties are
+ * there to turn them down rather than to boost them into clipping. */
 #define WARP_PL_VOLUME_MIN 0
 #define WARP_PL_VOLUME_MAX 100
+
+/* How many sources the mixer takes audio from at once: the item being
+ * transitioned away from, the one coming in, and whatever the transition plays
+ * of its own - a stinger has a video of its own and, with a track matte on, a
+ * second one alongside it. */
+#define WARP_PL_NUM_DECKS 4
+
+/* How far a source's audio may drift from where it was anchored before the
+ * mixer anchors it again, in nanoseconds. Audio arrives as it is decoded, so a
+ * drift this large is a clock that has been put back rather than one that is
+ * merely running late. */
+#define WARP_PL_DECK_RESYNC_NS UINT64_C(500000000)
+
+/* How long the mixer will hold a sample waiting on an item that still has
+ * audio to come, in nanoseconds. It only ever waits during a transition, when
+ * both halves have to be in before either can be mixed; with one item playing
+ * there is nothing to wait for and its audio goes out as it arrives. The bound
+ * is what keeps an item that stops dead halfway through a crossfade from
+ * taking the mix down with it. */
+#define WARP_PL_MIX_HOLD_NS UINT64_C(60000000)
+
+/* How long an item that has stopped handing audio over is waited on before the
+ * mixer writes it off, in nanoseconds. A file with no audio track never hands
+ * anything over at all, and must not hold up the other half of a transition. */
+#define WARP_PL_DECK_IDLE_NS UINT64_C(200000000)
+
+/* the most audio the mixer will hold at once, in nanoseconds */
+#define WARP_PL_MIX_MAX_NS UINT64_C(1000000000)
 
 /* how long an item plays before it may be transitioned away from early */
 #define WARP_PL_MIN_ITEM_SECONDS 0.25f
@@ -88,6 +117,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  * either in milliseconds or in frames of the stinger video */
 #define WARP_PL_STINGER_TP_TIME 0
 #define WARP_PL_STINGER_TP_FRAME 1
+
+/* audio_fade_style values of the stinger transition: the outgoing file fades
+ * out and the incoming one fades back in behind the sting, or the two cross
+ * over the way every other transition does */
+#define WARP_PL_STINGER_FADE_OUT_IN 0
+#define WARP_PL_STINGER_FADE_CROSS 1
 
 /* transition_timing values: overlap the end of the file, or run once it is
  * over */
@@ -176,12 +211,77 @@ struct warp_pl_transition {
 	uint32_t ms;
 	/* where a stinger swaps the incoming file in, in milliseconds */
 	uint32_t stinger_point_ms;
+	/* whether a stinger crosses its two files over rather than fading one
+	 * out and the other back in behind the sting */
+	bool stinger_cross_fade;
 	bool is_cut;
 	bool is_stinger;
 	/* Whether the transition overlaps the end of the file or runs once it
 	 * is over. Only read for the forward transition: it places automatic
 	 * advance, and a move back through the playlist is always asked for. */
 	bool overlap;
+};
+
+/* One item the mixer is taking audio from. There is one deck per half of a
+ * transition, and a single one while nothing is running. */
+struct warp_pl_deck {
+	/* the item being tapped; the deck holds a reference while it is */
+	obs_source_t *source;
+	/* Whether this is something the transition brought along rather than a
+	 * file out of the playlist, which is what decides the level it is
+	 * played at: the two are set apart so a playlist of silent replays can
+	 * still be stingered with sound. */
+	bool from_transition;
+	/* what its samples are scaled by, written by the tick */
+	float gain;
+	/* the gain the last packet ended on, so a change rides across the next
+	 * one rather than stepping and clicking */
+	float applied_gain;
+	/* What has to be added to this source's timestamps to put them on the
+	 * system clock. Every source counts from a base of its own - media
+	 * playback in one plugin knows nothing of the copy in another - so the
+	 * mixer works in the clock and anchors each source to it as its first
+	 * packet arrives, which is what libobs does with a source of its own. */
+	int64_t offset;
+	bool anchored;
+	/* just past the last sample handed over, on the system clock */
+	uint64_t end_ts;
+	/* when that arrived */
+	uint64_t arrived;
+	/* whether this source is handing audio over at all */
+	bool producing;
+};
+
+/* Where the audio of the items being played is added up before it is handed to
+ * OBS. See the audio section further down for what it is for. */
+struct warp_pl_audio {
+	/* Guards everything below. It is a leaf: nothing else is taken under
+	 * it, and it is never taken under s->mutex. */
+	pthread_mutex_t mutex;
+
+	struct warp_pl_deck deck[WARP_PL_NUM_DECKS];
+
+	/* Samples that have been handed over but not let out yet, planar float
+	 * in the mix format; 'ts' is where the first of them sits. */
+	float *buf[MAX_AUDIO_CHANNELS];
+	size_t capacity;
+	size_t frames;
+	uint64_t ts;
+	bool have;
+
+	size_t channels;
+	size_t sample_rate;
+	enum speaker_layout speakers;
+
+	/* just past the last sample let out, so audio that turns up behind it
+	 * is dropped rather than mixed in under what has already gone */
+	uint64_t next_ts;
+	bool flushed;
+
+	/* what the volume properties scale the files, and whatever the
+	 * transition plays of its own, by */
+	float volume;
+	float transition_volume;
 };
 
 struct warp_playlist_source {
@@ -280,10 +380,8 @@ struct warp_playlist_source {
 	 * each file goes up, the same way the speed is. */
 	struct warp_zoom_control zoom;
 
-	/* what the playlist's audio is scaled by on its way out, from 0 for
-	 * silence to 1 for the files as they are. Read by the audio thread,
-	 * which takes it under the lock along with the transition. */
-	float volume;
+	/* where the items' audio is mixed on its way out to OBS; guards itself */
+	struct warp_pl_audio audio;
 
 	bool auto_advance;
 	bool loop_playlist;
@@ -405,18 +503,30 @@ static obs_source_t *warp_pl_get_transition_dir(struct warp_playlist_source *s, 
 	return transition;
 }
 
-/* The transition that is on screen, with a reference held, along with the
- * volume its audio is played at. The audio thread needs both, and taking them
- * together keeps the samples it copies and the volume it scales them by from
- * coming from either side of an update. */
-static obs_source_t *warp_pl_get_transition_volume(struct warp_playlist_source *s, float *volume)
+/* What the transition on screen does to the audio of the two items it holds.
+ * Read alongside the transition itself so the shape the gains are worked out
+ * with belongs to the transition they are worked out for. */
+struct warp_pl_transition_audio {
+	bool is_stinger;
+	bool stinger_cross_fade;
+	uint32_t stinger_point_ms;
+	uint32_t ms;
+};
+
+/* The transition that is on screen, with a reference held, along with what it
+ * does to the audio of its two halves. */
+static obs_source_t *warp_pl_get_transition_audio(struct warp_playlist_source *s, struct warp_pl_transition_audio *info)
 {
 	obs_source_t *transition;
 
 	pthread_mutex_lock(&s->mutex);
 	transition = obs_source_get_ref(s->tr[s->active_dir].source);
-	if (volume)
-		*volume = s->volume;
+	if (info) {
+		info->is_stinger = s->tr[s->active_dir].is_stinger;
+		info->stinger_cross_fade = s->tr[s->active_dir].stinger_cross_fade;
+		info->stinger_point_ms = s->tr[s->active_dir].stinger_point_ms;
+		info->ms = s->tr[s->active_dir].ms;
+	}
 	pthread_mutex_unlock(&s->mutex);
 
 	return transition;
@@ -425,7 +535,7 @@ static obs_source_t *warp_pl_get_transition_volume(struct warp_playlist_source *
 /* the transition that is on screen, with a reference held */
 static obs_source_t *warp_pl_get_transition(struct warp_playlist_source *s)
 {
-	return warp_pl_get_transition_volume(s, NULL);
+	return warp_pl_get_transition_audio(s, NULL);
 }
 
 /* Drops s->mutex and works through whatever was queued while it was held.
@@ -558,6 +668,566 @@ static void warp_pl_unlock(struct warp_playlist_source *s)
 }
 
 /* ------------------------------------------------------------------------- */
+/* audio
+ *
+ * The playlist hands OBS its own audio rather than leaving the items to be
+ * mixed up the source tree through the transition. That is what puts it in the
+ * audio mixer next to every other source, with a fader, a mute, monitoring,
+ * audio filters and its own tracks: a composite source may not carry
+ * OBS_SOURCE_AUDIO at all, so for as long as the items were mixed for it, the
+ * playlist had none of that and the volume property was the only level it had.
+ *
+ * It also closes the hole that made that level a suggestion. libobs tags any
+ * source it meets twice in one pass over the audio tree and mixes it straight
+ * into the program mix as a root node instead of letting its parents mix it,
+ * at the file's own level. An item is met twice whenever the tree is walked
+ * more than once - a second video mix looking at the same scene, which is what
+ * studio mode and every extra canvas do, or both direction transitions holding
+ * the item across a hand-over - and the playlist's volume never touched those
+ * samples, so a playlist turned down to 0% could still be heard.
+ *
+ * So the items are taken out of libobs' audio altogether: each is opened with
+ * no audio mixers of its own, which leaves it nothing to mix anywhere, and the
+ * playlist taps its samples as they are decoded instead. What is tapped is
+ * already in the mix format, because libobs resamples on the way into
+ * obs_source_output_audio(), so the mixer below only has to line the two items
+ * of a transition up in time, scale them by the crossfade, and pass the result
+ * on. */
+
+static inline uint64_t warp_pl_frames_to_ns(size_t sample_rate, uint64_t frames)
+{
+	return util_mul_div64(frames, UINT64_C(1000000000), sample_rate);
+}
+
+static inline uint64_t warp_pl_ns_to_frames(size_t sample_rate, uint64_t ns)
+{
+	return util_mul_div64(ns, sample_rate, UINT64_C(1000000000));
+}
+
+/* Throws away what the mixer is holding and sets the format it works in.
+ * Expects the mixer's lock to be held. */
+static void warp_pl_mix_reset(struct warp_pl_audio *a, size_t channels, size_t sample_rate)
+{
+	for (size_t ch = 0; ch < MAX_AUDIO_CHANNELS; ch++) {
+		bfree(a->buf[ch]);
+		a->buf[ch] = NULL;
+	}
+
+	a->capacity = 0;
+	a->frames = 0;
+	a->ts = 0;
+	a->have = false;
+	a->next_ts = 0;
+	a->flushed = false;
+	a->channels = channels;
+	a->sample_rate = sample_rate;
+}
+
+/* Makes room for 'frames' samples and clears whatever of them is new, so that
+ * a gap between two items is silence rather than the last thing that stood
+ * there. Returns false when that is more than the mixer will hold. Expects the
+ * mixer's lock to be held. */
+static bool warp_pl_mix_reserve(struct warp_pl_audio *a, size_t frames)
+{
+	size_t limit = (size_t)warp_pl_ns_to_frames(a->sample_rate, WARP_PL_MIX_MAX_NS);
+
+	if (!a->channels || frames > limit)
+		return false;
+
+	if (frames > a->capacity) {
+		size_t capacity = a->capacity ? a->capacity : 1024;
+
+		while (capacity < frames)
+			capacity *= 2;
+		if (capacity > limit)
+			capacity = limit;
+
+		for (size_t ch = 0; ch < a->channels; ch++) {
+			a->buf[ch] = brealloc(a->buf[ch], capacity * sizeof(float));
+			memset(a->buf[ch] + a->frames, 0, (capacity - a->frames) * sizeof(float));
+		}
+
+		a->capacity = capacity;
+	} else if (frames > a->frames) {
+		for (size_t ch = 0; ch < a->channels; ch++)
+			memset(a->buf[ch] + a->frames, 0, (frames - a->frames) * sizeof(float));
+	}
+
+	if (frames > a->frames)
+		a->frames = frames;
+
+	return true;
+}
+
+/* Hands OBS whatever of the mix nothing is going to add to any more: everything
+ * up to the point the item that is furthest behind has reached, and never more
+ * than the hold behind the clock, so an item that stops handing audio over
+ * cannot wedge the ones that have not. Expects the mixer's lock to be held. */
+static void warp_pl_mix_flush(struct warp_playlist_source *s)
+{
+	struct warp_pl_audio *a = &s->audio;
+
+	if (!a->have || !a->frames || !a->sample_rate || !a->channels)
+		return;
+
+	uint64_t now = os_gettime_ns();
+	uint64_t horizon = a->ts + warp_pl_frames_to_ns(a->sample_rate, a->frames);
+
+	for (size_t i = 0; i < WARP_PL_NUM_DECKS; i++) {
+		struct warp_pl_deck *deck = &a->deck[i];
+
+		if (!deck->source || !deck->producing)
+			continue;
+
+		if (now - deck->arrived > WARP_PL_DECK_IDLE_NS) {
+			deck->producing = false;
+			continue;
+		}
+
+		if (deck->end_ts < horizon)
+			horizon = deck->end_ts;
+	}
+
+	/* nothing is waited on for longer than the hold, so a source that stops
+	 * handing audio over cannot wedge the ones that have not */
+	if (now > WARP_PL_MIX_HOLD_NS && horizon < now - WARP_PL_MIX_HOLD_NS)
+		horizon = now - WARP_PL_MIX_HOLD_NS;
+
+	if (horizon <= a->ts)
+		return;
+
+	size_t frames = (size_t)warp_pl_ns_to_frames(a->sample_rate, horizon - a->ts);
+
+	if (frames > a->frames)
+		frames = a->frames;
+	if (!frames)
+		return;
+
+	struct obs_source_audio out = {0};
+
+	for (size_t ch = 0; ch < a->channels; ch++)
+		out.data[ch] = (const uint8_t *)a->buf[ch];
+
+	out.frames = (uint32_t)frames;
+	out.speakers = a->speakers;
+	out.format = AUDIO_FORMAT_FLOAT_PLANAR;
+	out.samples_per_sec = (uint32_t)a->sample_rate;
+	out.timestamp = a->ts;
+
+	obs_source_output_audio(s->source, &out);
+
+	a->ts += warp_pl_frames_to_ns(a->sample_rate, frames);
+	a->next_ts = a->ts;
+	a->flushed = true;
+	a->frames -= frames;
+
+	if (a->frames) {
+		for (size_t ch = 0; ch < a->channels; ch++)
+			memmove(a->buf[ch], a->buf[ch] + frames, a->frames * sizeof(float));
+	} else {
+		a->have = false;
+	}
+}
+
+/* Takes a packet of one item's audio into the mix. Runs on that item's own
+ * media thread, which is why the mixer has a lock of its own: s->mutex is held
+ * across work that hands sources to transitions, and audio cannot wait on it. */
+static void warp_pl_mix_submit(struct warp_playlist_source *s, obs_source_t *source, const struct audio_data *audio,
+			       bool muted)
+{
+	audio_t *obs_audio = obs_get_audio();
+
+	if (!obs_audio || !audio || !audio->frames)
+		return;
+
+	const struct audio_output_info *info = audio_output_get_info(obs_audio);
+	size_t channels = audio_output_get_channels(obs_audio);
+	size_t sample_rate = audio_output_get_sample_rate(obs_audio);
+
+	if (!info || !channels || channels > MAX_AUDIO_CHANNELS || !sample_rate)
+		return;
+
+	struct warp_pl_audio *a = &s->audio;
+	struct warp_pl_deck *deck = NULL;
+
+	pthread_mutex_lock(&a->mutex);
+
+	for (size_t i = 0; i < WARP_PL_NUM_DECKS; i++) {
+		if (a->deck[i].source == source) {
+			deck = &a->deck[i];
+			break;
+		}
+	}
+
+	/* the item was taken off the mixer between the packet being handed over
+	 * and this getting to look at it */
+	if (deck) {
+		if (a->channels != channels || a->sample_rate != sample_rate)
+			warp_pl_mix_reset(a, channels, sample_rate);
+
+		a->speakers = info->speakers;
+
+		/* put the packet on the clock the mixer works in */
+		uint64_t arrived = os_gettime_ns();
+		int64_t raw = (int64_t)audio->timestamp;
+
+		if (!deck->anchored) {
+			deck->offset = (int64_t)arrived - raw;
+			deck->anchored = true;
+		} else {
+			uint64_t placed = (uint64_t)(raw + deck->offset);
+			uint64_t drift = placed > arrived ? placed - arrived : arrived - placed;
+
+			if (drift > WARP_PL_DECK_RESYNC_NS)
+				deck->offset = (int64_t)arrived - raw;
+		}
+
+		uint64_t ts = (uint64_t)(raw + deck->offset);
+		size_t frames = audio->frames;
+		size_t skipped = 0;
+
+		/* Where the mix will take samples from: never behind what has
+		 * already gone out, and never behind what is being held, so a
+		 * packet that turns up late is trimmed rather than mixed in
+		 * under audio that has moved on. */
+		uint64_t floor_ts = a->flushed ? a->next_ts : 0;
+		bool have_floor = a->flushed;
+
+		if (a->have && (!have_floor || a->ts > floor_ts)) {
+			floor_ts = a->ts;
+			have_floor = true;
+		}
+
+		if (have_floor && ts < floor_ts) {
+			skipped = (size_t)warp_pl_ns_to_frames(sample_rate, floor_ts - ts);
+
+			if (skipped >= frames) {
+				/* all of it is behind; the deck has still been
+				 * heard from, so it is not waited on for this */
+				skipped = frames;
+				frames = 0;
+			} else {
+				frames -= skipped;
+			}
+
+			ts = floor_ts;
+		}
+
+		if (frames) {
+			if (!a->have) {
+				a->ts = ts;
+				a->frames = 0;
+				a->have = true;
+			}
+
+			size_t offset = (size_t)warp_pl_ns_to_frames(sample_rate, ts - a->ts);
+
+			if (!warp_pl_mix_reserve(a, offset + frames)) {
+				/* Further ahead than the mixer will hold, which
+				 * takes an item whose timestamps have run away.
+				 * Start again from this packet rather than
+				 * growing without end. */
+				warp_pl_mix_reset(a, channels, sample_rate);
+				a->ts = ts;
+				a->have = true;
+				offset = 0;
+
+				if (!warp_pl_mix_reserve(a, frames))
+					frames = 0;
+			}
+
+			float level = deck->from_transition ? a->transition_volume : a->volume;
+			float target = muted ? 0.0f : deck->gain * level;
+			float step = frames ? (target - deck->applied_gain) / (float)frames : 0.0f;
+
+			for (size_t ch = 0; ch < channels && frames; ch++) {
+				const float *in = (const float *)audio->data[ch];
+				float *out = a->buf[ch] + offset;
+				float gain = deck->applied_gain;
+
+				if (!in)
+					continue;
+
+				in += skipped;
+
+				for (size_t i = 0; i < frames; i++) {
+					out[i] += in[i] * gain;
+					gain += step;
+				}
+			}
+
+			if (frames)
+				deck->applied_gain = target;
+		}
+
+		deck->end_ts = ts + warp_pl_frames_to_ns(sample_rate, frames);
+		deck->arrived = arrived;
+		deck->producing = true;
+
+		warp_pl_mix_flush(s);
+	}
+
+	pthread_mutex_unlock(&a->mutex);
+}
+
+static void warp_pl_audio_capture(void *param, obs_source_t *source, const struct audio_data *audio, bool muted)
+{
+	warp_pl_mix_submit(param, source, audio, muted);
+}
+
+/* What the two halves of a running transition are played at, worked out the
+ * way the transition itself would have worked them out: everything crosses the
+ * two files over, and a stinger set to fade out and back in instead takes the
+ * outgoing file down to nothing by the point it swaps at and brings the
+ * incoming one back up from there. */
+static void warp_pl_transition_gains(const struct warp_pl_transition_audio *info, float t, float *out, float *in)
+{
+	if (t < 0.0f)
+		t = 0.0f;
+	else if (t > 1.0f)
+		t = 1.0f;
+
+	if (info->is_stinger && !info->stinger_cross_fade) {
+		float point = info->ms ? (float)info->stinger_point_ms / (float)info->ms : 0.5f;
+
+		if (point < 0.001f)
+			point = 0.001f;
+		else if (point > 0.999f)
+			point = 0.999f;
+
+		float faded_out = t / point;
+		float faded_in = (1.0f - t) / (1.0f - point);
+
+		*out = 1.0f - (faded_out > 1.0f ? 1.0f : faded_out);
+		*in = 1.0f - (faded_in > 1.0f ? 1.0f : faded_in);
+		return;
+	}
+
+	*out = 1.0f - t;
+	*in = t;
+}
+
+/* What the mixer should be listening to: the two halves of the transition and
+ * whatever it plays of its own on top of them. */
+struct warp_pl_audio_scan {
+	obs_source_t *want[WARP_PL_NUM_DECKS];
+	float gain[WARP_PL_NUM_DECKS];
+	bool from_transition[WARP_PL_NUM_DECKS];
+	size_t num;
+};
+
+static size_t warp_pl_audio_scan_find(const struct warp_pl_audio_scan *scan, obs_source_t *source)
+{
+	for (size_t i = 0; i < scan->num; i++) {
+		if (scan->want[i] == source)
+			return i;
+	}
+
+	return DARRAY_INVALID;
+}
+
+/* Expects 'source' to be one the caller has a reference to for the length of
+ * the call, which is what obs_source_enum_active_sources() guarantees. A source
+ * that stands in more than one place is played once, at everything it is asked
+ * for put together: the two halves of a transition are the same item for a
+ * moment whenever the picture is handed from one transition to the other. */
+static void warp_pl_audio_scan_add(struct warp_pl_audio_scan *scan, obs_source_t *source, float gain,
+				   bool from_transition)
+{
+	if (!source)
+		return;
+
+	size_t found = warp_pl_audio_scan_find(scan, source);
+
+	if (found != DARRAY_INVALID) {
+		scan->gain[found] += gain;
+		return;
+	}
+
+	if (scan->num == WARP_PL_NUM_DECKS)
+		return;
+
+	scan->want[scan->num] = obs_source_get_ref(source);
+	scan->gain[scan->num] = gain;
+	scan->from_transition[scan->num] = from_transition;
+	scan->num++;
+}
+
+/* Picks up whatever the transition itself is playing on top of the two halves
+ * it is holding, which for a stinger is the video it swaps over behind and the
+ * matte alongside it. The matte is muted by the transition that made it, and a
+ * muted source is mixed in as the silence it is, so the two need not be told
+ * apart. */
+static void warp_pl_audio_scan_transition(obs_source_t *parent, obs_source_t *child, void *param)
+{
+	struct warp_pl_audio_scan *scan = param;
+
+	UNUSED_PARAMETER(parent);
+
+	/* the halves are in already, at what the crossfade asks for */
+	if (warp_pl_audio_scan_find(scan, child) != DARRAY_INVALID)
+		return;
+
+	warp_pl_audio_scan_add(scan, child, 1.0f, true);
+}
+
+/* Points the mixer at the sources the transition on screen is playing and sets
+ * what each of them is played at. Runs on the tick, with no lock held: putting
+ * a tap on a source takes that source's own lock, so it is never done under the
+ * mixer's. */
+static void warp_pl_audio_sync(struct warp_playlist_source *s)
+{
+	struct warp_pl_audio *a = &s->audio;
+	struct warp_pl_transition_audio info;
+	struct warp_pl_audio_scan scan = {0};
+	obs_source_t **want = scan.want;
+	float *gain = scan.gain;
+	bool placed[WARP_PL_NUM_DECKS] = {false};
+	obs_source_t *taken[WARP_PL_NUM_DECKS] = {NULL};
+	obs_source_t *dropped[WARP_PL_NUM_DECKS] = {NULL};
+
+	obs_source_t *transition = warp_pl_get_transition_audio(s, &info);
+
+	if (transition) {
+		obs_source_t *from = obs_transition_get_source(transition, OBS_TRANSITION_SOURCE_A);
+		obs_source_t *into = NULL;
+		float from_gain = 1.0f;
+		float into_gain = 0.0f;
+
+		if (obs_transition_is_active(transition)) {
+			into = obs_transition_get_source(transition, OBS_TRANSITION_SOURCE_B);
+			warp_pl_transition_gains(&info, obs_transition_get_time(transition), &from_gain, &into_gain);
+		}
+
+		warp_pl_audio_scan_add(&scan, from, from_gain, false);
+		warp_pl_audio_scan_add(&scan, into, into_gain, false);
+
+		/* the two halves are already in, so this only adds what the
+		 * transition brought along itself */
+		obs_source_enum_active_sources(transition, warp_pl_audio_scan_transition, &scan);
+
+		obs_source_release(from);
+		obs_source_release(into);
+		obs_source_release(transition);
+	}
+
+	for (size_t i = 0; i < WARP_PL_NUM_DECKS; i++) {
+		obs_source_t *held = a->deck[i].source;
+		bool keep = false;
+
+		if (!held)
+			continue;
+
+		for (size_t j = 0; j < WARP_PL_NUM_DECKS; j++) {
+			if (want[j] == held)
+				keep = true;
+		}
+
+		if (!keep) {
+			obs_source_remove_audio_capture_callback(held, warp_pl_audio_capture, s);
+			dropped[i] = held;
+		}
+	}
+
+	pthread_mutex_lock(&a->mutex);
+
+	for (size_t i = 0; i < WARP_PL_NUM_DECKS; i++) {
+		if (dropped[i])
+			memset(&a->deck[i], 0, sizeof(a->deck[i]));
+	}
+
+	/* an item that is already tapped keeps its deck, so a crossfade that is
+	 * running rides on rather than starting over from silence */
+	for (size_t j = 0; j < WARP_PL_NUM_DECKS; j++) {
+		if (!want[j])
+			continue;
+
+		for (size_t i = 0; i < WARP_PL_NUM_DECKS; i++) {
+			if (a->deck[i].source != want[j])
+				continue;
+
+			a->deck[i].gain = gain[j];
+			a->deck[i].from_transition = scan.from_transition[j];
+			placed[j] = true;
+			break;
+		}
+	}
+
+	for (size_t j = 0; j < WARP_PL_NUM_DECKS; j++) {
+		if (!want[j] || placed[j])
+			continue;
+
+		for (size_t i = 0; i < WARP_PL_NUM_DECKS; i++) {
+			if (a->deck[i].source)
+				continue;
+
+			memset(&a->deck[i], 0, sizeof(a->deck[i]));
+			a->deck[i].source = obs_source_get_ref(want[j]);
+			a->deck[i].gain = gain[j];
+			a->deck[i].from_transition = scan.from_transition[j];
+
+			taken[i] = a->deck[i].source;
+			placed[j] = true;
+			break;
+		}
+	}
+
+	pthread_mutex_unlock(&a->mutex);
+
+	for (size_t i = 0; i < WARP_PL_NUM_DECKS; i++) {
+		if (!taken[i])
+			continue;
+
+		/* Everything the playlist listens to is played by the playlist
+		 * and by nothing else. The items are opened without mixers of
+		 * their own; a transition's own video is not the playlist's to
+		 * open, so it is quietened here as it is picked up. */
+		obs_source_set_audio_mixers(taken[i], 0);
+		obs_source_add_audio_capture_callback(taken[i], warp_pl_audio_capture, s);
+	}
+
+	for (size_t i = 0; i < WARP_PL_NUM_DECKS; i++) {
+		if (dropped[i])
+			obs_source_release(dropped[i]);
+	}
+
+	for (size_t j = 0; j < WARP_PL_NUM_DECKS; j++) {
+		if (want[j])
+			obs_source_release(want[j]);
+	}
+
+	/* an item that has gone quiet, or gone entirely, leaves the last of its
+	 * audio behind; nothing is going to add to it, so it goes out now */
+	pthread_mutex_lock(&a->mutex);
+	warp_pl_mix_flush(s);
+	pthread_mutex_unlock(&a->mutex);
+}
+
+/* takes every tap off and drops what the mixer is holding */
+static void warp_pl_audio_free(struct warp_playlist_source *s)
+{
+	struct warp_pl_audio *a = &s->audio;
+	obs_source_t *held[WARP_PL_NUM_DECKS];
+
+	for (size_t i = 0; i < WARP_PL_NUM_DECKS; i++) {
+		held[i] = a->deck[i].source;
+
+		if (held[i])
+			obs_source_remove_audio_capture_callback(held[i], warp_pl_audio_capture, s);
+	}
+
+	pthread_mutex_lock(&a->mutex);
+	memset(a->deck, 0, sizeof(a->deck));
+	warp_pl_mix_reset(a, 0, 0);
+	pthread_mutex_unlock(&a->mutex);
+
+	for (size_t i = 0; i < WARP_PL_NUM_DECKS; i++) {
+		if (held[i])
+			obs_source_release(held[i]);
+	}
+}
+
+/* ------------------------------------------------------------------------- */
 /* playlist bookkeeping (all of these expect s->mutex to be held) */
 
 static uint64_t warp_pl_rand(struct warp_playlist_source *s)
@@ -686,6 +1356,14 @@ static obs_source_t *warp_pl_create_item(struct warp_playlist_source *s, const c
 		WARP_PL_LOG(LOG_WARNING, "failed to open '%s'", path);
 		return item;
 	}
+
+	/* The item is played through the playlist's own mixer and nowhere else.
+	 * Leaving it no mixers of its own is what makes that true: libobs mixes
+	 * a source it meets twice in the audio tree straight into the program
+	 * mix by itself, past every parent that would have scaled it, and an
+	 * item is met twice as soon as anything looks at the scene a second
+	 * time. With no mixers there is nothing for that path to carry. */
+	obs_source_set_audio_mixers(item, 0);
 
 	/* Every file is opened with a zoom filter of its own, driven by this
 	 * playlist. It costs nothing while the file is being watched whole -
@@ -1254,10 +1932,14 @@ static void warp_pl_capture_transition_settings(struct warp_playlist_source *s, 
 		if (!warp_pl_data_empty(copy))
 			obs_data_set_obj(s->tr[dir].store, id, copy);
 
-		/* where a stinger swaps the incoming file in is one of its own
-		 * settings, so the playlist picks it up along with them */
-		if (strcmp(id, WARP_PL_TR_STINGER) == 0)
+		/* where a stinger swaps the incoming file in, and how it takes
+		 * the sound over, are its own settings, so the playlist picks
+		 * them up along with them */
+		if (strcmp(id, WARP_PL_TR_STINGER) == 0) {
 			s->tr[dir].stinger_point_ms = warp_pl_stinger_point_ms(copy);
+			s->tr[dir].stinger_cross_fade = obs_data_get_int(copy, "audio_fade_style") ==
+							WARP_PL_STINGER_FADE_CROSS;
+		}
 
 		pthread_mutex_unlock(&s->mutex);
 
@@ -1568,6 +2250,7 @@ static void warp_playlist_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "back_transition_alignment", "center");
 	obs_data_set_default_int(settings, "speed_percent", 100);
 	obs_data_set_default_int(settings, "volume_percent", 100);
+	obs_data_set_default_int(settings, "transition_volume_percent", 100);
 	obs_data_set_default_bool(settings, "restart_on_activate", true);
 	obs_data_set_default_bool(settings, "clear_on_media_end", true);
 	obs_data_set_default_bool(settings, "linear_alpha", false);
@@ -1584,6 +2267,25 @@ static const char *audio_filter = " (*.mp3 *.aac *.ogg *.wav);;";
 
 /* Only what the playlist puts around the transition is shown here; what the
  * transition itself is configured with belongs to the transition. */
+/* Shows the level a transition's own sound is played at, which only a stinger
+ * has: everything else is nothing but the two files it is holding, and there is
+ * no second level for it to set. Going back is only asked about when it has a
+ * transition of its own; without one it runs through the forward transition
+ * like everything else. */
+static void warp_pl_show_transition_volume(obs_properties_t *props, obs_data_t *settings)
+{
+	obs_property_t *prop = obs_properties_get(props, "transition_volume_percent");
+	bool stinger =
+		strcmp(obs_data_get_string(settings, warp_pl_keys[WARP_PL_DIR_FORWARD].id), WARP_PL_TR_STINGER) == 0;
+
+	if (!stinger && obs_data_get_bool(settings, "separate_back_transition"))
+		stinger = strcmp(obs_data_get_string(settings, warp_pl_keys[WARP_PL_DIR_BACKWARD].id),
+				 WARP_PL_TR_STINGER) == 0;
+
+	if (prop)
+		obs_property_set_visible(prop, stinger);
+}
+
 static bool warp_pl_transition_changed_dir(obs_properties_t *props, obs_data_t *settings, size_t dir)
 {
 	const char *id = obs_data_get_string(settings, warp_pl_keys[dir].id);
@@ -1595,6 +2297,8 @@ static bool warp_pl_transition_changed_dir(obs_properties_t *props, obs_data_t *
 
 	if (warp_pl_keys[dir].timing)
 		obs_property_set_visible(obs_properties_get(props, warp_pl_keys[dir].timing), !is_cut);
+
+	warp_pl_show_transition_volume(props, settings);
 
 	return true;
 }
@@ -1630,6 +2334,10 @@ static bool warp_pl_separate_back_changed(obs_properties_t *props, obs_property_
 								      : "Warp.Playlist.Group.Transition"));
 
 	obs_property_set_visible(obs_properties_get(props, "back_transition_group"), separate);
+
+	/* a stinger for going back is only played when going back has a
+	 * transition of its own */
+	warp_pl_show_transition_volume(props, settings);
 
 	return true;
 }
@@ -1784,9 +2492,9 @@ static obs_properties_t *warp_playlist_getproperties(void *data)
 		pthread_mutex_unlock(&s->mutex);
 	}
 
-	/* Speed and volume ride at the top, in a group of their own: they are
-	 * the two an operator reaches for while a clip is up, and everything
-	 * below them is set once when the source is built. */
+	/* Speed and the two levels ride at the top, in a group of their own:
+	 * they are what an operator reaches for while a clip is up, and
+	 * everything below them is set once when the source is built. */
 	playback = obs_properties_create();
 
 	prop = obs_properties_add_int_slider(playback, "speed_percent", obs_module_text("Warp.Video.Speed"),
@@ -1798,6 +2506,12 @@ static obs_properties_t *warp_playlist_getproperties(void *data)
 					     WARP_PL_VOLUME_MIN, WARP_PL_VOLUME_MAX, 1);
 	obs_property_int_set_suffix(prop, "%");
 	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.Volume.Desc"));
+
+	prop = obs_properties_add_int_slider(playback, "transition_volume_percent",
+					     obs_module_text("Warp.Playlist.TransitionVolume"), WARP_PL_VOLUME_MIN,
+					     WARP_PL_VOLUME_MAX, 1);
+	obs_property_int_set_suffix(prop, "%");
+	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.TransitionVolume.Desc"));
 
 	obs_properties_add_group(props, "playback_group", obs_module_text("Warp.Playlist.Group.Playback"),
 				 OBS_GROUP_NORMAL, playback);
@@ -1936,6 +2650,8 @@ static void warp_pl_apply_transition(struct warp_playlist_source *s, size_t dir,
 	obs_data_t *tr_settings = warp_pl_transition_settings(s, dir, id);
 
 	cfg->stinger_point_ms = cfg->is_stinger ? warp_pl_stinger_point_ms(tr_settings) : 0;
+	cfg->stinger_cross_fade = cfg->is_stinger &&
+				  obs_data_get_int(tr_settings, "audio_fade_style") == WARP_PL_STINGER_FADE_CROSS;
 
 	if (type_changed || store_loaded) {
 		obs_data_release(cfg->pending_settings);
@@ -1979,6 +2695,7 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 	bool separate_back = obs_data_get_bool(settings, "separate_back_transition");
 	int speed = (int)obs_data_get_int(settings, "speed_percent");
 	int volume = (int)obs_data_get_int(settings, "volume_percent");
+	int transition_volume = (int)obs_data_get_int(settings, "transition_volume_percent");
 
 	if (speed < MP_SPEED_MIN || speed > MP_SPEED_MAX)
 		speed = 100;
@@ -1987,6 +2704,11 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 		volume = WARP_PL_VOLUME_MIN;
 	else if (volume > WARP_PL_VOLUME_MAX)
 		volume = WARP_PL_VOLUME_MAX;
+
+	if (transition_volume < WARP_PL_VOLUME_MIN)
+		transition_volume = WARP_PL_VOLUME_MIN;
+	else if (transition_volume > WARP_PL_VOLUME_MAX)
+		transition_volume = WARP_PL_VOLUME_MAX;
 
 	/* the transitions' own properties write to the transitions rather than
 	 * to these settings, so what they are running with is read back before
@@ -2020,6 +2742,15 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 
 	bool overlap = strcmp(obs_data_get_string(settings, "transition_timing"), WARP_PL_TIMING_AFTER) != 0;
 
+	/* The mixer's lock is a leaf, so the levels are set before s->mutex is
+	 * picked up rather than under it. The next packet of everything that is
+	 * playing rides to the new level, so this applies to the file that is
+	 * up as well as to the ones after it. */
+	pthread_mutex_lock(&s->audio.mutex);
+	s->audio.volume = (float)volume / 100.0f;
+	s->audio.transition_volume = (float)transition_volume / 100.0f;
+	pthread_mutex_unlock(&s->audio.mutex);
+
 	pthread_mutex_lock(&s->mutex);
 
 	/* zero until the first update, which is the one create() makes */
@@ -2046,9 +2777,6 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 	s->is_linear_alpha = obs_data_get_bool(settings, "linear_alpha");
 	s->range = (enum video_range_type)obs_data_get_int(settings, "color_range");
 	s->base_speed = speed;
-	/* the audio thread picks this up on its next call, so it applies to the
-	 * file that is playing rather than only to the ones after it */
-	s->volume = (float)volume / 100.0f;
 
 	if (warp_pl_load_playlist(s, settings))
 		order_changed = true;
@@ -2614,7 +3342,8 @@ static void *warp_playlist_create(obs_data_t *settings, obs_source_t *source)
 	s->source = source;
 	s->state = OBS_MEDIA_STATE_NONE;
 	s->base_speed = 100;
-	s->volume = 1.0f;
+	s->audio.volume = 1.0f;
+	s->audio.transition_volume = 1.0f;
 	/* s->speed is left at zero: the update below fills it in, and a speed
 	 * that was never played at is not a change to report */
 	s->rand_state = os_gettime_ns() | 1;
@@ -2633,6 +3362,17 @@ static void *warp_playlist_create(obs_data_t *settings, obs_source_t *source)
 		for (size_t dir = 0; dir < WARP_PL_NUM_DIRS; dir++)
 			obs_data_release(s->tr[dir].store);
 
+		bfree(s);
+		return NULL;
+	}
+
+	if (pthread_mutex_init(&s->audio.mutex, NULL)) {
+		blog(LOG_ERROR, "[Warp Playlist]: failed to initialize audio mutex");
+
+		for (size_t dir = 0; dir < WARP_PL_NUM_DIRS; dir++)
+			obs_data_release(s->tr[dir].store);
+
+		pthread_mutex_destroy(&s->mutex);
 		bfree(s);
 		return NULL;
 	}
@@ -2664,6 +3404,9 @@ static void warp_playlist_destroy(void *data)
 	obs_source_t *prev;
 
 	warp_zoom_control_free(&s->zoom);
+
+	/* the items stop being tapped before anything lets go of them */
+	warp_pl_audio_free(s);
 
 	pthread_mutex_lock(&s->mutex);
 
@@ -2741,6 +3484,7 @@ static void warp_playlist_destroy(void *data)
 		obs_source_release(transitions[dir]);
 	}
 
+	pthread_mutex_destroy(&s->audio.mutex);
 	pthread_mutex_destroy(&s->mutex);
 	bfree(s);
 }
@@ -2756,63 +3500,6 @@ static void warp_playlist_video_render(void *data, gs_effect_t *effect)
 		obs_source_video_render(transition);
 		obs_source_release(transition);
 	}
-}
-
-static bool warp_playlist_audio_render(void *data, uint64_t *ts_out, struct obs_source_audio_mix *audio_output,
-				       uint32_t mixers, size_t channels, size_t sample_rate)
-{
-	UNUSED_PARAMETER(sample_rate);
-
-	struct warp_playlist_source *s = data;
-	/* the tick swaps the transition out, so the audio thread needs a
-	 * reference of its own rather than the bare pointer */
-	float volume = 1.0f;
-	obs_source_t *transition = warp_pl_get_transition_volume(s, &volume);
-	uint64_t timestamp;
-
-	if (!transition)
-		return false;
-
-	if (obs_source_audio_pending(transition)) {
-		obs_source_release(transition);
-		return false;
-	}
-
-	timestamp = obs_source_get_audio_timestamp(transition);
-
-	if (!timestamp) {
-		obs_source_release(transition);
-		return false;
-	}
-
-	struct obs_source_audio_mix child_audio;
-
-	obs_source_get_audio_mix(transition, &child_audio);
-
-	/* The volume property is the only place the playlist's audio can be
-	 * turned down: a composite source is not given a slider in the OBS
-	 * mixer. Full volume hands the samples over as they are. */
-	for (size_t mix = 0; mix < MAX_AUDIO_MIXES; mix++) {
-		if ((mixers & (1 << mix)) == 0)
-			continue;
-
-		for (size_t ch = 0; ch < channels; ch++) {
-			float *out = audio_output->output[mix].data[ch];
-			float *in = child_audio.output[mix].data[ch];
-
-			if (volume == 1.0f) {
-				memcpy(out, in, AUDIO_OUTPUT_FRAMES * sizeof(float));
-			} else {
-				for (size_t frame = 0; frame < AUDIO_OUTPUT_FRAMES; frame++)
-					out[frame] = in[frame] * volume;
-			}
-		}
-	}
-
-	obs_source_release(transition);
-
-	*ts_out = timestamp;
-	return true;
 }
 
 static void warp_playlist_enum_active_sources(void *data, obs_source_enum_proc_t cb, void *param)
@@ -3009,6 +3696,11 @@ static void warp_playlist_tick(void *data, float seconds)
 	warp_pl_unlock(s);
 
 	obs_source_release(transition);
+
+	/* Follow the transition with the audio, after the switch above rather
+	 * than before it, so the item going up is being listened to from the
+	 * tick it goes up. */
+	warp_pl_audio_sync(s);
 
 	/* Frame the file that is playing. This is done after the switch above
 	 * rather than before it so that a file going up is framed on the tick
@@ -3345,12 +4037,13 @@ static obs_missing_files_t *warp_playlist_missingfiles(void *data)
 struct obs_source_info warp_playlist_source_info = {
 	.id = "warp_playlist_source",
 	.type = OBS_SOURCE_TYPE_INPUT,
-	/* OBS_SOURCE_AUDIO must not be set alongside OBS_SOURCE_COMPOSITE:
-	 * obs_register_source() rejects that combination outright, which keeps
-	 * the source out of the Add Source menu entirely. A composite source
-	 * delivers its audio through audio_render instead, the way scenes and
-	 * the slide show source do. */
-	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_COMPOSITE | OBS_SOURCE_DO_NOT_DUPLICATE |
+	/* The playlist renders its picture itself and hands its audio over
+	 * itself, the way the browser source does. It is deliberately not
+	 * composite: obs_register_source() refuses OBS_SOURCE_AUDIO alongside
+	 * OBS_SOURCE_COMPOSITE, and without OBS_SOURCE_AUDIO there is no
+	 * playlist in the OBS audio mixer to fade, mute, monitor, filter or
+	 * route. The items are mixed by the audio section above instead. */
+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_AUDIO | OBS_SOURCE_DO_NOT_DUPLICATE |
 			OBS_SOURCE_CONTROLLABLE_MEDIA,
 	.get_name = warp_playlist_getname,
 	.create = warp_playlist_create,
@@ -3363,7 +4056,6 @@ struct obs_source_info warp_playlist_source_info = {
 	.deactivate = warp_playlist_deactivate,
 	.video_render = warp_playlist_video_render,
 	.video_tick = warp_playlist_tick,
-	.audio_render = warp_playlist_audio_render,
 	.enum_active_sources = warp_playlist_enum_active_sources,
 	.get_width = warp_playlist_getwidth,
 	.get_height = warp_playlist_getheight,
