@@ -387,10 +387,8 @@ struct warp_playlist_source {
 	bool loop_playlist;
 	bool shuffle;
 	bool hw_decode;
-	bool is_linear_alpha;
 	bool restart_on_activate;
 	bool clear_on_media_end;
-	enum video_range_type range;
 
 	bool showing_nothing;
 	enum obs_media_state state;
@@ -1315,8 +1313,6 @@ static bool warp_pl_step_pos(struct warp_playlist_source *s, int dir, size_t *ou
 struct warp_pl_item_config {
 	int speed;
 	bool hw_decode;
-	bool is_linear_alpha;
-	enum video_range_type range;
 };
 
 /* expects s->mutex to be held */
@@ -1324,8 +1320,6 @@ static void warp_pl_read_item_config(struct warp_playlist_source *s, struct warp
 {
 	cfg->speed = s->base_speed;
 	cfg->hw_decode = s->hw_decode;
-	cfg->is_linear_alpha = s->is_linear_alpha;
-	cfg->range = s->range;
 }
 
 /* expects s->mutex NOT to be held */
@@ -1343,8 +1337,6 @@ static obs_source_t *warp_pl_create_item(struct warp_playlist_source *s, const c
 	obs_data_set_bool(settings, "restart_on_activate", false);
 	obs_data_set_bool(settings, "close_when_inactive", false);
 	obs_data_set_bool(settings, "hw_decode", cfg->hw_decode);
-	obs_data_set_bool(settings, "linear_alpha", cfg->is_linear_alpha);
-	obs_data_set_int(settings, "color_range", cfg->range);
 	obs_data_set_int(settings, "speed_percent", cfg->speed);
 	/* one settings dump per playlist item would drown the log */
 	obs_data_set_bool(settings, "log_changes", false);
@@ -2253,7 +2245,6 @@ static void warp_playlist_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "transition_volume_percent", 100);
 	obs_data_set_default_bool(settings, "restart_on_activate", true);
 	obs_data_set_default_bool(settings, "clear_on_media_end", true);
-	obs_data_set_default_bool(settings, "linear_alpha", false);
 
 	/* the framing itself is not saved with the playlist: it belongs to the
 	 * file that is playing, and the next file starts from the top */
@@ -2317,10 +2308,10 @@ static bool warp_pl_back_transition_changed(obs_properties_t *props, obs_propert
 	return warp_pl_transition_changed_dir(props, settings, WARP_PL_DIR_BACKWARD);
 }
 
-/* Shows the section that going back through the playlist is configured in, and
- * says as much in the heading of the one above it: with a transition of its own
- * for going back, the transition the playlist has always had is the one it goes
- * forward with. */
+/* Shows the second section, the one going back through the playlist is
+ * configured in, and says as much in the heading of the first: with a
+ * transition of its own for going back, the transition the playlist has always
+ * had is the one it goes forward with. */
 static bool warp_pl_separate_back_changed(obs_properties_t *props, obs_property_t *prop, obs_data_t *settings)
 {
 	bool separate = obs_data_get_bool(settings, "separate_back_transition");
@@ -2516,6 +2507,17 @@ static obs_properties_t *warp_playlist_getproperties(void *data)
 	obs_properties_add_group(props, "playback_group", obs_module_text("Warp.Playlist.Group.Playback"),
 				 OBS_GROUP_NORMAL, playback);
 
+	/* The three switches that say what the playlist does around the edges of
+	 * a show - how it starts, how it ends, and what decodes it - stand above
+	 * the file list rather than at the foot of the window. They are settings
+	 * an operator reaches for between clips, and hunting for them past every
+	 * transition setting is not something to be doing with a show running. */
+	obs_properties_add_bool(props, "restart_on_activate", obs_module_text("Warp.Playlist.RestartOnActivate"));
+
+	obs_properties_add_bool(props, "clear_on_media_end", obs_module_text("Warp.Playlist.ClearOnEnd"));
+
+	obs_properties_add_bool(props, "hw_decode", obs_module_text("Warp.Video.HardwareDecode"));
+
 	obs_properties_add_editable_list(props, "playlist", obs_module_text("Warp.Playlist.Files"),
 					 OBS_EDITABLE_LIST_TYPE_FILES, filter.array, path.array);
 	dstr_free(&filter);
@@ -2528,32 +2530,23 @@ static obs_properties_t *warp_playlist_getproperties(void *data)
 
 	obs_properties_add_bool(props, "loop_playlist", obs_module_text("Warp.Playlist.Loop"));
 
-	obs_properties_add_group(props, "transition_group", obs_module_text("Warp.Playlist.Group.Transition"),
-				 OBS_GROUP_NORMAL, warp_pl_transition_properties(s, WARP_PL_DIR_FORWARD));
-
+	/* Asked before either section rather than between them: whether going
+	 * back has a transition of its own is what says how many sections there
+	 * are to read, so it is answered on the way in. Sat between them it read
+	 * as a footnote to the first, which is not where anybody looking for it
+	 * thinks to look. */
 	prop = obs_properties_add_bool(props, "separate_back_transition",
 				       obs_module_text("Warp.Playlist.SeparateBackTransition"));
 	obs_property_set_long_description(prop, obs_module_text("Warp.Playlist.SeparateBackTransition.Desc"));
 	obs_property_set_modified_callback(prop, warp_pl_separate_back_changed);
 
+	obs_properties_add_group(props, "transition_group", obs_module_text("Warp.Playlist.Group.Transition"),
+				 OBS_GROUP_NORMAL, warp_pl_transition_properties(s, WARP_PL_DIR_FORWARD));
+
 	obs_properties_add_group(props, "back_transition_group", obs_module_text("Warp.Playlist.Group.Transition.Back"),
 				 OBS_GROUP_NORMAL, warp_pl_transition_properties(s, WARP_PL_DIR_BACKWARD));
 
 	warp_zoom_control_properties(props, false);
-
-	obs_properties_add_bool(props, "restart_on_activate", obs_module_text("Warp.Playlist.RestartOnActivate"));
-
-	obs_properties_add_bool(props, "clear_on_media_end", obs_module_text("Warp.Playlist.ClearOnEnd"));
-
-	obs_properties_add_bool(props, "hw_decode", obs_module_text("Warp.Video.HardwareDecode"));
-
-	prop = obs_properties_add_list(props, "color_range", obs_module_text("Warp.Video.ColorRange"),
-				       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(prop, obs_module_text("Warp.Video.ColorRange.Auto"), VIDEO_RANGE_DEFAULT);
-	obs_property_list_add_int(prop, obs_module_text("Warp.Video.ColorRange.Partial"), VIDEO_RANGE_PARTIAL);
-	obs_property_list_add_int(prop, obs_module_text("Warp.Video.ColorRange.Full"), VIDEO_RANGE_FULL);
-
-	obs_properties_add_bool(props, "linear_alpha", obs_module_text("Warp.Video.LinearAlpha"));
 
 	return props;
 }
@@ -2774,8 +2767,6 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 	s->restart_on_activate = obs_data_get_bool(settings, "restart_on_activate");
 	s->clear_on_media_end = obs_data_get_bool(settings, "clear_on_media_end");
 	s->hw_decode = obs_data_get_bool(settings, "hw_decode");
-	s->is_linear_alpha = obs_data_get_bool(settings, "linear_alpha");
-	s->range = (enum video_range_type)obs_data_get_int(settings, "color_range");
 	s->base_speed = speed;
 
 	if (warp_pl_load_playlist(s, settings))
