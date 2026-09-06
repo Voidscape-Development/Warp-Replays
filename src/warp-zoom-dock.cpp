@@ -1488,8 +1488,13 @@ public:
 	~WarpZoomDock() override { grabber.release(); }
 
 protected:
-	/* Full or Minimal, on the dock itself: a setting you choose once does
-	 * not deserve a control taking up room in a panel meant to be small. */
+	/* Full or Minimal, and whether the source is framed on the spot or the
+	 * shot is lined up first: settings chosen once a show, which do not
+	 * deserve rows of their own in a panel meant to be small. Confirm is
+	 * still a per-source setting - it is the source the dock is pointed at
+	 * that is put on confirm, the same one the source properties set - so it
+	 * is read back every time the menu is opened rather than remembered
+	 * here. */
 	void contextMenuEvent(QContextMenuEvent *event) override
 	{
 		QMenu menu(this);
@@ -1501,10 +1506,32 @@ protected:
 		full->setChecked(!minimal);
 		small->setChecked(minimal);
 
+		menu.addSeparator();
+
+		QAction *confirmAction = menu.addAction(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Confirm")));
+
+		confirmAction->setCheckable(true);
+		confirmAction->setChecked(confirming);
+		confirmAction->setEnabled(canConfirm);
+		confirmAction->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Confirm.Desc")));
+
+		/* a menu says nothing in a tooltip unless it is asked to */
+		menu.setToolTipsVisible(true);
+
 		QAction *picked = menu.exec(event->globalPos());
 
 		if (!picked)
 			return;
+
+		if (picked == confirmAction) {
+			OBSSourceAutoRelease source = zoomSource();
+
+			if (source)
+				warp_zoom_source_set_confirm(source, confirmAction->isChecked());
+
+			refreshView();
+			return;
+		}
 
 		bool wanted = picked == small;
 
@@ -1746,12 +1773,12 @@ private:
 				warp_zoom_source_reset(source, -1);
 		});
 
-		/* Lining a shot up before it goes to air. The take and drop
-		 * buttons are only there while something is waiting, so the row
-		 * carries nothing dead. */
-		confirm = new WarpZoomCheck(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Confirm")), this);
-		confirm->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Confirm.Desc")));
-
+		/* Lining a shot up before it goes to air. Confirm itself is set
+		 * from the dock's right-click menu, since it is chosen once and
+		 * a row spent saying so is a row the picture does not get; what
+		 * stands in the dock is the pair of buttons a waiting shot is
+		 * answered with, and they are only there while one is waiting,
+		 * so the row takes no height at all the rest of the time. */
 		takeButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Take")), this);
 		dropButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Drop")), this);
 
@@ -1759,21 +1786,10 @@ private:
 		takeButton->setVisible(false);
 		dropButton->setVisible(false);
 
-		auto *confirmRow = new WarpZoomFlow();
+		auto *stageRow = new WarpZoomFlow();
 
-		confirmRow->addWidget(confirm);
-		confirmRow->addWidget(takeButton);
-		confirmRow->addWidget(dropButton);
-
-		connect(confirm, &QCheckBox::toggled, this, [this](bool on) {
-			OBSSourceAutoRelease source = zoomSource();
-
-			if (loading || !source)
-				return;
-
-			warp_zoom_source_set_confirm(source, on);
-			refreshView();
-		});
+		stageRow->addWidget(takeButton);
+		stageRow->addWidget(dropButton);
 
 		connect(takeButton, &QPushButton::clicked, this, [this]() {
 			OBSSourceAutoRelease source = zoomSource();
@@ -2009,7 +2025,7 @@ private:
 		layout->addWidget(preview, 1);
 		layout->addLayout(zoomRow);
 		layout->addWidget(pad);
-		layout->addLayout(confirmRow);
+		layout->addLayout(stageRow);
 		layout->addWidget(presetSection, 1);
 		layout->addLayout(speedRow);
 		layout->addLayout(speedButtons);
@@ -2036,11 +2052,11 @@ private:
 	static bool framingNow(obs_source_t *source, warp_zoom_view *out, bool *staging = nullptr)
 	{
 		bool is_staged = false;
-		bool confirming = false;
-		bool have = warp_zoom_source_stage(source, out, &is_staged, &confirming);
+		bool confirm_on = false;
+		bool have = warp_zoom_source_stage(source, out, &is_staged, &confirm_on);
 
 		if (staging)
-			*staging = have && confirming;
+			*staging = have && confirm_on;
 
 		if (have && is_staged)
 			return true;
@@ -2247,10 +2263,10 @@ private:
 		warp_zoom_view stage = warp_zoom_default_view();
 		bool have = source && warp_zoom_source_get(source, &view, &heading);
 		bool is_staged = false;
-		bool confirming = false;
+		bool confirm_on = false;
 
 		if (have)
-			warp_zoom_source_stage(source, &stage, &is_staged, &confirming);
+			warp_zoom_source_stage(source, &stage, &is_staged, &confirm_on);
 
 		loading = true;
 
@@ -2271,8 +2287,11 @@ private:
 
 		zoomLabel->setText(QString("%1%").arg(qRound(shown.zoom * 100.0f)));
 
-		confirm->setEnabled(have);
-		confirm->setChecked(confirming);
+		/* what the right-click menu says about confirm the next time it
+		 * is opened, kept here because the menu is built on demand */
+		canConfirm = have;
+		confirming = confirm_on;
+
 		takeButton->setVisible(is_staged);
 		dropButton->setVisible(is_staged);
 
@@ -2333,7 +2352,6 @@ private:
 	QComboBox *targets = nullptr;
 	QComboBox *path = nullptr;
 	QCheckBox *follow = nullptr;
-	QCheckBox *confirm = nullptr;
 	QPushButton *takeButton = nullptr;
 	QPushButton *dropButton = nullptr;
 	WarpZoomPreview *preview = nullptr;
@@ -2359,6 +2377,10 @@ private:
 	WarpZoomGrabber grabber;
 	bool loading = false;
 	bool minimal = false;
+	/* what the source the dock is pointed at has to say about confirm, for
+	 * the menu that is only built when it is asked for */
+	bool confirming = false;
+	bool canConfirm = false;
 };
 
 /* ------------------------------------------------------------------------- */
