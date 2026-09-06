@@ -26,6 +26,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <graphics/vec4.h>
 #include <util/config-file.h>
 
+#include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialog>
@@ -493,16 +494,59 @@ protected:
 		QFrame::changeEvent(event);
 
 		if (event->type() == QEvent::PaletteChange || event->type() == QEvent::StyleChange)
-			dress();
+			dressLater();
 	}
 
 private:
+	/* The ground the slab stands on, which is the panel behind it rather
+	 * than the slab itself.
+	 *
+	 * A stylesheet with a colour in it is written back into the widget's
+	 * own palette when the style dresses it, so the window colour here is
+	 * the shade this class last set rather than the theme's panel. Mixing
+	 * the next shade from that would be mixing a shade from a shade, and
+	 * since each pass takes another step away from the one before it, the
+	 * colour never lands on the one already set and the dressing never
+	 * settles. The panel behind us is the theme's own and nothing here
+	 * writes to it, so it is what the shade is taken from. */
+	QColor ground() const
+	{
+		const QWidget *behind = parentWidget();
+
+		return behind ? behind->palette().color(QPalette::Window)
+			      : QApplication::palette().color(QPalette::Window);
+	}
+
+	/* Asked for after the pass that brought us here has finished.
+	 *
+	 * A theme change is a style change to every widget and a palette change
+	 * to every widget under the one that owns the palette, in whatever order
+	 * Qt walks them, so the panel behind us may not have been given the new
+	 * theme's colour at the moment we are told about it. Waiting for the
+	 * event loop asks the panel once it has been dressed itself, and asking
+	 * once for however many of those events arrive keeps a theme change to a
+	 * single mix. */
+	void dressLater()
+	{
+		if (dressPending)
+			return;
+
+		dressPending = true;
+		QMetaObject::invokeMethod(
+			this,
+			[this]() {
+				dressPending = false;
+				dress();
+			},
+			Qt::QueuedConnection);
+	}
+
 	/* Dressed only when the colour has actually moved. Setting a stylesheet
 	 * is itself a style change, which is one of the things that brings us
 	 * here, so dressing on every pass would never settle. */
 	void dress()
 	{
-		QColor wanted = warpZoomSectionShade(palette().color(QPalette::Window));
+		QColor wanted = warpZoomSectionShade(ground());
 
 		if (wanted == shade)
 			return;
@@ -514,6 +558,7 @@ private:
 	}
 
 	QColor shade;
+	bool dressPending = false;
 };
 
 /* Where the dock remembers how it was left. This is how an operator likes to
