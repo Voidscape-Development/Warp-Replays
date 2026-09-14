@@ -14,6 +14,7 @@ A media source based on OBS Studio's built-in Media Source, with the same proper
   * The Speed property in the source settings also applies live
 * **Frame stepping** hotkeys: step 1, 5, 10, or 20 frames forward or backward. Stepping while the video is playing pauses it first; stepping is frame-accurate, including backward steps.
 * **Zoom and framing** of the clip that is loaded — see [zoom](#zoom). The framing goes back to the whole picture as each clip lands, so an [instant replay](#instant-replays) arrives ready to go on screen rather than still zoomed into the last one.
+* **Angle switching** for a clip that came from a [Warp buffer](#warp-buffers) holding several cameras: Next Angle, Previous Angle and Angle 1 through 8 swap the clip for another camera's view of the same moment without losing where the play had got to. See [multi-angle replays](#multi-angle-replays).
 
 All hotkeys are per-source and are bound in OBS under Settings → Hotkeys. Every one of these actions can also be driven from outside OBS — see [obs-websocket control](#obs-websocket-control).
 
@@ -33,7 +34,8 @@ A playlist source in the spirit of the VLC video source, built on the same playb
 * **Zoom and framing** for the video that is playing — see [zoom](#zoom) — with the same rule the speed follows: the framing belongs to the video, not to the playlist. Zoom into a corner of one replay and the playlist moves on to the next file at the whole picture, ready to go, however far in the last one was left. The file being transitioned away from keeps the framing it was being watched at, so it plays out the transition as it was on screen while the incoming one is already framed at the top.
 * **Audio in the OBS mixer.** The playlist hands OBS the sound of the file that is playing as its own, the way any other source does, so it sits in the audio mixer with a fader, a mute, monitoring, audio filters and its own track routing. The files themselves are played only through the playlist, so the fader is the last word on how loud it is. A transition crossfades the two files it is holding, and a stinger brings its own sound with it.
 * **Volume**, from silent to 100% of the audio in the files themselves, and **Transition Volume**, the same for the sound a stinger brings with it, which appears alongside it while a stinger is picked. They are set before the playlist reaches the mixer, so the fader, mute, monitoring and audio filters all still apply on top of them. Both apply live, to the file that is playing as well as to the ones after it, so a playlist of clips recorded far louder than the rest of the show can be turned down without touching the files — and because the two levels are separate, a playlist can be run silent while its stinger still sounds.
-* **Hotkeys**: Next Video, Previous Video, Back to First Video, Restart Current Video, Clear Playlist, plus Play/Pause, Stop, the speed hotkeys, and the frame stepping hotkeys.
+* **Angle switching** for the clip that is playing, when it came from a [Warp buffer](#warp-buffers) holding several cameras. The ask is handed to whichever file is playing, so it works exactly as it does in a Warp Media source; the playlist's own file list is untouched, and reaching the next file is back on the angle the list names.
+* **Hotkeys**: Next Video, Previous Video, Back to First Video, Restart Current Video, Clear Playlist, plus Play/Pause, Stop, the speed hotkeys, the frame stepping hotkeys, and the angle hotkeys.
 
 Clear Playlist empties the source's file list for good — it is written to the scene collection like any other settings change. The cleared file paths are written to the OBS log first, so a playlist cleared by a mis-hit during a show can be rebuilt from there. It is the one playlist hotkey that is not limited to a source that is on screen: the others drive playback, so they are aimed at what the operator has in front of them, while this one edits the file list, which is most often emptied while the playlist is off air.
 
@@ -130,6 +132,9 @@ A filter that watches a Warp Media or Warp Playlist source and triggers somethin
 
   The framing a video starts at is not a change: a playlist reaching its next file resets the zoom without firing anything, the same way it resets the speed.
 
+  One is about which camera is being watched:
+  * *Angle Switched To…*, matching one angle by name, or any of them, for a clip out of a [Warp buffer](#warp-buffers) holding several. The angle a clip arrives on is not a switch, the same way the framing it arrives at is not a change.
+
   One more is about the file rather than about playback:
   * *Clip Loaded*, when a clip is put in a Warp Media source from outside it — which is what an [Instant Replay flow](#instant-replays) does as each replay is saved. This is the event to react to for bringing an instant replay on screen: point it at a hotkey, or at a filter that runs your slide-in.
 
@@ -154,9 +159,12 @@ warp_frames_stepped(ptr source, int frames)
 warp_media_action(ptr source, string action)
 warp_zoom_changed(ptr source, float zoom, float x, float y, string change, string preset)
 warp_zoom_staged(ptr source, bool staged, float zoom, float x, float y, string change, string preset)
+warp_angle_changed(ptr source, int index, int count, string angle, string path)
 ```
 
 On `warp_zoom_changed`, `zoom` is 1 for the whole picture and up to 8 at the tightest, `x` and `y` are where the middle of what is shown sits in the file, and `change` is `manual`, `preset`, `reset` or `set`, with `preset` naming the preset when one was recalled. A Warp Zoom filter emits it on itself. `warp_zoom_staged` reports a shot being [lined up](#lining-a-shot-up), and again with `staged` false as it is taken or dropped; nothing has moved on screen when it fires.
+
+On `warp_angle_changed`, `index` is which angle of the set is now up counting from zero, `count` how many the set holds, `angle` its name and `path` the clip that was put in. Nothing has moved on screen when it fires: the clip is still opening, and playback lands on the same moment it was at a frame or two later.
 
 For the rest, `change` is `set`, `increased` or `decreased`; `frames` is negative when stepping backward; `action` is `play`, `pause` or `restart`. The speed a file starts at is not a change: a playlist moving to its next file resets the speed without emitting anything. `warp_media_action` reports commands, so playback a source drives by itself — restarting as it goes on screen, the pause a frame step does first, a playlist rolling on to its next file — emits nothing.
 
@@ -190,7 +198,12 @@ Every request names the source it applies to, with `sourceName` or `sourceUuid`.
 | `ResetSpeed` | | Back to 100% |
 | `StepForward` | `frames` | Steps forward, by 1 frame unless `frames` says otherwise |
 | `StepBackward` | `frames` | Steps backward |
+| `NextAngle` | | Switches the clip for the next camera's view of the same moment, wrapping round the set |
+| `PreviousAngle` | | The same the other way |
+| `SetAngle` | `angle` | Switches to one angle of the set, counting from 0 |
 | `GetStatus` | | Changes nothing, and answers with where playback stands |
+
+The three angle requests answer with an error when the clip being played is not one of a [multi-angle set](#multi-angle-replays), or is already on the angle asked for, so a control surface can grey its angle buttons rather than guess.
 
 Five more apply to a Warp Playlist source, and answer with an error when they are sent to a Warp Media source:
 
@@ -236,7 +249,7 @@ Every response says whether the request was carried out, and reports where playb
 }
 ```
 
-Every response also reports `zoom`, `zoomX` and `zoomY` — how the source is framed, in percent — along with `zoomFilter` when the framing lives in a filter rather than in the source itself, so a zoom can be followed without asking for it separately. `zoomConfirm` says whether that source lines shots up, and `zoomStaged` whether one is waiting; when one is, `zoomStagedZoom`, `zoomStagedX` and `zoomStagedY` are the shot it would take. A Warp Playlist source also reports `playlistIndex` (-1 when nothing is playing), `playlistLength` and `currentFile`. A request that could not be carried out — no such source, a source that is not a Warp source, or a value outside the range the action takes — answers with `"success": false` and an `error` saying what was wrong, and changes nothing.
+Every response also reports `zoom`, `zoomX` and `zoomY` — how the source is framed, in percent — along with `zoomFilter` when the framing lives in a filter rather than in the source itself, so a zoom can be followed without asking for it separately. `zoomConfirm` says whether that source lines shots up, and `zoomStaged` whether one is waiting; when one is, `zoomStagedZoom`, `zoomStagedX` and `zoomStagedY` are the shot it would take. `angleCount` says how many cameras the clip being played was saved from, and is 0 for a clip that is not one of a set; when it is one, `angleIndex` and `angle` are which of them is up and `angles` is the whole set, each with its `name`, `path` and `duration`, so a control surface can lay out an angle button per camera from the reply it already has. A Warp Playlist source also reports `playlistIndex` (-1 when nothing is playing), `playlistLength` and `currentFile`. A request that could not be carried out — no such source, a source that is not a Warp source, or a value outside the range the action takes — answers with `"success": false` and an `error` saying what was wrong, and changes nothing.
 
 The requests do exactly what the matching hotkeys do, including emitting the signals above, so a Warp Detection filter reacts to a speed change driven over the websocket the same way it reacts to the hotkey. The difference is that a hotkey only applies to a source that is on screen, because the operator is pressing it at whatever is in front of them, while a request names the source it means and is carried out whether or not it is being shown. There are two exceptions, one either way. `Restart` on a Warp Media source only restarts playback while the source is being shown, over the websocket as from the hotkey. `ClearPlaylist` edits the file list rather than driving playback, so its hotkey is carried out whether or not the playlist is on screen, the same as the request.
 
@@ -263,6 +276,33 @@ They answer with the flow they applied to, and how much is in the playlist it fe
 
 `GetFlows` answers with `flows`, an array of those same objects, and takes no fields.
 
+Four more work on a [Warp buffer](#warp-buffers), and name it with `bufferName` (or `bufferId`) instead of `sourceName`:
+
+| Request | Fields | What it does |
+| --- | --- | --- |
+| `SaveBuffer` | `seconds` | Writes `seconds` out of every angle of the buffer at once, exactly as that length's hotkey does. A length the buffer does not hold is refused rather than rounded to one it does; leave it out for the first length the buffer offers |
+| `StartBuffer` | | Starts the buffer holding |
+| `StopBuffer` | | Stops it |
+| `GetBuffers` | | Changes nothing, and answers with every buffer in the scene collection |
+
+They answer with the buffer they applied to, what it holds and what it costs:
+
+```json
+{
+  "success": true,
+  "bufferId": "buf_…",
+  "bufferName": "Match Replay",
+  "running": true,
+  "followsObs": false,
+  "memoryMb": 210,
+  "angleCount": 4,
+  "angles": [ { "name": "Program", "feed": "program" }, … ],
+  "lengths": [ { "seconds": 5 }, { "seconds": 10 }, { "seconds": 20 } ]
+}
+```
+
+`GetBuffers` answers with `buffers`, an array of those same objects, and takes no fields.
+
 The playlist actions that have no counterpart in OBS's media control API are proc handlers on the source, so scripts can call them too, and so can anything else that can reach the source:
 
 ```
@@ -271,6 +311,15 @@ warp_adjust_speed(int delta)       warp_playlist_restart_current()
 warp_get_speed(out int speed)      warp_playlist_clear()
 warp_step_frames(int frames)       warp_playlist_status(out int index, out int count, out string current_file)
 ```
+
+Both sources carry the angle procs as well, and a playlist hands them to whichever file it is playing:
+
+```
+warp_angle_next(out bool changed)       warp_angle_select(int index, out bool changed)
+warp_angle_previous(out bool changed)   warp_angle_status(out int index, out int count, out string angle, out string path, out string angles)
+```
+
+`changed` is false when the clip is in no set, when the set holds only the one angle, or when the angle asked for is the one already up. `warp_angle_status` answers with `angles` as JSON, since a calldata cannot carry an array.
 
 Everything that can be zoomed carries the framing procs as well, which is how the dock, the websocket requests and a Warp Detection filter all drive it without caring which kind of source they are holding:
 
@@ -290,11 +339,50 @@ These take the zoom as a factor from 1 to 8 and the position from 0 to 1, rather
 
 The first four playlist procs are on the Warp Media source as well, along with `warp_media_load(string path, int speed, string playback)`, which points the source at a file and says what playback does with it — `keep`, `play` or `hold`, as the [Instant Replay flow](#instant-replays) settings describe. It is what an instant replay flow calls, and it emits the source's `loaded` media action. Play, pause, stop, restart, next, previous and seeking are OBS's own media controls on both sources, so obs-websocket's built-in `TriggerMediaInputAction`, `SetMediaInputCursor` and `GetMediaInputStatus` requests work on them too.
 
+### Warp buffers
+
+OBS has one replay buffer, of one length, set up in its own settings. A **Warp buffer** is the same idea with the two things a replay operator keeps reaching for: several lengths on the same feed, so the last five seconds and the last twenty are both a keypress away, and several angles of the same moment, so the play can be watched again from the camera that saw it best.
+
+Buffers are set up on the **Buffers** tab of the [Warp window](#warp-flows). Each one is:
+
+* **Angles** — the feeds it holds. Each is either the **program feed** — what goes out of OBS, which is what a replay buffer has always held — or **one source**, on its own, whatever scene is up and whether or not it is on screen. That last part is what gives a replay its camera angles: a buffer with a player cam on each angle catches every one of them looking at the same moment, including the ones that were nowhere near the program.
+
+  The angle at the top is the **primary** one. It is the clip a flow is handed, so a replay list holds one entry per moment rather than one per camera, and it is the angle an operator starts watching before reaching for another.
+* **Lengths** — the seconds it can be asked for. Each length keeps its own seconds behind every angle, so asking for five writes the five seconds that were held rather than twenty cut down. Each one registers a hotkey of its own in Settings → Hotkeys — *Warp: Save Last 10s from Match Replay* — and is a websocket request.
+* **Starts** — on its own, from the Warp window, its **Warp: Start/Stop** hotkey or the websocket; or **with OBS's own replay buffer**, so one control covers everything and the button and Stream Deck key you already have still work. Buffers that start on their own come back up the way the scene collection was left.
+* **Cap each buffer at** — the most one length of one angle will hold, whatever that comes to in seconds. This is the same cap OBS puts on its own replay buffer.
+
+Picture and sound come from the **recording settings of the profile that is loaded** — encoder, quality, container and folder — so a buffer is set up by naming it and saying what it holds, rather than by configuring a second recorder. Change what the profile records at and the buffers that are running are put back up against the new settings. A profile carried over from a machine with an encoder this one does not have falls back to x264 and says so in the log, rather than refusing to start. The one thing Warp asks for of its own is a keyframe a second: keyframes are what a step back seeks to and what the oldest end of a buffer is trimmed to, so a long gap between them is both a coarse scrub and seconds of slack on every length.
+
+Every angle carries the **program audio**, so cutting between cameras during a replay does not change what is heard.
+
+What a buffer costs while it is running is the sum of its lengths, behind each of its angles, at whatever the profile records at — four angles at 5, 10 and 20 seconds is 140 seconds of encoded picture. The Warp window and the buffer dialog both say roughly what that comes to, so it is known before the buffer is started rather than after. The encoding cost is one encoder per angle however many lengths it offers: the lengths share it, since they are the same picture held for different amounts of time.
+
+Clips are written into the profile's recording folder, named after the time they were taken and then the buffer, the angle and the length, so a folder of them reads as the show it came from and the angles of one moment sit together.
+
+#### Multi-angle replays
+
+Pressing a buffer's Save hotkey writes **every angle at once**. The clips are the same seconds of the same moment from each camera, and Warp keeps them as a set, so any one of them finds the rest.
+
+Only the primary angle is handed to a flow. A replay list therefore holds one clip per moment, and its playlist is exactly the file list it always was — a scene collection written by a Warp that knows nothing about angles still loads. The other cameras are reached from the source that is playing:
+
+* **Next Angle** and **Previous Angle** wrap round the set, and **Angle 1** through **8** fire whichever camera is in that position.
+* The clip is swapped **without losing the play**: the position being watched, whether it was running or held, are all carried across, so a replay can be watched through once and then again from the other end of the pitch without starting over.
+* Both Warp sources carry them. A playlist hands the ask to whichever file it is playing, so an angle is switched the same way whether the clip is in a media source or in a list.
+
+The clips of one save do not begin together — each is written from whichever keyframe its buffer still held, so they start up to a keyframe apart. They *end* together, because the buffers are all told to save at the same instant, so Warp lines the set up on its ends and turns a position in one angle into the same moment in another. That is what makes an angle switch land on the play rather than near it.
+
+The angle belongs to the **video**, not to the source, the same way the speed and the framing do: a playlist reaching its next file is back on the angle the list names, because that is the clip the list holds. Switching angle puts the framing back to the whole picture too — another camera is another picture, and a shot punched into the corner of the last one means nothing in it.
+
+Sources emit `warp_angle_changed` as an angle is switched, and a [Warp Detection filter](#warp-detection-filter) reacts to it with **Angle Switched To…**, so a cut to a particular camera can trigger a lower third, a filter or a hotkey of its own.
+
+Angle sets are saved with the scene collection: the clips are still on disk after a restart, and they are still angles of each other.
+
 ### Warp flows
 
-A **Warp** entry in the Tools menu opens the Warp window: the flows of the scene collection, what each one feeds, and how much is in it. Underneath the list, a dot says whether the replay buffer is running — green while it is, red while it is not — next to the clip it saved last, and a **Zoom Presets…** button opens the [zoom presets](#the-warp-zoom-dock) of every source that can be framed.
+A **Warp** entry in the Tools menu opens the Warp window, in two tabs: **Flows**, the flows of the scene collection, what each one feeds and how much is in it, and **Buffers**, the [Warp buffers](#warp-buffers) their clips come from. Underneath the list, a dot says whether the replay buffer is running — green while it is, red while it is not — next to the clip it saved last, and a **Zoom Presets…** button opens the [zoom presets](#the-warp-zoom-dock) of every source that can be framed.
 
-A flow takes the clips the OBS replay buffer saves and hands them to a Warp source, so a feed builds itself as an event goes on. Adding one opens a dialog laid out like OBS's own Add Source: the kinds down the left, what the one that is picked does on the right, and the settings it needs underneath.
+A flow takes the clips a replay buffer saves — OBS's own, or a [Warp buffer](#warp-buffers) — and hands them to a Warp source, so a feed builds itself as an event goes on. Adding one opens a dialog laid out like OBS's own Add Source: the kinds down the left, what the one that is picked does on the right, and the settings it needs underneath.
 
 * **Replay List** — a list that fills itself with the clips the replay buffer saves.
 * **Highlight List** — a list that keeps the clips worth keeping. It works the same way, and is usually fed by a replay list rather than by the replay buffer directly.
@@ -304,6 +392,7 @@ A flow takes the clips the OBS replay buffer saves and hands them to a Warp sour
 Every flow is:
 
 * **Feeds**: the Warp source clips are handed to — a Warp Playlist source for the list kinds, a Warp Media source for an instant replay — picked from the ones already in the scene collection or made on the spot. A new one is put in the current scene, since a source no scene holds on to is not saved with the scene collection.
+* **Clips from**: OBS's own replay buffer, which is what a flow took before there was anything else, or a [Warp buffer](#warp-buffers). A flow pointed at a Warp buffer takes the **lengths taken** ticked in its properties, or every length the buffer offers when none are; its own Save Replay hotkey saves that buffer rather than OBS's, so the key an operator presses does not change with the setting.
 * **Takes**: where its clips come from.
   * *Only what its own hotkey saves* — the flow's own Save Replay hotkey saves the replay buffer and keeps the clip for that flow. Saves made any other way go past it, so two flows with two hotkeys feed two different lists.
   * *Every replay buffer save* — the flow takes those as well as the saves nobody claimed: OBS's own Save Replay hotkey, obs-websocket, a script.

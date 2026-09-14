@@ -39,10 +39,13 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QStringList>
 #include <QStyle>
 #include <QStyledItemDelegate>
+#include <QTabWidget>
 #include <QTimer>
 #include <QTreeWidget>
 #include <QVBoxLayout>
 
+#include "warp-buffer-dialog.hpp"
+#include "warp-buffer.h"
 #include "warp-events.h"
 #include "warp-flow-dialog.hpp"
 #include "warp-flow.h"
@@ -59,6 +62,17 @@ enum WarpFlowColumn {
 	WARP_COL_ORDER,
 	WARP_COL_LINKS,
 	WARP_COL_COUNT,
+};
+
+/* the columns of the buffer list */
+enum WarpBufferColumn {
+	WARP_BUF_COL_NAME,
+	WARP_BUF_COL_STATE,
+	WARP_BUF_COL_ANGLES,
+	WARP_BUF_COL_LENGTHS,
+	WARP_BUF_COL_MEMORY,
+	WARP_BUF_COL_START,
+	WARP_BUF_COL_COUNT,
 };
 
 /* how narrow a column of the flow list is allowed to get, whatever is in it */
@@ -130,10 +144,10 @@ public:
 	explicit WarpWindow(QWidget *parent);
 	~WarpWindow() override;
 
-	/* the flow list from the top */
+	/* the flow list and the buffer list from the top */
 	void refresh();
-	/* what does not need the list rebuilt: the replay buffer, and how many
-	 * clips each flow's playlist is holding */
+	/* what does not need the lists rebuilt: the replay buffer, how many
+	 * clips each flow's playlist is holding, and which buffers are holding */
 	void refreshStatus();
 
 private:
@@ -143,9 +157,22 @@ private:
 	void selectionChanged();
 	QString selectedId() const;
 
+	void refreshBuffers();
+	void addBuffer();
+	void editBuffer();
+	void removeBuffer();
+	void toggleBuffer();
+	void bufferSelectionChanged();
+	QString selectedBufferId() const;
+
 	QTreeWidget *tree = nullptr;
 	QPushButton *propsButton = nullptr;
 	QPushButton *removeButton = nullptr;
+
+	QTreeWidget *bufferTree = nullptr;
+	QPushButton *bufferPropsButton = nullptr;
+	QPushButton *bufferRemoveButton = nullptr;
+	QPushButton *bufferStartButton = nullptr;
 	QLabel *bufferDot = nullptr;
 	QLabel *status = nullptr;
 	QTimer *timer = nullptr;
@@ -203,7 +230,7 @@ QString warp_order_name(const char *kind, const char *order, const char *playbac
 WarpWindow::WarpWindow(QWidget *parent) : QDialog(parent)
 {
 	setWindowTitle(warp_flow_text("Warp.Window.Title"));
-	resize(940, 460);
+	resize(940, 520);
 
 	auto *intro = new QLabel(warp_flow_text("Warp.Window.Intro"), this);
 
@@ -252,19 +279,78 @@ WarpWindow::WarpWindow(QWidget *parent) : QDialog(parent)
 	statusRow->addWidget(status);
 	statusRow->addStretch(1);
 
+	auto *flowButtons = new QHBoxLayout();
+
+	flowButtons->addWidget(addButton);
+	flowButtons->addWidget(propsButton);
+	flowButtons->addWidget(removeButton);
+	flowButtons->addStretch(1);
+
+	auto *flowPage = new QWidget(this);
+	auto *flowLayout = new QVBoxLayout(flowPage);
+
+	flowLayout->addWidget(intro);
+	flowLayout->addWidget(tree, 1);
+	flowLayout->addLayout(flowButtons);
+
+	/* ------------------------------------------------------------------ */
+	/* the buffers, which are where a flow's clips come from */
+
+	auto *bufferIntro = new QLabel(warp_flow_text("Warp.Window.Buffers.Intro"), this);
+
+	bufferIntro->setWordWrap(true);
+	bufferIntro->setTextFormat(Qt::PlainText);
+
+	bufferTree = new QTreeWidget(this);
+	bufferTree->setColumnCount(WARP_BUF_COL_COUNT);
+	bufferTree->setRootIsDecorated(false);
+	bufferTree->setAlternatingRowColors(true);
+	bufferTree->setSelectionMode(QAbstractItemView::SingleSelection);
+	bufferTree->setUniformRowHeights(true);
+	bufferTree->setHeaderLabels(
+		{warp_flow_text("Warp.Window.Column.Buffer"), warp_flow_text("Warp.Window.Column.State"),
+		 warp_flow_text("Warp.Window.Column.Angles"), warp_flow_text("Warp.Window.Column.Lengths"),
+		 warp_flow_text("Warp.Window.Column.Memory"), warp_flow_text("Warp.Window.Column.Starts")});
+	bufferTree->header()->setSectionResizeMode(QHeaderView::ResizeToContents);
+	bufferTree->header()->setStretchLastSection(true);
+	bufferTree->header()->setMinimumSectionSize(WARP_COLUMN_MIN_WIDTH);
+	bufferTree->header()->setDefaultAlignment(Qt::AlignCenter);
+
+	auto *bufferAddButton = new QPushButton(warp_flow_text("Warp.Window.Add"), this);
+
+	bufferPropsButton = new QPushButton(warp_flow_text("Warp.Window.Props"), this);
+	bufferRemoveButton = new QPushButton(warp_flow_text("Warp.Window.Remove"), this);
+	bufferStartButton = new QPushButton(warp_flow_text("Warp.Window.Buffer.Start"), this);
+
+	auto *bufferButtons = new QHBoxLayout();
+
+	bufferButtons->addWidget(bufferAddButton);
+	bufferButtons->addWidget(bufferPropsButton);
+	bufferButtons->addWidget(bufferRemoveButton);
+	bufferButtons->addStretch(1);
+	bufferButtons->addWidget(bufferStartButton);
+
+	auto *bufferPage = new QWidget(this);
+	auto *bufferLayout = new QVBoxLayout(bufferPage);
+
+	bufferLayout->addWidget(bufferIntro);
+	bufferLayout->addWidget(bufferTree, 1);
+	bufferLayout->addLayout(bufferButtons);
+
+	auto *tabs = new QTabWidget(this);
+
+	tabs->addTab(flowPage, warp_flow_text("Warp.Window.Tab.Flows"));
+	tabs->addTab(bufferPage, warp_flow_text("Warp.Window.Tab.Buffers"));
+
 	auto *buttons = new QHBoxLayout();
 
-	buttons->addWidget(addButton);
-	buttons->addWidget(propsButton);
-	buttons->addWidget(removeButton);
 	buttons->addStretch(1);
 	buttons->addWidget(zoomButton);
 	buttons->addWidget(closeButton);
 
 	auto *layout = new QVBoxLayout(this);
 
-	layout->addWidget(intro);
-	layout->addWidget(tree, 1);
+	layout->addWidget(tabs, 1);
 	layout->addLayout(statusRow);
 	layout->addLayout(buttons);
 
@@ -275,6 +361,13 @@ WarpWindow::WarpWindow(QWidget *parent) : QDialog(parent)
 	connect(closeButton, &QPushButton::clicked, this, &QDialog::close);
 	connect(tree, &QTreeWidget::itemSelectionChanged, this, [this]() { selectionChanged(); });
 	connect(tree, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *, int) { editFlow(); });
+
+	connect(bufferAddButton, &QPushButton::clicked, this, [this]() { addBuffer(); });
+	connect(bufferPropsButton, &QPushButton::clicked, this, [this]() { editBuffer(); });
+	connect(bufferRemoveButton, &QPushButton::clicked, this, [this]() { removeBuffer(); });
+	connect(bufferStartButton, &QPushButton::clicked, this, [this]() { toggleBuffer(); });
+	connect(bufferTree, &QTreeWidget::itemSelectionChanged, this, [this]() { bufferSelectionChanged(); });
+	connect(bufferTree, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *, int) { editBuffer(); });
 
 	timer = new QTimer(this);
 	timer->setInterval(1000);
@@ -304,6 +397,153 @@ void WarpWindow::selectionChanged()
 
 	propsButton->setEnabled(has);
 	removeButton->setEnabled(has);
+}
+
+QString WarpWindow::selectedBufferId() const
+{
+	QTreeWidgetItem *item = bufferTree->currentItem();
+
+	return item ? item->data(WARP_BUF_COL_NAME, Qt::UserRole).toString() : QString();
+}
+
+void WarpWindow::bufferSelectionChanged()
+{
+	const QString id = selectedBufferId();
+	const bool has = !id.isEmpty();
+
+	bufferPropsButton->setEnabled(has);
+	bufferRemoveButton->setEnabled(has);
+	bufferStartButton->setEnabled(has);
+	bufferStartButton->setText(has && warp_buffer_running(id.toUtf8().constData())
+					   ? warp_flow_text("Warp.Window.Buffer.Stop")
+					   : warp_flow_text("Warp.Window.Buffer.Start"));
+}
+
+void WarpWindow::refreshBuffers()
+{
+	const QString selected = selectedBufferId();
+
+	bufferTree->clear();
+
+	obs_data_array_t *buffers = warp_buffer_list();
+	const size_t count = obs_data_array_count(buffers);
+
+	for (size_t i = 0; i < count; i++) {
+		obs_data_t *buffer = obs_data_array_item(buffers, i);
+		const QString id = QString::fromUtf8(obs_data_get_string(buffer, WARP_BUFFER_ID));
+		const bool running = obs_data_get_bool(buffer, "running");
+		const bool follows = obs_data_get_bool(buffer, WARP_BUFFER_FOLLOW_OBS);
+
+		auto *item = new QTreeWidgetItem(bufferTree);
+
+		item->setText(WARP_BUF_COL_NAME, QString::fromUtf8(obs_data_get_string(buffer, WARP_BUFFER_NAME)));
+		item->setData(WARP_BUF_COL_NAME, Qt::UserRole, id);
+		item->setText(WARP_BUF_COL_STATE, running ? warp_flow_text("Warp.Window.Buffer.Running")
+							  : warp_flow_text("Warp.Window.Buffer.Stopped"));
+
+		/* the angles by name, since which cameras a buffer is holding
+		 * is the thing worth seeing without opening it */
+		QStringList angles;
+		obs_data_array_t *angle_array = obs_data_get_array(buffer, WARP_BUFFER_ANGLES);
+		const size_t angle_count = angle_array ? obs_data_array_count(angle_array) : 0;
+
+		for (size_t j = 0; j < angle_count; j++) {
+			obs_data_t *angle = obs_data_array_item(angle_array, j);
+
+			angles.append(QString::fromUtf8(obs_data_get_string(angle, WARP_BUFFER_ANGLE_NAME)));
+			obs_data_release(angle);
+		}
+
+		obs_data_array_release(angle_array);
+		item->setText(WARP_BUF_COL_ANGLES, angles.join(QStringLiteral(", ")));
+
+		QStringList lengths;
+		obs_data_array_t *length_array = obs_data_get_array(buffer, WARP_BUFFER_LENGTHS);
+		const size_t length_count = length_array ? obs_data_array_count(length_array) : 0;
+
+		for (size_t j = 0; j < length_count; j++) {
+			obs_data_t *length = obs_data_array_item(length_array, j);
+
+			lengths.append(warp_flow_text("Warp.Buffer.Length.Item")
+					       .arg(obs_data_get_int(length, WARP_BUFFER_LENGTH_SECONDS)));
+			obs_data_release(length);
+		}
+
+		obs_data_array_release(length_array);
+		item->setText(WARP_BUF_COL_LENGTHS, lengths.join(QStringLiteral(", ")));
+
+		item->setText(WARP_BUF_COL_MEMORY, warp_flow_text("Warp.Window.Buffer.Memory")
+							   .arg(warp_buffer_memory_estimate(id.toUtf8().constData())));
+		item->setText(WARP_BUF_COL_START, follows ? warp_flow_text("Warp.Window.Buffer.WithObs")
+							  : warp_flow_text("Warp.Window.Buffer.OnItsOwn"));
+
+		if (id == selected)
+			bufferTree->setCurrentItem(item);
+
+		obs_data_release(buffer);
+	}
+
+	obs_data_array_release(buffers);
+
+	bufferSelectionChanged();
+}
+
+void WarpWindow::addBuffer()
+{
+	WarpBufferDialog dialog(this, QString());
+
+	if (dialog.exec() == QDialog::Accepted)
+		refreshBuffers();
+}
+
+void WarpWindow::editBuffer()
+{
+	const QString id = selectedBufferId();
+
+	if (id.isEmpty())
+		return;
+
+	WarpBufferDialog dialog(this, id);
+
+	if (dialog.exec() == QDialog::Accepted)
+		refreshBuffers();
+}
+
+void WarpWindow::removeBuffer()
+{
+	QTreeWidgetItem *item = bufferTree->currentItem();
+	const QString id = selectedBufferId();
+
+	if (!item || id.isEmpty())
+		return;
+
+	const QString name = item->text(WARP_BUF_COL_NAME);
+
+	if (QMessageBox::question(this, warp_flow_text("Warp.Buffer.Remove.Title"),
+				  warp_flow_text("Warp.Buffer.Remove.Text").arg(name)) != QMessageBox::Yes)
+		return;
+
+	warp_buffer_remove(id.toUtf8().constData());
+	refreshBuffers();
+}
+
+void WarpWindow::toggleBuffer()
+{
+	const QString id = selectedBufferId();
+
+	if (id.isEmpty())
+		return;
+
+	const QByteArray utf8 = id.toUtf8();
+
+	if (warp_buffer_running(utf8.constData())) {
+		warp_buffer_stop(utf8.constData());
+	} else if (!warp_buffer_start(utf8.constData())) {
+		QMessageBox::warning(this, warp_flow_text("Warp.Window.Title"),
+				     warp_flow_text("Warp.Buffer.Error.Start"));
+	}
+
+	refreshBuffers();
 }
 
 void WarpWindow::refresh()
@@ -386,6 +626,8 @@ void WarpWindow::refresh()
 
 	obs_data_array_release(flows);
 
+	refreshBuffers();
+
 	selectionChanged();
 	refreshStatus();
 }
@@ -405,6 +647,21 @@ void WarpWindow::refreshStatus()
 		else
 			item->setText(WARP_COL_CLIPS, QString::number(clips));
 	}
+
+	/* a buffer can be started or stopped from a hotkey, from the websocket,
+	 * or by OBS's own replay buffer taking the ones that follow it with
+	 * it, so the state column is read back rather than set when the button
+	 * is pressed */
+	for (int i = 0; i < bufferTree->topLevelItemCount(); i++) {
+		QTreeWidgetItem *item = bufferTree->topLevelItem(i);
+		const QString id = item->data(WARP_BUF_COL_NAME, Qt::UserRole).toString();
+		const bool running = warp_buffer_running(id.toUtf8().constData());
+
+		item->setText(WARP_BUF_COL_STATE, running ? warp_flow_text("Warp.Window.Buffer.Running")
+							  : warp_flow_text("Warp.Window.Buffer.Stopped"));
+	}
+
+	bufferSelectionChanged();
 
 	const bool active = warp_flow_replay_buffer_active();
 
@@ -493,7 +750,7 @@ bool warp_buffer_prompt_open = false;
 /* A flow's Save Replay hotkey, pressed with no replay buffer running to save.
  * Told from the UI thread, but the dialog is left to the event loop rather
  * than opened inside the task the press is being carried out in. */
-void warp_window_buffer_prompt(const char *flow_name)
+void warp_window_buffer_prompt(const char *flow_name, const char *buffer_id)
 {
 	auto *main_window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
 
@@ -503,10 +760,13 @@ void warp_window_buffer_prompt(const char *flow_name)
 	warp_buffer_prompt_open = true;
 
 	const QString name = QString::fromUtf8(flow_name ? flow_name : "");
+	/* which buffer the offer to start applies to: a Warp buffer the flow
+	 * is pointed at, or OBS's own when there is none */
+	const QString buffer = QString::fromUtf8(buffer_id ? buffer_id : "");
 
 	QMetaObject::invokeMethod(
 		main_window,
-		[main_window, name]() {
+		[main_window, name, buffer]() {
 			QMessageBox box(main_window);
 
 			box.setWindowTitle(warp_flow_text("Warp.Flow.Buffer.Title"));
@@ -523,10 +783,19 @@ void warp_window_buffer_prompt(const char *flow_name)
 
 			warp_buffer_prompt_open = false;
 
+			if (box.clickedButton() != start)
+				return;
+
 			/* the buffer may well have been started from elsewhere
 			 * while the question was sitting there */
-			if (box.clickedButton() == start && !obs_frontend_replay_buffer_active())
+			if (!buffer.isEmpty()) {
+				const QByteArray id = buffer.toUtf8();
+
+				if (!warp_buffer_running(id.constData()))
+					warp_buffer_start(id.constData());
+			} else if (!obs_frontend_replay_buffer_active()) {
 				obs_frontend_replay_buffer_start();
+			}
 		},
 		Qt::QueuedConnection);
 }

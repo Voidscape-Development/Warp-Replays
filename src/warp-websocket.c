@@ -32,6 +32,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "warp-zoom.h"
 
 #ifdef WARP_HAVE_FRONTEND_API
+#include "warp-buffer.h"
 #include "warp-flow.h"
 #endif
 
@@ -78,6 +79,9 @@ enum warp_ws_action {
 	WARP_WS_SET_ZOOM_CONFIRM,
 	WARP_WS_TAKE_ZOOM,
 	WARP_WS_DROP_ZOOM,
+	WARP_WS_NEXT_ANGLE,
+	WARP_WS_PREVIOUS_ANGLE,
+	WARP_WS_SET_ANGLE,
 	/* reports where playback stands without changing anything: every
 	 * response carries that, so this request has nothing else to do */
 	WARP_WS_GET_STATUS,
@@ -128,6 +132,9 @@ static struct warp_ws_request warp_ws_requests[] = {
 	{"SetZoomConfirm", WARP_WS_SET_ZOOM_CONFIRM, NULL, true},
 	{"TakeZoom", WARP_WS_TAKE_ZOOM, NULL, true},
 	{"DropZoom", WARP_WS_DROP_ZOOM, NULL, true},
+	{"NextAngle", WARP_WS_NEXT_ANGLE, NULL, false},
+	{"PreviousAngle", WARP_WS_PREVIOUS_ANGLE, NULL, false},
+	{"SetAngle", WARP_WS_SET_ANGLE, NULL, false},
 	{"GetStatus", WARP_WS_GET_STATUS, NULL, false},
 };
 
@@ -336,6 +343,32 @@ static void warp_ws_add_status(obs_source_t *source, obs_data_t *response)
 
 		obs_source_release(zoom);
 	}
+
+	/* Whether the clip being played is one of a set, and which camera of it
+	 * is up, so a control surface can lay out an angle button per camera
+	 * from the reply it already has. */
+	calldata_init(&cd);
+	if (proc_handler_call(obs_source_get_proc_handler(source), WARP_ANGLE_STATUS_PROC, &cd)) {
+		long long count = calldata_int(&cd, "count");
+
+		obs_data_set_int(response, "angleCount", count);
+
+		if (count > 0) {
+			obs_data_set_int(response, "angleIndex", calldata_int(&cd, "index"));
+			obs_data_set_string(response, "angle", calldata_string(&cd, "angle"));
+
+			obs_data_t *set = obs_data_create_from_json(calldata_string(&cd, "angles"));
+
+			if (set) {
+				obs_data_array_t *angles = obs_data_get_array(set, "angles");
+
+				obs_data_set_array(response, "angles", angles);
+				obs_data_array_release(angles);
+				obs_data_release(set);
+			}
+		}
+	}
+	calldata_free(&cd);
 
 	if (!id || strcmp(id, WARP_PLAYLIST_SOURCE_ID) != 0)
 		return;
@@ -619,6 +652,46 @@ static bool warp_ws_run(const struct warp_ws_request *req, obs_source_t *source,
 	case WARP_WS_TAKE_ZOOM:
 	case WARP_WS_DROP_ZOOM:
 		return warp_ws_run_zoom(req, source, request, response);
+	/* Switching the clip in the source for another camera's view of the
+	 * same moment. A source whose clip is not part of an angle set, or that
+	 * is already on the angle asked for, answers with an error rather than
+	 * quietly doing nothing, so a control surface can grey the button. */
+	case WARP_WS_NEXT_ANGLE:
+	case WARP_WS_PREVIOUS_ANGLE:
+	case WARP_WS_SET_ANGLE: {
+		const char *proc = WARP_ANGLE_NEXT_PROC;
+		calldata_t cd;
+		bool changed = false;
+
+		calldata_init(&cd);
+
+		if (req->action == WARP_WS_PREVIOUS_ANGLE) {
+			proc = WARP_ANGLE_PREVIOUS_PROC;
+		} else if (req->action == WARP_WS_SET_ANGLE) {
+			long long angle = warp_ws_field(request, "angle", -1);
+
+			if (angle < 0) {
+				calldata_free(&cd);
+				warp_ws_fail(response, "angle must be which angle of the set to switch to, from 0");
+				return false;
+			}
+
+			proc = WARP_ANGLE_SELECT_PROC;
+			calldata_set_int(&cd, "index", angle);
+		}
+
+		if (proc_handler_call(obs_source_get_proc_handler(source), proc, &cd))
+			calldata_get_bool(&cd, "changed", &changed);
+
+		calldata_free(&cd);
+
+		if (!changed) {
+			warp_ws_fail(response, "there is no other angle of this clip to switch to");
+			return false;
+		}
+
+		return true;
+	}
 	case WARP_WS_GET_STATUS:
 		return true;
 	}
@@ -746,6 +819,174 @@ static void warp_ws_flow_cb(obs_data_t *request, obs_data_t *response, void *pri
 	obs_data_release(flow);
 }
 
+/* ------------------------------------------------------------------------- */
+/* the buffers
+ *
+ * These name a Warp buffer rather than a source, with "bufferName" or
+ * "bufferId", and do what its hotkeys do:
+ *
+ *   {"vendorName": "warp", "requestType": "SaveBuffer",
+ *    "requestData": {"bufferName": "Match Replay", "seconds": 10}} */
+
+enum warp_ws_buffer_action {
+	WARP_WS_BUFFER_SAVE,
+	WARP_WS_BUFFER_START,
+	WARP_WS_BUFFER_STOP,
+	WARP_WS_BUFFER_LIST,
+};
+
+struct warp_ws_buffer_request {
+	const char *type;
+	enum warp_ws_buffer_action action;
+};
+
+static struct warp_ws_buffer_request warp_ws_buffer_requests[] = {
+	{"SaveBuffer", WARP_WS_BUFFER_SAVE},
+	{"StartBuffer", WARP_WS_BUFFER_START},
+	{"StopBuffer", WARP_WS_BUFFER_STOP},
+	{"GetBuffers", WARP_WS_BUFFER_LIST},
+};
+
+/* the buffer the request names, which the caller releases, or NULL with the
+ * response saying what was wrong with it */
+static obs_data_t *warp_ws_get_buffer(obs_data_t *request, obs_data_t *response)
+{
+	const char *id = obs_data_get_string(request, "bufferId");
+	const char *name = obs_data_get_string(request, "bufferName");
+	obs_data_t *buffer;
+
+	if (id && *id) {
+		buffer = warp_buffer_get(id);
+	} else if (name && *name) {
+		buffer = warp_buffer_get_by_name(name);
+	} else {
+		warp_ws_fail(response, "bufferName or bufferId is required");
+		return NULL;
+	}
+
+	if (!buffer) {
+		warp_ws_fail(response, "there is no buffer called '%s'", (id && *id) ? id : name);
+		return NULL;
+	}
+
+	return buffer;
+}
+
+static void warp_ws_add_buffer_status(obs_data_t *buffer, obs_data_t *response)
+{
+	const char *id = obs_data_get_string(buffer, WARP_BUFFER_ID);
+	obs_data_array_t *lengths = obs_data_get_array(buffer, WARP_BUFFER_LENGTHS);
+	obs_data_array_t *angles = obs_data_get_array(buffer, WARP_BUFFER_ANGLES);
+
+	obs_data_set_string(response, "bufferId", id);
+	obs_data_set_string(response, "bufferName", obs_data_get_string(buffer, WARP_BUFFER_NAME));
+	obs_data_set_bool(response, "running", warp_buffer_running(id));
+	obs_data_set_bool(response, "followsObs", obs_data_get_bool(buffer, WARP_BUFFER_FOLLOW_OBS));
+	obs_data_set_int(response, "memoryMb", warp_buffer_memory_estimate(id));
+
+	/* the lengths as plain numbers rather than as the objects they are
+	 * saved as, since that is what a control surface makes buttons from */
+	obs_data_array_t *seconds = obs_data_array_create();
+	size_t count = lengths ? obs_data_array_count(lengths) : 0;
+
+	for (size_t i = 0; i < count; i++) {
+		obs_data_t *item = obs_data_array_item(lengths, i);
+		obs_data_t *entry = obs_data_create();
+
+		obs_data_set_int(entry, "seconds", obs_data_get_int(item, WARP_BUFFER_LENGTH_SECONDS));
+		obs_data_array_push_back(seconds, entry);
+
+		obs_data_release(entry);
+		obs_data_release(item);
+	}
+
+	obs_data_set_array(response, "lengths", seconds);
+	obs_data_set_array(response, "angles", angles);
+	obs_data_set_int(response, "angleCount", angles ? (long long)obs_data_array_count(angles) : 0);
+
+	obs_data_array_release(seconds);
+	obs_data_array_release(angles);
+	obs_data_array_release(lengths);
+}
+
+static void warp_ws_buffer_cb(obs_data_t *request, obs_data_t *response, void *priv_data)
+{
+	const struct warp_ws_buffer_request *req = priv_data;
+
+	if (req->action == WARP_WS_BUFFER_LIST) {
+		obs_data_array_t *buffers = warp_buffer_list();
+		obs_data_array_t *listed = obs_data_array_create();
+		size_t count = obs_data_array_count(buffers);
+
+		for (size_t i = 0; i < count; i++) {
+			obs_data_t *buffer = obs_data_array_item(buffers, i);
+			obs_data_t *entry = obs_data_create();
+
+			warp_ws_add_buffer_status(buffer, entry);
+			obs_data_array_push_back(listed, entry);
+
+			obs_data_release(entry);
+			obs_data_release(buffer);
+		}
+
+		obs_data_set_array(response, "buffers", listed);
+		obs_data_set_bool(response, "success", true);
+
+		obs_data_array_release(listed);
+		obs_data_array_release(buffers);
+		return;
+	}
+
+	obs_data_t *buffer = warp_ws_get_buffer(request, response);
+
+	if (!buffer)
+		return;
+
+	const char *id = obs_data_get_string(buffer, WARP_BUFFER_ID);
+	bool carried_out = true;
+
+	switch (req->action) {
+	case WARP_WS_BUFFER_SAVE: {
+		/* nothing said asks for the first length the buffer offers,
+		 * which is what its own hotkeys do */
+		long long seconds = warp_ws_field(request, "seconds", 0);
+
+		if (seconds < 0 || seconds > WARP_BUFFER_LENGTH_MAX) {
+			warp_ws_fail(response, "seconds must be a length the buffer holds, up to %d",
+				     WARP_BUFFER_LENGTH_MAX);
+			carried_out = false;
+			break;
+		}
+
+		carried_out = warp_buffer_save(id, (int)seconds, NULL);
+
+		if (!carried_out)
+			warp_ws_fail(response,
+				     "the buffer is not running, or does not hold that many seconds; the OBS log "
+				     "says which");
+		break;
+	}
+	case WARP_WS_BUFFER_START:
+		carried_out = warp_buffer_start(id);
+
+		if (!carried_out)
+			warp_ws_fail(response, "the buffer could not be started; the OBS log says why");
+		break;
+	case WARP_WS_BUFFER_STOP:
+		warp_buffer_stop(id);
+		break;
+	case WARP_WS_BUFFER_LIST:
+		break;
+	}
+
+	if (carried_out) {
+		obs_data_set_bool(response, "success", true);
+		warp_ws_add_buffer_status(buffer, response);
+	}
+
+	obs_data_release(buffer);
+}
+
 #endif /* WARP_HAVE_FRONTEND_API */
 
 /* ------------------------------------------------------------------------- */
@@ -800,6 +1041,15 @@ void warp_websocket_register(void)
 		struct warp_ws_flow_request *req = &warp_ws_flow_requests[i];
 
 		if (obs_websocket_vendor_register_request(warp_ws_vendor, req->type, warp_ws_flow_cb, req))
+			registered++;
+		else
+			obs_log(LOG_WARNING, "could not register the '%s' vendor request", req->type);
+	}
+
+	for (size_t i = 0; i < sizeof(warp_ws_buffer_requests) / sizeof(*warp_ws_buffer_requests); i++) {
+		struct warp_ws_buffer_request *req = &warp_ws_buffer_requests[i];
+
+		if (obs_websocket_vendor_register_request(warp_ws_vendor, req->type, warp_ws_buffer_cb, req))
 			registered++;
 		else
 			obs_log(LOG_WARNING, "could not register the '%s' vendor request", req->type);

@@ -54,6 +54,7 @@ target_sources(
   ${CMAKE_PROJECT_NAME}
   PRIVATE
     src/plugin-main.c
+    src/warp-angles.c
     src/warp-source.c
     src/warp-playlist-source.c
     src/warp-detection-filter.c
@@ -68,13 +69,18 @@ target_sources(
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 if(ENABLE_FRONTEND_API)
-  target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/warp-flow.c)
+  target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/warp-buffer.c src/warp-flow.c)
 endif()
 
 if(ENABLE_FRONTEND_API AND ENABLE_QT)
   target_sources(
     ${CMAKE_PROJECT_NAME}
-    PRIVATE src/warp-flow-dialog.cpp src/warp-window.cpp src/warp-zoom-dock.cpp src/warp-zoom-icons.qrc
+    PRIVATE
+      src/warp-buffer-dialog.cpp
+      src/warp-flow-dialog.cpp
+      src/warp-window.cpp
+      src/warp-zoom-dock.cpp
+      src/warp-zoom-icons.qrc
   )
   target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE WARP_HAVE_FRONTEND)
 endif()

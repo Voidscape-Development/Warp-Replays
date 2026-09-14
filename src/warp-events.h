@@ -83,6 +83,49 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define WARP_SIGNAL_DECL_FRAMES_STEPPED "void warp_frames_stepped(ptr source, int frames)"
 #define WARP_SIGNAL_DECL_MEDIA_ACTION "void warp_media_action(ptr source, string action)"
 
+/* Said when the clip in the source is swapped for another camera's view of the
+ * same moment:
+ *
+ *   warp_angle_changed(ptr source, int index, int count, string angle,
+ *                      string path)
+ *
+ * 'index' is which angle of the set is now up, counting from zero, 'count' how
+ * many the set holds, 'angle' its name and 'path' the clip that was put in.
+ * Nothing has moved on screen when it fires: the clip is still opening, and
+ * playback lands on the same moment it was at a frame or two later.
+ *
+ * A clip arriving is not an angle change, the same way it is not a speed
+ * change: the set starts on its primary angle. */
+#define WARP_SIGNAL_ANGLE_CHANGED "warp_angle_changed"
+#define WARP_SIGNAL_DECL_ANGLE_CHANGED \
+	"void warp_angle_changed(ptr source, int index, int count, string angle, string path)"
+
+/* Switching the clip in a Warp source for another angle of the same moment,
+ * as procs on the source itself:
+ *
+ *   warp_angle_next(out bool changed)
+ *   warp_angle_previous(out bool changed)
+ *   warp_angle_select(int index, out bool changed)
+ *   warp_angle_status(out int index, out int count, out string angle,
+ *                     out string path, out string angles)
+ *
+ * Next and previous wrap round the set. 'changed' is false when the clip is in
+ * no set, when the set holds only the one angle, or when the angle asked for
+ * is the one already up. 'angles' is the whole set written out as JSON, since
+ * a calldata cannot carry an array.
+ *
+ * A Warp Playlist source carries these as well and hands them to whichever
+ * file it is playing, so an angle is switched the same way whether the clip is
+ * in a media source or in a list. */
+#define WARP_ANGLE_NEXT_PROC "warp_angle_next"
+#define WARP_ANGLE_PREVIOUS_PROC "warp_angle_previous"
+#define WARP_ANGLE_SELECT_PROC "warp_angle_select"
+#define WARP_ANGLE_STATUS_PROC "warp_angle_status"
+
+/* how many angles are reachable through the numbered angle hotkeys, which are
+ * registered once and fire whichever camera is in that position */
+#define WARP_ANGLE_HOTKEY_SLOTS 8
+
 /* values of the 'change' field: the speed was set to a value outright (a preset
  * hotkey, Reset Speed, or the Speed property), or stepped by WARP_SPEED_STEP */
 #define WARP_SPEED_CHANGE_SET "set"
@@ -176,4 +219,25 @@ static inline void warp_signal_media_action(obs_source_t *source, const char *ac
 	calldata_set_string(&cd, "action", action);
 
 	signal_handler_signal(obs_source_get_signal_handler(source), WARP_SIGNAL_MEDIA_ACTION, &cd);
+}
+
+/* An angle carries a path, which has no length worth sizing a stack for - a
+ * path cut short is not a shorter path, it is the wrong file - so this one is
+ * the exception that takes its calldata from the heap. It is only ever emitted
+ * when an operator reaches for another camera, rather than every frame. */
+static inline void warp_signal_angle_changed(obs_source_t *source, size_t index, size_t count, const char *angle,
+					     const char *path)
+{
+	struct calldata cd;
+
+	calldata_init(&cd);
+	calldata_set_ptr(&cd, "source", source);
+	calldata_set_int(&cd, "index", (long long)index);
+	calldata_set_int(&cd, "count", (long long)count);
+	calldata_set_string(&cd, "angle", angle ? angle : "");
+	calldata_set_string(&cd, "path", path ? path : "");
+
+	signal_handler_signal(obs_source_get_signal_handler(source), WARP_SIGNAL_ANGLE_CHANGED, &cd);
+
+	calldata_free(&cd);
 }

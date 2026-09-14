@@ -24,6 +24,7 @@
 #include <media-playback/media-playback.h>
 #include <media-playback/media.h>
 
+#include "warp-angles.h"
 #include "warp-events.h"
 #include "warp-zoom.h"
 
@@ -129,8 +130,25 @@ struct warp_source {
 	volatile bool start_pending;
 	volatile bool hold_clip;
 
+	/* An angle being switched to.
+	 *
+	 * The clip goes in the same way any other does, so the file is not open
+	 * when the switch returns; what makes it a switch rather than a load is
+	 * that playback is put back where it was once the file is there.
+	 * 'angle_cursor' is where in the incoming clip the moment being watched
+	 * falls, worked out before the swap from the two clips' lengths, and
+	 * 'angle_was_playing' is whether it was running or held.
+	 *
+	 * Both are written before angle_pending is set and read after it is
+	 * seen, the same way hold_clip is ordered against start_pending. */
+	int64_t angle_cursor;
+	volatile bool angle_was_playing;
+	volatile bool angle_pending;
+
 	struct warp_hotkey_binding speed_bindings[WARP_NUM_SPEED_PRESETS];
 	struct warp_hotkey_binding step_bindings[WARP_NUM_STEP_HOTKEYS];
+	/* next and previous, then one per numbered slot */
+	struct warp_hotkey_binding angle_bindings[WARP_ANGLE_HOTKEY_SLOTS + 2];
 };
 
 // Used to safely cancel and join any active reconnect threads
@@ -536,6 +554,125 @@ static void warp_source_hold_tick(struct warp_source *s)
 	os_atomic_set_bool(&s->hold_clip, false);
 }
 
+/* ------------------------------------------------------------------------- */
+/* angles
+ *
+ * A clip written by a Warp buffer holding several cameras is one of a set: the
+ * same seconds of the same moment, seen from somewhere else. Switching angle
+ * puts another clip of that set in the source and lands playback on the moment
+ * that was being watched, so the play carries on from the new camera rather
+ * than starting over.
+ *
+ * The clips do not begin together - each was written from whichever keyframe
+ * its buffer still held - so where the moment falls in the incoming clip is
+ * worked out from the two clips' lengths by the angle register, which lines
+ * them up on their ends. */
+
+/* Puts the clip of angle 'index' in the source, held at the moment the one
+ * being played is at. Answers false when the clip is in no set, the set is not
+ * that long, or that angle is the one already up. */
+static bool warp_source_select_angle(struct warp_source *s, size_t index)
+{
+	char *path = NULL;
+	char *name = NULL;
+	size_t at = 0;
+
+	if (!s->is_local_file || !s->input || !*s->input)
+		return false;
+
+	size_t count = warp_angles_count(s->input, &at);
+
+	if (count < 2 || index >= count || index == at)
+		return false;
+
+	if (!warp_angles_get(s->input, index, &path, &name, NULL))
+		return false;
+
+	int64_t cursor = s->media ? media_playback_get_current_time(s->media) : 0;
+	int64_t landing = cursor;
+
+	warp_angles_map_cursor(s->input, index, cursor, &landing);
+
+	const bool playing = s->state == OBS_MEDIA_STATE_PLAYING;
+
+	obs_data_t *settings = obs_source_get_settings(s->source);
+
+	obs_data_set_bool(settings, "is_local_file", true);
+	obs_data_set_string(settings, "local_file", path);
+	obs_source_update(s->source, settings);
+	obs_data_release(settings);
+
+	/* Where playback is to land, and how it is to be left, are both set
+	 * before the tick is told there is an angle waiting. The clip is
+	 * opened and decoded whether or not the source is on screen, the same
+	 * way a held clip is: there is nothing to seek in a file that is not
+	 * being read. */
+	s->angle_cursor = landing;
+	os_atomic_set_bool(&s->angle_was_playing, playing);
+	os_atomic_set_bool(&s->angle_pending, true);
+	os_atomic_set_bool(&s->hold_clip, false);
+	os_atomic_set_bool(&s->start_pending, true);
+
+	/* another camera is another picture, so the framing goes back to the
+	 * whole of it rather than staying punched into a corner of the shot
+	 * that is no longer on screen */
+	warp_zoom_control_restore_default(&s->zoom);
+
+	FF_BLOG(LOG_INFO, "angle %d of %d: '%s' at %" PRId64 "ms", (int)index + 1, (int)count, name, landing);
+
+	warp_signal_angle_changed(s->source, index, count, name, path);
+
+	bfree(name);
+	bfree(path);
+
+	return true;
+}
+
+/* Moves 'delta' angles along the set, wrapping round either end. */
+static bool warp_source_step_angle(struct warp_source *s, int delta)
+{
+	size_t at = 0;
+
+	if (!s->is_local_file || !s->input || !*s->input)
+		return false;
+
+	size_t count = warp_angles_count(s->input, &at);
+
+	if (count < 2)
+		return false;
+
+	long long next = (long long)at + delta;
+	long long wrapped = next % (long long)count;
+
+	if (wrapped < 0)
+		wrapped += (long long)count;
+
+	return warp_source_select_angle(s, (size_t)wrapped);
+}
+
+/* Lands playback on the moment the angle was switched at, once the incoming
+ * clip has opened far enough to be seeked. libobs carries the pause and the
+ * seek out on the media's own thread, so this is done from the tick rather
+ * than from the call that asked for the switch. */
+static void warp_source_angle_tick(struct warp_source *s)
+{
+	if (!warp_source_ready(s))
+		return;
+
+	/* A clip that was being held stays held: the source is putting the new
+	 * angle where the old one was, not being told to play by anyone, so
+	 * the media action signal hears nothing about it. */
+	if (!os_atomic_load_bool(&s->angle_was_playing)) {
+		s->internal_command = true;
+		obs_source_media_play_pause(s->source, true);
+		s->internal_command = false;
+	}
+
+	media_playback_seek(s->media, s->angle_cursor);
+
+	os_atomic_set_bool(&s->angle_pending, false);
+}
+
 /* The filter the zoom is drawn by, made the first time anything asks the source
  * to zoom rather than put on every source that is never framed. One the source
  * was made with - a playlist opens its files with a zoom of their own - is
@@ -632,6 +769,11 @@ static void warp_source_tick(void *data, float seconds)
 
 	if (os_atomic_load_bool(&s->hold_clip))
 		warp_source_hold_tick(s);
+
+	/* an angle that was switched to and is waiting on its clip to open far
+	 * enough to be put where the last one was */
+	if (os_atomic_load_bool(&s->angle_pending))
+		warp_source_angle_tick(s);
 
 	if (s->destroy_media) {
 		if (s->media) {
@@ -1114,6 +1256,78 @@ static void warp_media_load_proc(void *data, calldata_t *cd)
 	warp_signal_media_action(s->source, WARP_MEDIA_ACTION_LOADED);
 }
 
+static void warp_angle_next_proc(void *data, calldata_t *cd)
+{
+	calldata_set_bool(cd, "changed", warp_source_step_angle(data, 1));
+}
+
+static void warp_angle_previous_proc(void *data, calldata_t *cd)
+{
+	calldata_set_bool(cd, "changed", warp_source_step_angle(data, -1));
+}
+
+static void warp_angle_select_proc(void *data, calldata_t *cd)
+{
+	long long index = 0;
+
+	if (!calldata_get_int(cd, "index", &index) || index < 0) {
+		calldata_set_bool(cd, "changed", false);
+		return;
+	}
+
+	calldata_set_bool(cd, "changed", warp_source_select_angle(data, (size_t)index));
+}
+
+static void warp_angle_status_proc(void *data, calldata_t *cd)
+{
+	struct warp_source *s = data;
+	const char *path = (s->is_local_file && s->input) ? s->input : NULL;
+	size_t at = 0;
+	size_t count = warp_angles_count(path, &at);
+	char *name = NULL;
+	char *angles = warp_angles_describe(path);
+
+	if (count)
+		warp_angles_get(path, at, NULL, &name, NULL);
+
+	calldata_set_int(cd, "index", count ? (long long)at : -1);
+	calldata_set_int(cd, "count", (long long)count);
+	calldata_set_string(cd, "angle", name ? name : "");
+	calldata_set_string(cd, "path", path ? path : "");
+	calldata_set_string(cd, "angles", angles ? angles : "");
+
+	bfree(angles);
+	bfree(name);
+}
+
+/* the numbered angle hotkeys fire whichever camera is in that position, so a
+ * binding survives a set with the cameras the other way round */
+static void warp_source_angle_slot_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
+{
+	struct warp_hotkey_binding *b = data;
+
+	UNUSED_PARAMETER(id);
+	UNUSED_PARAMETER(hotkey);
+
+	if (!pressed || !obs_source_showing(b->s->source))
+		return;
+
+	warp_source_select_angle(b->s, (size_t)b->value);
+}
+
+static void warp_source_angle_step_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
+{
+	struct warp_hotkey_binding *b = data;
+
+	UNUSED_PARAMETER(id);
+	UNUSED_PARAMETER(hotkey);
+
+	if (!pressed || !obs_source_showing(b->s->source))
+		return;
+
+	warp_source_step_angle(b->s, b->value);
+}
+
 static void warp_source_register_warp_hotkeys(struct warp_source *s, obs_source_t *source)
 {
 	static const int speed_presets[WARP_NUM_SPEED_PRESETS] = {WARP_SPEED_PRESET_LIST};
@@ -1158,6 +1372,31 @@ static void warp_source_register_warp_hotkeys(struct warp_source *s, obs_source_
 		snprintf(text_key, sizeof(text_key), "Warp.Hotkey.Step.Backward%d", step_counts[i]);
 		obs_hotkey_register_source(source, name, obs_module_text(text_key), warp_source_step_hotkey, back);
 	}
+
+	s->angle_bindings[0].s = s;
+	s->angle_bindings[0].value = 1;
+	obs_hotkey_register_source(source, "WarpMedia.AngleNext", obs_module_text("Warp.Hotkey.Angle.Next"),
+				   warp_source_angle_step_hotkey, &s->angle_bindings[0]);
+
+	s->angle_bindings[1].s = s;
+	s->angle_bindings[1].value = -1;
+	obs_hotkey_register_source(source, "WarpMedia.AnglePrevious", obs_module_text("Warp.Hotkey.Angle.Previous"),
+				   warp_source_angle_step_hotkey, &s->angle_bindings[1]);
+
+	for (size_t i = 0; i < WARP_ANGLE_HOTKEY_SLOTS; i++) {
+		struct warp_hotkey_binding *slot = &s->angle_bindings[i + 2];
+		char name[64];
+		struct dstr desc = {0};
+
+		slot->s = s;
+		slot->value = (int)i;
+
+		snprintf(name, sizeof(name), "WarpMedia.Angle%d", (int)i + 1);
+		dstr_printf(&desc, obs_module_text("Warp.Hotkey.Angle.Slot"), (int)i + 1);
+
+		obs_hotkey_register_source(source, name, desc.array, warp_source_angle_slot_hotkey, slot);
+		dstr_free(&desc);
+	}
 }
 
 /* The zoom presets are made in the dock rather than through the properties, so
@@ -1172,9 +1411,13 @@ static void warp_source_save(void *data, obs_data_t *settings)
 
 static void *warp_source_create(obs_data_t *settings, obs_source_t *source)
 {
-	static const char *signals[] = {WARP_SIGNAL_DECL_SPEED_CHANGED, WARP_SIGNAL_DECL_FRAMES_STEPPED,
-					WARP_SIGNAL_DECL_MEDIA_ACTION,  WARP_SIGNAL_DECL_ZOOM_CHANGED,
-					WARP_SIGNAL_DECL_ZOOM_STAGED,   NULL};
+	static const char *signals[] = {WARP_SIGNAL_DECL_SPEED_CHANGED,
+					WARP_SIGNAL_DECL_FRAMES_STEPPED,
+					WARP_SIGNAL_DECL_MEDIA_ACTION,
+					WARP_SIGNAL_DECL_ZOOM_CHANGED,
+					WARP_SIGNAL_DECL_ZOOM_STAGED,
+					WARP_SIGNAL_DECL_ANGLE_CHANGED,
+					NULL};
 
 	struct warp_source *s = bzalloc(sizeof(struct warp_source));
 	s->source = source;
@@ -1220,6 +1463,13 @@ static void *warp_source_create(obs_data_t *settings, obs_source_t *source)
 	proc_handler_add(ph, "void warp_step_frames(int frames)", step_frames_proc, s);
 	proc_handler_add(ph, "void " WARP_MEDIA_LOAD_PROC "(string path, int speed, string playback)",
 			 warp_media_load_proc, s);
+	proc_handler_add(ph, "void " WARP_ANGLE_NEXT_PROC "(out bool changed)", warp_angle_next_proc, s);
+	proc_handler_add(ph, "void " WARP_ANGLE_PREVIOUS_PROC "(out bool changed)", warp_angle_previous_proc, s);
+	proc_handler_add(ph, "void " WARP_ANGLE_SELECT_PROC "(int index, out bool changed)", warp_angle_select_proc, s);
+	proc_handler_add(ph,
+			 "void " WARP_ANGLE_STATUS_PROC
+			 "(out int index, out int count, out string angle, out string path, out string angles)",
+			 warp_angle_status_proc, s);
 
 	warp_zoom_control_init(&s->zoom, source, "WarpMedia", true, false);
 	warp_zoom_control_register_procs(&s->zoom, source);
@@ -1291,6 +1541,10 @@ static void warp_source_drop_pending_load(struct warp_source *s)
 
 	os_atomic_set_bool(&s->start_pending, false);
 	os_atomic_set_bool(&s->hold_clip, false);
+	/* an angle waiting to be put where the last one was is dropped too:
+	 * somebody has taken playback somewhere themselves, and that is where
+	 * it belongs rather than where the switch was aiming for */
+	os_atomic_set_bool(&s->angle_pending, false);
 }
 
 static void warp_source_play_pause(void *data, bool pause)

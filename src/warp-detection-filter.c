@@ -48,6 +48,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define S_FILTER_MODE "filter_mode"
 #define S_FILTER_HOTKEY "filter_hotkey"
 #define S_PRESET_VALUE "preset_value"
+#define S_ANGLE_VALUE "angle_value"
 #define S_ZOOM_SOURCE "zoom_source"
 #define S_ZOOM_FILTER "zoom_filter"
 #define S_ZOOM_PRESET "zoom_preset"
@@ -70,6 +71,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define EVENT_ZOOM_CHANGED "zoom_changed"
 #define EVENT_ZOOM_PRESET "zoom_preset"
 #define EVENT_ZOOM_RESET "zoom_reset"
+#define EVENT_ANGLE_CHANGED "angle_changed"
 
 /* the speed Reset Speed sets, which has an event like the presets do */
 #define WARP_DETECT_RESET_SPEED 100
@@ -87,6 +89,7 @@ enum warp_detect_kind {
 	WARP_DETECT_KIND_MEDIA_PAUSE,
 	WARP_DETECT_KIND_MEDIA_RESTART,
 	WARP_DETECT_KIND_MEDIA_LOADED,
+	WARP_DETECT_KIND_ANGLE_CHANGED,
 	WARP_DETECT_KIND_ZOOM_CHANGED,
 	WARP_DETECT_KIND_ZOOM_PRESET,
 	WARP_DETECT_KIND_ZOOM_RESET,
@@ -506,6 +509,11 @@ static enum warp_detect_kind warp_detect_event_kind(obs_data_t *settings, int *v
 	if (strcmp(event, EVENT_ZOOM_CHANGED) == 0)
 		return WARP_DETECT_KIND_ZOOM_CHANGED;
 
+	if (strcmp(event, EVENT_ANGLE_CHANGED) == 0) {
+		*any = obs_data_get_bool(settings, S_ANY_VALUE);
+		return WARP_DETECT_KIND_ANGLE_CHANGED;
+	}
+
 	if (strcmp(event, EVENT_ZOOM_PRESET) == 0) {
 		*any = obs_data_get_bool(settings, S_ANY_VALUE);
 		return WARP_DETECT_KIND_ZOOM_PRESET;
@@ -615,6 +623,49 @@ static bool warp_detect_zoom_matches(obs_data_t *settings, const char *change, c
 	default:
 		return false;
 	}
+}
+
+/* An angle switch matches when the filter is listening for one, and either
+ * takes any camera or names the one that was switched to. */
+static bool warp_detect_angle_matches(obs_data_t *settings, const char *angle)
+{
+	int value;
+	bool any;
+
+	if (warp_detect_event_kind(settings, &value, &any) != WARP_DETECT_KIND_ANGLE_CHANGED)
+		return false;
+
+	const char *wanted = obs_data_get_string(settings, S_ANGLE_VALUE);
+
+	return any || (angle && *angle && astrcmpi(angle, wanted) == 0);
+}
+
+static void warp_detect_angle_signal(void *param, calldata_t *cd)
+{
+	struct warp_detect_filter *f = param;
+	const char *angle = NULL;
+	long long index = 0;
+	long long count = 0;
+
+	if (!obs_source_enabled(f->source))
+		return;
+
+	calldata_get_string(cd, "angle", &angle);
+	calldata_get_int(cd, "index", &index);
+	calldata_get_int(cd, "count", &count);
+
+	obs_data_t *settings = obs_source_get_settings(f->source);
+	bool matched = warp_detect_angle_matches(settings, angle);
+
+	obs_data_release(settings);
+
+	if (!matched)
+		return;
+
+	char event[sizeof(f->event_desc)];
+
+	snprintf(event, sizeof(event), "angle %d of %d ('%s')", (int)index + 1, (int)count, angle ? angle : "");
+	warp_detect_fire(f, event);
 }
 
 static void warp_detect_zoom_signal(void *param, calldata_t *cd)
@@ -756,6 +807,7 @@ static void warp_detect_disconnect(struct warp_detect_filter *f)
 		signal_handler_disconnect(handler, WARP_SIGNAL_FRAMES_STEPPED, warp_detect_frames_signal, f);
 		signal_handler_disconnect(handler, WARP_SIGNAL_MEDIA_ACTION, warp_detect_media_signal, f);
 		signal_handler_disconnect(handler, WARP_SIGNAL_ZOOM_CHANGED, warp_detect_zoom_signal, f);
+		signal_handler_disconnect(handler, WARP_SIGNAL_ANGLE_CHANGED, warp_detect_angle_signal, f);
 		obs_source_release(source);
 	}
 
@@ -814,6 +866,7 @@ static void warp_detect_resolve(struct warp_detect_filter *f)
 	signal_handler_connect(handler, WARP_SIGNAL_FRAMES_STEPPED, warp_detect_frames_signal, f);
 	signal_handler_connect(handler, WARP_SIGNAL_MEDIA_ACTION, warp_detect_media_signal, f);
 	signal_handler_connect(handler, WARP_SIGNAL_ZOOM_CHANGED, warp_detect_zoom_signal, f);
+	signal_handler_connect(handler, WARP_SIGNAL_ANGLE_CHANGED, warp_detect_angle_signal, f);
 	f->listening_to = obs_source_get_weak_source(wanted);
 
 	WARP_DETECT_LOG(LOG_INFO, "listening to '%s'", obs_source_get_name(wanted));
@@ -1070,6 +1123,7 @@ static void warp_detect_add_events(obs_property_t *list)
 	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.MediaLoaded"), EVENT_MEDIA_LOADED);
 
 	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.ZoomChanged"), EVENT_ZOOM_CHANGED);
+	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.AngleChanged"), EVENT_ANGLE_CHANGED);
 	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.ZoomPreset"), EVENT_ZOOM_PRESET);
 	obs_property_list_add_string(list, obs_module_text("Warp.Detect.Event.ZoomReset"), EVENT_ZOOM_RESET);
 }
@@ -1147,6 +1201,7 @@ static bool warp_detect_modified(obs_properties_t *props, obs_property_t *proper
 	bool filter_hotkey = filter && strcmp(filter_mode, FILTER_MODE_HOTKEY) == 0;
 	bool zoom_action = strcmp(action, ACTION_ZOOM_PRESET) == 0;
 	bool preset_value = strcmp(event, EVENT_ZOOM_PRESET) == 0;
+	bool angle_value = strcmp(event, EVENT_ANGLE_CHANGED) == 0;
 	obs_property_t *list;
 
 	UNUSED_PARAMETER(property);
@@ -1155,7 +1210,9 @@ static bool warp_detect_modified(obs_properties_t *props, obs_property_t *proper
 	obs_property_set_visible(obs_properties_get(props, S_SPEED_VALUE), speed_value && !any_value);
 	obs_property_set_visible(obs_properties_get(props, S_FRAME_VALUE), frame_value && !any_value);
 	obs_property_set_visible(obs_properties_get(props, S_PRESET_VALUE), preset_value && !any_value);
-	obs_property_set_visible(obs_properties_get(props, S_ANY_VALUE), speed_value || frame_value || preset_value);
+	obs_property_set_visible(obs_properties_get(props, S_ANGLE_VALUE), angle_value && !any_value);
+	obs_property_set_visible(obs_properties_get(props, S_ANY_VALUE),
+				 speed_value || frame_value || preset_value || angle_value);
 
 	obs_property_set_visible(obs_properties_get(props, S_GLOBAL_HOTKEY), global_hotkey);
 	obs_property_set_visible(obs_properties_get(props, S_HOTKEY_SOURCE), source_hotkey);
@@ -1237,6 +1294,7 @@ static obs_properties_t *warp_detect_getproperties(void *data)
 	obs_properties_add_int(props, S_FRAME_VALUE, obs_module_text("Warp.Detect.Frames"), 1, 10000, 1);
 
 	obs_properties_add_text(props, S_PRESET_VALUE, obs_module_text("Warp.Detect.Preset"), OBS_TEXT_DEFAULT);
+	obs_properties_add_text(props, S_ANGLE_VALUE, obs_module_text("Warp.Detect.Angle"), OBS_TEXT_DEFAULT);
 
 	prop = obs_properties_add_bool(props, S_ANY_VALUE, obs_module_text("Warp.Detect.AnyValue"));
 	obs_property_set_modified_callback(prop, warp_detect_modified);

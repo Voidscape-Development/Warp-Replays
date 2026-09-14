@@ -37,6 +37,11 @@ extern "C" {
 #define WARP_FLOW_NAME "name"
 #define WARP_FLOW_KIND "kind"
 #define WARP_FLOW_TRIGGER "trigger"
+/* where its clips come from: OBS's own replay buffer, or a Warp buffer, which
+ * is named by WARP_FLOW_BUFFER_ID and filtered by WARP_FLOW_BUFFER_LENGTHS */
+#define WARP_FLOW_CLIP_SOURCE "clip_source"
+#define WARP_FLOW_BUFFER_ID "buffer_id"
+#define WARP_FLOW_BUFFER_LENGTHS "buffer_lengths"
 #define WARP_FLOW_ORDER "order"
 #define WARP_FLOW_TARGET_UUID "target_uuid"
 #define WARP_FLOW_TARGET_NAME "target_name"
@@ -58,6 +63,25 @@ extern "C" {
 
 /* items of the WARP_FLOW_LINKS array carry the id of the flow they link to */
 #define WARP_FLOW_LINK_ID "id"
+
+/* items of the WARP_FLOW_BUFFER_LENGTHS array carry one length in seconds; an
+ * empty array is the flow taking every length its buffer offers */
+#define WARP_FLOW_BUFFER_LENGTH_SECONDS "seconds"
+
+/* Where a flow's clips come from:
+ *
+ *   obs    - OBS's own replay buffer, set up in its settings and one length
+ *            long. This is what a flow took before there were any others, and
+ *            is what a flow that says nothing still takes.
+ *   buffer - a Warp buffer, named by WARP_FLOW_BUFFER_ID: several lengths on
+ *            one feed, and several angles of one moment. The flow takes the
+ *            lengths listed in WARP_FLOW_BUFFER_LENGTHS, or every length the
+ *            buffer offers when that is empty.
+ *
+ * A flow's own Save Replay hotkey saves whichever of the two it is pointed at,
+ * so the key an operator presses does not change with the setting. */
+#define WARP_FLOW_CLIP_SOURCE_OBS "obs"
+#define WARP_FLOW_CLIP_SOURCE_BUFFER "buffer"
 
 /* What the flow is for.
  *
@@ -126,11 +150,13 @@ bool warp_flow_save_replay(const char *id);
  * new one */
 bool warp_flow_promote_last(const char *id);
 
-/* Told when a flow's Save Replay hotkey is pressed and there is no replay
- * buffer running for it to save. The UI sets this so the press says so rather
- * than doing nothing, and can offer to start the buffer there and then; with
- * nothing set the press is only logged. Called on the UI thread. */
-typedef void (*warp_flow_buffer_prompt_t)(const char *flow_name);
+/* Told when a flow's Save Replay hotkey is pressed and whatever it takes its
+ * clips from is not holding any. The UI sets this so the press says so rather
+ * than doing nothing, and can offer to start it there and then; with nothing
+ * set the press is only logged. 'buffer_id' names the Warp buffer the flow is
+ * pointed at, or is NULL when it takes OBS's own replay buffer. Called on the
+ * UI thread. */
+typedef void (*warp_flow_buffer_prompt_t)(const char *flow_name, const char *buffer_id);
 void warp_flow_set_buffer_prompt(warp_flow_buffer_prompt_t prompt);
 
 bool warp_flow_replay_buffer_active(void);

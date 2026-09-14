@@ -20,6 +20,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <QDialog>
 #include <QIcon>
+#include <QList>
 #include <QString>
 #include <QStringList>
 
@@ -71,6 +72,7 @@ private:
 	QCheckBox *limitCheck = nullptr;
 	QSpinBox *limitSpin = nullptr;
 	QComboBox *fedByCombo = nullptr;
+	QComboBox *clipSourceCombo = nullptr;
 	QComboBox *hlTargetCombo = nullptr;
 	QLineEdit *hlNewTargetEdit = nullptr;
 	QComboBox *hlOrderCombo = nullptr;
@@ -113,5 +115,14 @@ private:
 	QCheckBox *speedCheck = nullptr;
 	QSpinBox *speedSpin = nullptr;
 	QCheckBox *enabledCheck = nullptr;
+	QComboBox *clipSourceCombo = nullptr;
+	/* the lengths of the Warp buffer the flow is pointed at, ticked for the
+	 * ones it takes; none ticked is every length the buffer offers */
+	QListWidget *bufferLengthList = nullptr;
+	/* the lengths the flow was saved taking, so the list comes back ticked
+	 * the way it was left even after the buffer it is pointed at changes */
+	QList<int> takenLengths;
 	QListWidget *linkList = nullptr;
+
+	void clipSourceChanged();
 };

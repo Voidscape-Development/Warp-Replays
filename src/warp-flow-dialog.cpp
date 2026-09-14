@@ -43,6 +43,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QSpinBox>
 #include <QVBoxLayout>
 
+#include "warp-buffer.h"
 #include "warp-events.h"
 #include "warp-flow-dialog.hpp"
 #include "warp-flow.h"
@@ -184,6 +185,53 @@ void warp_fill_playback_combo(QComboBox *combo)
 	combo->addItem(warp_flow_text("Warp.Flow.Playback.Keep"), QString(WARP_MEDIA_LOAD_KEEP));
 	combo->addItem(warp_flow_text("Warp.Flow.Playback.Play"), QString(WARP_MEDIA_LOAD_PLAY));
 	combo->addItem(warp_flow_text("Warp.Flow.Playback.Hold"), QString(WARP_MEDIA_LOAD_HOLD));
+}
+
+/* Where a flow takes its clips from: OBS's own replay buffer, which is what a
+ * flow took before there was anything else, and then every Warp buffer in the
+ * scene collection. A buffer is named by its id, so renaming one does not lose
+ * the flows pointed at it. */
+void warp_fill_clip_source_combo(QComboBox *combo)
+{
+	combo->clear();
+	combo->addItem(warp_flow_text("Warp.Flow.ClipSource.Obs"), QString());
+
+	obs_data_array_t *buffers = warp_buffer_list();
+	const size_t count = obs_data_array_count(buffers);
+
+	for (size_t i = 0; i < count; i++) {
+		obs_data_t *buffer = obs_data_array_item(buffers, i);
+
+		combo->addItem(QString::fromUtf8(obs_data_get_string(buffer, WARP_BUFFER_NAME)),
+			       QString::fromUtf8(obs_data_get_string(buffer, WARP_BUFFER_ID)));
+		obs_data_release(buffer);
+	}
+
+	obs_data_array_release(buffers);
+}
+
+/* what the flow's clip source combo should be showing, from the two fields the
+ * flow is saved with */
+QString warp_flow_clip_source_value(obs_data_t *config)
+{
+	if (!config)
+		return QString();
+
+	const char *source = obs_data_get_string(config, WARP_FLOW_CLIP_SOURCE);
+
+	if (!source || strcmp(source, WARP_FLOW_CLIP_SOURCE_BUFFER) != 0)
+		return QString();
+
+	return QString::fromUtf8(obs_data_get_string(config, WARP_FLOW_BUFFER_ID));
+}
+
+/* writes the two fields a flow saves its clip source as, from what the combo
+ * is showing */
+void warp_flow_set_clip_source(obs_data_t *config, const QString &buffer_id)
+{
+	obs_data_set_string(config, WARP_FLOW_CLIP_SOURCE,
+			    buffer_id.isEmpty() ? WARP_FLOW_CLIP_SOURCE_OBS : WARP_FLOW_CLIP_SOURCE_BUFFER);
+	obs_data_set_string(config, WARP_FLOW_BUFFER_ID, buffer_id.toUtf8().constData());
 }
 
 void warp_select_data(QComboBox *combo, const QString &value)
@@ -523,6 +571,13 @@ WarpFlowCreateDialog::WarpFlowCreateDialog(QWidget *parent) : QDialog(parent)
 	fedByCombo = new QComboBox(this);
 	form->addRow(warp_flow_text("Warp.Flow.FedBy"), fedByCombo);
 
+	/* Where its clips come from. A flow made here takes every length its
+	 * buffer offers; which of them it takes is settled in its properties,
+	 * where the buffer's lengths can be listed to tick. */
+	clipSourceCombo = new QComboBox(this);
+	warp_fill_clip_source_combo(clipSourceCombo);
+	form->addRow(warp_flow_text("Warp.Flow.ClipSource"), clipSourceCombo);
+
 	triggerCombo = new QComboBox(this);
 	warp_fill_trigger_combo(triggerCombo);
 	form->addRow(warp_flow_text("Warp.Flow.Trigger"), triggerCombo);
@@ -681,6 +736,8 @@ bool WarpFlowCreateDialog::buildFlow(const char *kind, const QString &name, QCom
 	obs_data_set_string(config, WARP_FLOW_TARGET_NAME, target_name.toUtf8().constData());
 	obs_data_set_int(config, WARP_FLOW_MAX_CLIPS, max_clips);
 	obs_data_set_bool(config, WARP_FLOW_ENABLED, true);
+
+	warp_flow_set_clip_source(config, clipSourceCombo->currentData().toString());
 
 	/* what playback does with a clip, and how fast, is the instant replay
 	 * flow's alone: the list kinds put a clip in a list and leave playback
@@ -870,6 +927,18 @@ WarpFlowPropsDialog::WarpFlowPropsDialog(QWidget *parent, const QString &id) : Q
 	newTargetEdit->setPlaceholderText(warp_flow_text("Warp.Flow.Target.NewName.Placeholder"));
 	form->addRow(warp_flow_text("Warp.Flow.Target.NewName"), newTargetEdit);
 
+	/* where its clips come from, which is what its own Save Replay hotkey
+	 * saves as well as what it listens to */
+	clipSourceCombo = new QComboBox(this);
+	warp_fill_clip_source_combo(clipSourceCombo);
+	warp_select_data(clipSourceCombo, warp_flow_clip_source_value(config));
+	form->addRow(warp_flow_text("Warp.Flow.ClipSource"), clipSourceCombo);
+
+	bufferLengthList = new QListWidget(this);
+	bufferLengthList->setMaximumHeight(110);
+	bufferLengthList->setToolTip(warp_flow_text("Warp.Flow.BufferLengths.Desc"));
+	form->addRow(warp_flow_text("Warp.Flow.BufferLengths"), bufferLengthList);
+
 	triggerCombo = new QComboBox(this);
 	warp_fill_trigger_combo(triggerCombo);
 	warp_select_data(triggerCombo, QString::fromUtf8(config ? obs_data_get_string(config, WARP_FLOW_TRIGGER) : ""));
@@ -977,10 +1046,61 @@ WarpFlowPropsDialog::WarpFlowPropsDialog(QWidget *parent, const QString &id) : Q
 	layout->addWidget(buttons);
 
 	connect(targetCombo, &QComboBox::currentIndexChanged, this, [this](int) { targetChanged(); });
+	connect(clipSourceCombo, &QComboBox::currentIndexChanged, this, [this](int) { clipSourceChanged(); });
+
+	/* the lengths this flow already takes, so the list comes up ticked the
+	 * way it was left */
+	obs_data_array_t *taken = config ? obs_data_get_array(config, WARP_FLOW_BUFFER_LENGTHS) : nullptr;
+	const size_t taken_count = taken ? obs_data_array_count(taken) : 0;
+
+	for (size_t i = 0; i < taken_count; i++) {
+		obs_data_t *item = obs_data_array_item(taken, i);
+
+		takenLengths.append((int)obs_data_get_int(item, WARP_FLOW_BUFFER_LENGTH_SECONDS));
+		obs_data_release(item);
+	}
+
+	obs_data_array_release(taken);
 
 	targetChanged();
+	clipSourceChanged();
 
 	obs_data_release(config);
+}
+
+/* The lengths list only means anything for a flow pointed at a Warp buffer,
+ * and it lists that buffer's lengths, so it is rebuilt whenever the buffer
+ * changes. Nothing ticked is the flow taking every length. */
+void WarpFlowPropsDialog::clipSourceChanged()
+{
+	const QString buffer_id = clipSourceCombo->currentData().toString();
+	const bool from_buffer = !buffer_id.isEmpty();
+
+	bufferLengthList->clear();
+
+	if (from_buffer) {
+		obs_data_t *buffer = warp_buffer_get(buffer_id.toUtf8().constData());
+		obs_data_array_t *lengths = buffer ? obs_data_get_array(buffer, WARP_BUFFER_LENGTHS) : nullptr;
+		const size_t count = lengths ? obs_data_array_count(lengths) : 0;
+
+		for (size_t i = 0; i < count; i++) {
+			obs_data_t *length = obs_data_array_item(lengths, i);
+			const int seconds = (int)obs_data_get_int(length, WARP_BUFFER_LENGTH_SECONDS);
+			auto *item = new QListWidgetItem(warp_flow_text("Warp.Buffer.Length.Item").arg(seconds),
+							 bufferLengthList);
+
+			item->setData(Qt::UserRole, seconds);
+			item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+			item->setCheckState(takenLengths.contains(seconds) ? Qt::Checked : Qt::Unchecked);
+
+			obs_data_release(length);
+		}
+
+		obs_data_array_release(lengths);
+		obs_data_release(buffer);
+	}
+
+	warp_set_row_visible(form, bufferLengthList, from_buffer);
 }
 
 void WarpFlowPropsDialog::targetChanged()
@@ -1018,6 +1138,26 @@ void WarpFlowPropsDialog::accept()
 	obs_data_set_string(config, WARP_FLOW_ORDER, orderCombo->currentData().toString().toUtf8().constData());
 	obs_data_set_int(config, WARP_FLOW_MAX_CLIPS, limitCheck->isChecked() ? limitSpin->value() : 0);
 	obs_data_set_bool(config, WARP_FLOW_ENABLED, enabledCheck->isChecked());
+
+	warp_flow_set_clip_source(config, clipSourceCombo->currentData().toString());
+
+	obs_data_array_t *buffer_lengths = obs_data_array_create();
+
+	for (int i = 0; i < bufferLengthList->count(); i++) {
+		QListWidgetItem *item = bufferLengthList->item(i);
+
+		if (item->checkState() != Qt::Checked)
+			continue;
+
+		obs_data_t *length = obs_data_create();
+
+		obs_data_set_int(length, WARP_FLOW_BUFFER_LENGTH_SECONDS, item->data(Qt::UserRole).toInt());
+		obs_data_array_push_back(buffer_lengths, length);
+		obs_data_release(length);
+	}
+
+	obs_data_set_array(config, WARP_FLOW_BUFFER_LENGTHS, buffer_lengths);
+	obs_data_array_release(buffer_lengths);
 
 	if (isInstant) {
 		obs_data_set_string(config, WARP_FLOW_PLAYBACK,

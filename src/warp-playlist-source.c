@@ -155,6 +155,12 @@ struct warp_pl_hotkey_binding {
 	int value;
 };
 
+/* The two angle hotkeys that name a direction rather than a camera, kept
+ * outside the range a numbered slot can take so that one callback tells them
+ * apart by the value it is handed. */
+#define WARP_PL_ANGLE_NEXT (-1)
+#define WARP_PL_ANGLE_PREVIOUS (-2)
+
 /* The settings one direction's transition is configured through. The forward
  * ones are the keys the playlist has always used, so a playlist saved before
  * going back could have a transition of its own loads unchanged. 'timing' is
@@ -407,6 +413,8 @@ struct warp_playlist_source {
 
 	struct warp_pl_hotkey_binding speed_bindings[WARP_NUM_SPEED_PRESETS];
 	struct warp_pl_hotkey_binding step_bindings[WARP_NUM_STEP_HOTKEYS];
+	/* next and previous, then one per numbered slot */
+	struct warp_pl_hotkey_binding angle_bindings[WARP_ANGLE_HOTKEY_SLOTS + 2];
 };
 
 static const char *warp_playlist_getname(void *unused)
@@ -3116,6 +3124,143 @@ static void warp_playlist_speed_preset_hotkey(void *data, obs_hotkey_id id, obs_
 	warp_pl_change_speed(s, b->value, true, WARP_SPEED_CHANGE_SET);
 }
 
+/* ------------------------------------------------------------------------- */
+/* angles
+ *
+ * The files a playlist plays are Warp Media sources of its own making, so
+ * switching angle is handed to whichever file is playing: it is the one that
+ * knows which set its clip belongs to and where in another camera's clip the
+ * moment being watched falls.
+ *
+ * The playlist's own file list is left alone, the same way the speed and the
+ * framing of a file are. Reaching the next file puts the angle back to the one
+ * the list names, because that is the clip the list holds - the angle belonged
+ * to the video, not to the playlist. */
+
+/* the file that is playing, held while it is used; the caller releases it */
+static obs_source_t *warp_pl_current_ref(struct warp_playlist_source *s)
+{
+	obs_source_t *current = NULL;
+
+	pthread_mutex_lock(&s->mutex);
+
+	if (s->current)
+		current = obs_source_get_ref(s->current);
+
+	pthread_mutex_unlock(&s->mutex);
+
+	return current;
+}
+
+/* Hands an angle switch to the file that is playing, and says it again on the
+ * playlist itself so that a Warp Detection filter watching the playlist hears
+ * about it as well as one watching the file. */
+static bool warp_pl_angle_switch(struct warp_playlist_source *s, const char *proc, long long index)
+{
+	obs_source_t *current = warp_pl_current_ref(s);
+	calldata_t cd;
+	bool changed = false;
+
+	if (!current)
+		return false;
+
+	calldata_init(&cd);
+
+	if (index >= 0)
+		calldata_set_int(&cd, "index", index);
+
+	if (proc_handler_call(obs_source_get_proc_handler(current), proc, &cd))
+		calldata_get_bool(&cd, "changed", &changed);
+
+	calldata_free(&cd);
+
+	if (changed) {
+		calldata_t status;
+
+		calldata_init(&status);
+
+		if (proc_handler_call(obs_source_get_proc_handler(current), WARP_ANGLE_STATUS_PROC, &status)) {
+			long long at = 0;
+			long long count = 0;
+			const char *name = NULL;
+			const char *path = NULL;
+
+			calldata_get_int(&status, "index", &at);
+			calldata_get_int(&status, "count", &count);
+			calldata_get_string(&status, "angle", &name);
+			calldata_get_string(&status, "path", &path);
+
+			warp_signal_angle_changed(s->source, (size_t)(at < 0 ? 0 : at), (size_t)count, name, path);
+		}
+
+		calldata_free(&status);
+	}
+
+	obs_source_release(current);
+
+	return changed;
+}
+
+static void warp_pl_angle_next_proc(void *data, calldata_t *cd)
+{
+	calldata_set_bool(cd, "changed", warp_pl_angle_switch(data, WARP_ANGLE_NEXT_PROC, -1));
+}
+
+static void warp_pl_angle_previous_proc(void *data, calldata_t *cd)
+{
+	calldata_set_bool(cd, "changed", warp_pl_angle_switch(data, WARP_ANGLE_PREVIOUS_PROC, -1));
+}
+
+static void warp_pl_angle_select_proc(void *data, calldata_t *cd)
+{
+	long long index = 0;
+
+	if (!calldata_get_int(cd, "index", &index) || index < 0) {
+		calldata_set_bool(cd, "changed", false);
+		return;
+	}
+
+	calldata_set_bool(cd, "changed", warp_pl_angle_switch(data, WARP_ANGLE_SELECT_PROC, index));
+}
+
+static void warp_pl_angle_status_proc(void *data, calldata_t *cd)
+{
+	struct warp_playlist_source *s = data;
+	obs_source_t *current = warp_pl_current_ref(s);
+
+	if (!current) {
+		calldata_set_int(cd, "index", -1);
+		calldata_set_int(cd, "count", 0);
+		calldata_set_string(cd, "angle", "");
+		calldata_set_string(cd, "path", "");
+		calldata_set_string(cd, "angles", "");
+		return;
+	}
+
+	proc_handler_call(obs_source_get_proc_handler(current), WARP_ANGLE_STATUS_PROC, cd);
+	obs_source_release(current);
+}
+
+static void warp_pl_angle_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
+{
+	struct warp_pl_hotkey_binding *b = data;
+
+	UNUSED_PARAMETER(id);
+	UNUSED_PARAMETER(hotkey);
+
+	if (!pressed || !obs_source_showing(b->s->source))
+		return;
+
+	/* the numbered slots name an angle; next and previous are the two
+	 * values outside the set, so one callback covers all ten */
+	if (b->value == WARP_PL_ANGLE_NEXT)
+		warp_pl_angle_switch(b->s, WARP_ANGLE_NEXT_PROC, -1);
+	else if (b->value == WARP_PL_ANGLE_PREVIOUS)
+		warp_pl_angle_switch(b->s, WARP_ANGLE_PREVIOUS_PROC, -1);
+	else
+		warp_pl_angle_switch(b->s, WARP_ANGLE_SELECT_PROC, b->value);
+}
+
 /* Steps the file that is playing by 'frames', negative to step backward. The
  * signal is emitted with the mutex released, for the reason above. */
 static void warp_pl_step_frames(struct warp_playlist_source *s, int frames)
@@ -3217,6 +3362,31 @@ static void warp_playlist_register_hotkeys(struct warp_playlist_source *s, obs_s
 		snprintf(text_key, sizeof(text_key), "Warp.Hotkey.Step.Backward%d", step_counts[i]);
 		obs_hotkey_register_source(source, name, obs_module_text(text_key), warp_playlist_step_hotkey, back);
 	}
+
+	s->angle_bindings[0].s = s;
+	s->angle_bindings[0].value = WARP_PL_ANGLE_NEXT;
+	obs_hotkey_register_source(source, "WarpPlaylist.AngleNext", obs_module_text("Warp.Hotkey.Angle.Next"),
+				   warp_pl_angle_hotkey, &s->angle_bindings[0]);
+
+	s->angle_bindings[1].s = s;
+	s->angle_bindings[1].value = WARP_PL_ANGLE_PREVIOUS;
+	obs_hotkey_register_source(source, "WarpPlaylist.AnglePrevious", obs_module_text("Warp.Hotkey.Angle.Previous"),
+				   warp_pl_angle_hotkey, &s->angle_bindings[1]);
+
+	for (size_t i = 0; i < WARP_ANGLE_HOTKEY_SLOTS; i++) {
+		struct warp_pl_hotkey_binding *slot = &s->angle_bindings[i + 2];
+		char name[64];
+		struct dstr desc = {0};
+
+		slot->s = s;
+		slot->value = (int)i;
+
+		snprintf(name, sizeof(name), "WarpPlaylist.Angle%d", (int)i + 1);
+		dstr_printf(&desc, obs_module_text("Warp.Hotkey.Angle.Slot"), (int)i + 1);
+
+		obs_hotkey_register_source(source, name, desc.array, warp_pl_angle_hotkey, slot);
+		dstr_free(&desc);
+	}
 }
 
 /* ------------------------------------------------------------------------- */
@@ -3316,6 +3486,14 @@ static void warp_playlist_register_procs(struct warp_playlist_source *s, obs_sou
 	proc_handler_add(ph, "void warp_playlist_first()", warp_pl_first_proc, s);
 	proc_handler_add(ph, "void warp_playlist_restart_current()", warp_pl_restart_current_proc, s);
 	proc_handler_add(ph, "void warp_playlist_clear()", warp_pl_clear_proc, s);
+	proc_handler_add(ph, "void " WARP_ANGLE_NEXT_PROC "(out bool changed)", warp_pl_angle_next_proc, s);
+	proc_handler_add(ph, "void " WARP_ANGLE_PREVIOUS_PROC "(out bool changed)", warp_pl_angle_previous_proc, s);
+	proc_handler_add(ph, "void " WARP_ANGLE_SELECT_PROC "(int index, out bool changed)", warp_pl_angle_select_proc,
+			 s);
+	proc_handler_add(ph,
+			 "void " WARP_ANGLE_STATUS_PROC
+			 "(out int index, out int count, out string angle, out string path, out string angles)",
+			 warp_pl_angle_status_proc, s);
 	proc_handler_add(ph, "void warp_playlist_status(out int index, out int count, out string current_file)",
 			 warp_pl_status_proc, s);
 }
@@ -3324,9 +3502,13 @@ static void warp_playlist_register_procs(struct warp_playlist_source *s, obs_sou
 
 static void *warp_playlist_create(obs_data_t *settings, obs_source_t *source)
 {
-	static const char *signals[] = {WARP_SIGNAL_DECL_SPEED_CHANGED, WARP_SIGNAL_DECL_FRAMES_STEPPED,
-					WARP_SIGNAL_DECL_MEDIA_ACTION,  WARP_SIGNAL_DECL_ZOOM_CHANGED,
-					WARP_SIGNAL_DECL_ZOOM_STAGED,   NULL};
+	static const char *signals[] = {WARP_SIGNAL_DECL_SPEED_CHANGED,
+					WARP_SIGNAL_DECL_FRAMES_STEPPED,
+					WARP_SIGNAL_DECL_MEDIA_ACTION,
+					WARP_SIGNAL_DECL_ZOOM_CHANGED,
+					WARP_SIGNAL_DECL_ZOOM_STAGED,
+					WARP_SIGNAL_DECL_ANGLE_CHANGED,
+					NULL};
 
 	struct warp_playlist_source *s = bzalloc(sizeof(struct warp_playlist_source));
 

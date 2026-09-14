@@ -30,6 +30,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <media-playback/media-playback.h>
 #include <plugin-support.h>
 
+#include "warp-angles.h"
+#include "warp-buffer.h"
 #include "warp-events.h"
 #include "warp-flow.h"
 
@@ -45,6 +47,10 @@ _Static_assert(WARP_FLOW_SPEED_MIN == MP_SPEED_MIN && WARP_FLOW_SPEED_MAX == MP_
  * goes under one key of its own. */
 #define WARP_FLOW_MODULE_KEY "warp"
 #define WARP_FLOW_ARRAY_KEY "flows"
+/* the buffers and the angle register live in the same corner of the
+ * collection, since they are saved and loaded on the same callback */
+#define WARP_FLOW_BUFFERS_KEY "buffers"
+#define WARP_FLOW_ANGLES_KEY "angle_sets"
 
 /* How long a replay buffer save stays attributed to the flow that asked for
  * it. Writing the buffer out takes as long as the buffer is long, so this is
@@ -108,6 +114,8 @@ static char *warp_flow_claim_id = NULL;
 static uint64_t warp_flow_claim_ns = 0;
 
 static uint64_t warp_flow_id_seq = 0;
+
+static char *warp_flow_buffer_of(struct warp_flow *flow, int *seconds);
 
 /* how the UI is told a hotkey press found no replay buffer to save; set once,
  * while the module loads, and only ever called from the UI thread */
@@ -192,6 +200,7 @@ static void warp_flow_hotkey_task(void *param)
 	struct warp_flow_hotkey_press *press = param;
 	char *id = NULL;
 	char *name = NULL;
+	char *buffer_id = NULL;
 
 	pthread_mutex_lock(&warp_flow_mutex);
 	struct warp_flow *flow = warp_flow_find_by_hotkey(press->hotkey, press->promote);
@@ -199,22 +208,28 @@ static void warp_flow_hotkey_task(void *param)
 	if (flow) {
 		id = bstrdup(obs_data_get_string(flow->config, WARP_FLOW_ID));
 		name = bstrdup(obs_data_get_string(flow->config, WARP_FLOW_NAME));
+		buffer_id = warp_flow_buffer_of(flow, NULL);
 	}
 	pthread_mutex_unlock(&warp_flow_mutex);
 
 	if (id) {
 		if (press->promote) {
 			warp_flow_promote_last(id);
-		} else if (!warp_flow_save_replay(id) && !obs_frontend_replay_buffer_active()) {
-			/* the press did nothing because there was no buffer to
-			 * save: the user asked for a clip, so they are told */
-			if (warp_flow_buffer_prompt)
-				warp_flow_buffer_prompt(name);
+		} else if (!warp_flow_save_replay(id)) {
+			/* The press did nothing because whatever the flow takes
+			 * its clips from is not holding any: the user asked for
+			 * a clip, so they are told, and told which buffer it
+			 * was so it can be started there and then. */
+			bool holding = buffer_id ? warp_buffer_running(buffer_id) : obs_frontend_replay_buffer_active();
+
+			if (!holding && warp_flow_buffer_prompt)
+				warp_flow_buffer_prompt(name, buffer_id);
 		}
 
 		bfree(id);
 	}
 
+	bfree(buffer_id);
 	bfree(name);
 	bfree(press);
 }
@@ -363,6 +378,7 @@ static void warp_flow_set_defaults(obs_data_t *config)
 {
 	obs_data_set_default_string(config, WARP_FLOW_KIND, WARP_FLOW_KIND_REPLAY);
 	obs_data_set_default_string(config, WARP_FLOW_TRIGGER, WARP_FLOW_TRIGGER_HOTKEY);
+	obs_data_set_default_string(config, WARP_FLOW_CLIP_SOURCE, WARP_FLOW_CLIP_SOURCE_OBS);
 	obs_data_set_default_string(config, WARP_FLOW_ORDER, WARP_FLOW_ORDER_OLDEST_FIRST);
 	obs_data_set_default_int(config, WARP_FLOW_MAX_CLIPS, 0);
 	obs_data_set_default_bool(config, WARP_FLOW_ENABLED, true);
@@ -863,9 +879,52 @@ static void warp_flow_plan_add(struct warp_flow_plan *plan, struct warp_flow *fl
 	obs_data_array_release(links);
 }
 
+/* Whether a flow takes clips from where this one came from. 'buffer_id' names
+ * the Warp buffer that wrote it, or is NULL for a save out of OBS's own replay
+ * buffer; 'seconds' is the length that was asked for, and means nothing to an
+ * OBS save, which is only ever one length long.
+ *
+ * This is about where a clip came from rather than whether the flow was
+ * listening: a flow that asked for the save takes it whatever it is set to,
+ * because it asked. Expects the lock to be held. */
+static bool warp_flow_takes_from(struct warp_flow *flow, const char *buffer_id, int seconds)
+{
+	const char *source = obs_data_get_string(flow->config, WARP_FLOW_CLIP_SOURCE);
+	bool from_buffer = warp_flow_str_eq(source, WARP_FLOW_CLIP_SOURCE_BUFFER);
+
+	/* a flow that says nothing takes OBS's replay buffer, which is what
+	 * every flow took before there was anything else to take */
+	if (!from_buffer)
+		return buffer_id == NULL;
+
+	if (!buffer_id)
+		return false;
+
+	if (!warp_flow_str_eq(obs_data_get_string(flow->config, WARP_FLOW_BUFFER_ID), buffer_id))
+		return false;
+
+	obs_data_array_t *lengths = obs_data_get_array(flow->config, WARP_FLOW_BUFFER_LENGTHS);
+	size_t count = lengths ? obs_data_array_count(lengths) : 0;
+
+	/* no lengths listed is every length the buffer offers */
+	bool takes = count == 0;
+
+	for (size_t i = 0; i < count && !takes; i++) {
+		obs_data_t *item = obs_data_array_item(lengths, i);
+
+		takes = (int)obs_data_get_int(item, WARP_FLOW_BUFFER_LENGTH_SECONDS) == seconds;
+		obs_data_release(item);
+	}
+
+	obs_data_array_release(lengths);
+
+	return takes;
+}
+
 /* Hands 'path' to the flow that asked for the save, or to every listening flow
- * when nobody did, along with everything those flows are linked to. */
-static void warp_flow_deliver(const char *path, const char *claimed_by)
+ * that takes clips from where this one came from, along with everything those
+ * flows are linked to. */
+static void warp_flow_deliver(const char *path, const char *claimed_by, const char *buffer_id, int seconds)
 {
 	struct warp_flow_plan plan;
 
@@ -884,7 +943,8 @@ static void warp_flow_deliver(const char *path, const char *claimed_by)
 			struct warp_flow *flow = warp_flows.array[i];
 
 			if (warp_flow_str_eq(obs_data_get_string(flow->config, WARP_FLOW_TRIGGER),
-					     WARP_FLOW_TRIGGER_LISTEN))
+					     WARP_FLOW_TRIGGER_LISTEN) &&
+			    warp_flow_takes_from(flow, buffer_id, seconds))
 				warp_flow_plan_add(&plan, flow, 0);
 		}
 	}
@@ -955,10 +1015,32 @@ static void warp_flow_replay_saved(void)
 
 	pthread_mutex_unlock(&warp_flow_mutex);
 
-	warp_flow_deliver(path, claimed_by);
+	warp_flow_deliver(path, claimed_by, NULL, 0);
 
 	bfree(claimed_by);
 	bfree(path);
+}
+
+/* A Warp buffer has finished writing a save. 'path' is the primary angle - the
+ * clip a flow takes - and the rest of the set is already in the angle
+ * register, so a source playing this clip can reach the other cameras. Called
+ * on the UI thread by warp-buffer.c. */
+static void warp_flow_buffer_clip(const char *buffer_id, const char *buffer_name, int seconds, const char *path,
+				  const char *claim_flow_id, void *param)
+{
+	UNUSED_PARAMETER(buffer_name);
+	UNUSED_PARAMETER(param);
+
+	pthread_mutex_lock(&warp_flow_mutex);
+
+	/* Add Last Saved Clip reaches for whatever was written last, whichever
+	 * buffer wrote it */
+	bfree(warp_flow_last_path);
+	warp_flow_last_path = bstrdup(path);
+
+	pthread_mutex_unlock(&warp_flow_mutex);
+
+	warp_flow_deliver(path, claim_flow_id, buffer_id, seconds);
 }
 
 void warp_flow_set_buffer_prompt(warp_flow_buffer_prompt_t prompt)
@@ -982,6 +1064,41 @@ char *warp_flow_last_clip(void)
 	return path;
 }
 
+/* The Warp buffer a flow takes its clips from, and the length its own Save
+ * Replay hotkey asks that buffer for, which is the first length it is set to
+ * take. Answers NULL for a flow that takes OBS's own replay buffer; the caller
+ * frees what it gets. Expects the lock to be held. */
+static char *warp_flow_buffer_of(struct warp_flow *flow, int *seconds)
+{
+	if (!warp_flow_str_eq(obs_data_get_string(flow->config, WARP_FLOW_CLIP_SOURCE), WARP_FLOW_CLIP_SOURCE_BUFFER))
+		return NULL;
+
+	const char *buffer_id = obs_data_get_string(flow->config, WARP_FLOW_BUFFER_ID);
+
+	if (!buffer_id || !*buffer_id)
+		return NULL;
+
+	if (seconds) {
+		obs_data_array_t *lengths = obs_data_get_array(flow->config, WARP_FLOW_BUFFER_LENGTHS);
+
+		/* nothing listed means the flow takes every length, so its own
+		 * hotkey asks for the first one the buffer offers, which
+		 * warp_buffer_save() reads as a length of zero */
+		*seconds = 0;
+
+		if (lengths && obs_data_array_count(lengths)) {
+			obs_data_t *item = obs_data_array_item(lengths, 0);
+
+			*seconds = (int)obs_data_get_int(item, WARP_FLOW_BUFFER_LENGTH_SECONDS);
+			obs_data_release(item);
+		}
+
+		obs_data_array_release(lengths);
+	}
+
+	return bstrdup(buffer_id);
+}
+
 bool warp_flow_save_replay(const char *id)
 {
 	pthread_mutex_lock(&warp_flow_mutex);
@@ -993,8 +1110,25 @@ bool warp_flow_save_replay(const char *id)
 	}
 
 	char *name = bstrdup(obs_data_get_string(flow->config, WARP_FLOW_NAME));
+	int seconds = 0;
+	char *buffer_id = warp_flow_buffer_of(flow, &seconds);
 
 	pthread_mutex_unlock(&warp_flow_mutex);
+
+	/* A flow pointed at a Warp buffer saves that buffer rather than OBS's,
+	 * and the buffer hands the clip back with the flow's own id on it, so
+	 * there is nothing to claim: the save is already spoken for. */
+	if (buffer_id) {
+		bool saved = warp_buffer_save(buffer_id, seconds, id);
+
+		if (!saved)
+			WARP_FLOW_LOG(LOG_WARNING, "flow '%s': its buffer is not holding anything to save", name);
+
+		bfree(buffer_id);
+		bfree(name);
+
+		return saved;
+	}
 
 	/* Nothing to save, and nothing to claim: a claim left standing for a
 	 * save that never happens would take the next one somebody else made. */
@@ -1130,9 +1264,19 @@ static void warp_flow_save_to(obs_data_t *save_data)
 
 	pthread_mutex_unlock(&warp_flow_mutex);
 
+	/* The buffers the flows take their clips from, and the angle register
+	 * that ties one save's clips together, go in the same corner of the
+	 * collection: they are one setup, and they are saved on one callback. */
+	obs_data_array_t *buffers = warp_buffer_save_all();
+	obs_data_array_t *angles = warp_angles_save();
+
 	obs_data_set_array(warp, WARP_FLOW_ARRAY_KEY, array);
+	obs_data_set_array(warp, WARP_FLOW_BUFFERS_KEY, buffers);
+	obs_data_set_array(warp, WARP_FLOW_ANGLES_KEY, angles);
 	obs_data_set_obj(save_data, WARP_FLOW_MODULE_KEY, warp);
 
+	obs_data_array_release(angles);
+	obs_data_array_release(buffers);
 	obs_data_array_release(array);
 	obs_data_release(warp);
 }
@@ -1156,6 +1300,14 @@ static void warp_flow_load_from(obs_data_t *save_data)
 
 	pthread_mutex_unlock(&warp_flow_mutex);
 
+	obs_data_array_t *buffers = warp ? obs_data_get_array(warp, WARP_FLOW_BUFFERS_KEY) : NULL;
+	obs_data_array_t *angles = warp ? obs_data_get_array(warp, WARP_FLOW_ANGLES_KEY) : NULL;
+
+	warp_buffer_load_all(buffers);
+	warp_angles_load(angles);
+
+	obs_data_array_release(angles);
+	obs_data_array_release(buffers);
 	obs_data_array_release(array);
 	obs_data_release(warp);
 
@@ -1209,6 +1361,10 @@ void warp_flow_init(void)
 
 	warp_flow_ready = true;
 
+	/* the buffers hand their clips here, the same way the frontend hands
+	 * over OBS's own replay buffer saves */
+	warp_buffer_set_clip_handler(warp_flow_buffer_clip, NULL);
+
 	obs_frontend_add_event_callback(warp_flow_frontend_event, NULL);
 	obs_frontend_add_save_callback(warp_flow_save_cb, NULL);
 }
@@ -1220,6 +1376,8 @@ void warp_flow_shutdown(void)
 
 	warp_flow_ready = false;
 	warp_flow_buffer_prompt = NULL;
+
+	warp_buffer_set_clip_handler(NULL, NULL);
 
 	obs_frontend_remove_event_callback(warp_flow_frontend_event, NULL);
 	obs_frontend_remove_save_callback(warp_flow_save_cb, NULL);

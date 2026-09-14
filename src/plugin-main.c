@@ -19,9 +19,11 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <obs-module.h>
 #include <plugin-support.h>
 
+#include "warp-angles.h"
 #include "warp-websocket.h"
 
 #ifdef WARP_HAVE_FRONTEND_API
+#include "warp-buffer.h"
 #include "warp-flow.h"
 #endif
 
@@ -45,6 +47,11 @@ bool obs_module_load(void)
 	obs_register_source(&warp_detection_filter_info);
 	obs_register_source(&warp_zoom_filter_info);
 
+	/* The angle register is read by the sources, which are here whether or
+	 * not there is a frontend, so it is set up alongside them rather than
+	 * with the buffers that write to it. */
+	warp_angles_init();
+
 #ifdef WARP_HAVE_FRONTEND
 	warp_register_tools_menu();
 	warp_register_zoom_dock();
@@ -61,7 +68,10 @@ void obs_module_post_load(void)
 #ifdef WARP_HAVE_FRONTEND_API
 	/* The flows listen to the frontend, which is ready by the time every
 	 * module has loaded, and are read out of the scene collection, which
-	 * the frontend only loads once that has happened. */
+	 * the frontend only loads once that has happened. The buffers go up
+	 * first, so that the flows have something to point at and something to
+	 * hand their clips to them. */
+	warp_buffer_init();
 	warp_flow_init();
 #endif
 
@@ -72,7 +82,10 @@ void obs_module_unload(void)
 {
 #ifdef WARP_HAVE_FRONTEND_API
 	warp_flow_shutdown();
+	warp_buffer_shutdown();
 #endif
+
+	warp_angles_shutdown();
 
 	obs_log(LOG_INFO, "plugin unloaded");
 }
