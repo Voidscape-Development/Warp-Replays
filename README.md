@@ -248,7 +248,14 @@ Three more work on a [Warp flow](#warp-flows) rather than on a source, and name 
 | `AddLastReplayToFlow` | Puts the replay that was saved last in that flow, as its Add Last Saved Clip hotkey does |
 | `GetFlows` | Changes nothing, and answers with every flow in the scene collection |
 
-They answer with the flow they applied to, and how much is in the playlist it feeds:
+`SaveToFlow` and `AddLastReplayToFlow` also take `seconds`, which asks for a clip of that length rather than the one the flow keeps — `0` for the whole of what the replay buffer wrote, up to 3600, and anything a [clip length](#clip-lengths) can be. A length asked for this way is the length of that clip, so the flows it is handed on to are fed the same cut. Left out, each flow keeps what it is set to.
+
+```json
+{"vendorName": "warp", "requestType": "SaveToFlow",
+ "requestData": {"flowName": "Match Replays", "seconds": 10}}
+```
+
+They answer with the flow they applied to, how much is in the playlist it feeds, and the lengths it keeps:
 
 ```json
 {
@@ -257,11 +264,14 @@ They answer with the flow they applied to, and how much is in the playlist it fe
   "flowName": "Match Replays",
   "flowKind": "replay",
   "targetName": "Replay Feed",
-  "clipCount": 4
+  "clipCount": 4,
+  "clipLength": 10,
+  "clipLengths": [{"seconds": 5}, {"seconds": 20}],
+  "seconds": 10
 }
 ```
 
-`GetFlows` answers with `flows`, an array of those same objects, and takes no fields.
+`clipLength` is the flow's own length in seconds, with `0` for the whole buffer, and `clipLengths` the ones it offers on top of it. `seconds` is only there when the request asked for a length of its own. `GetFlows` answers with `flows`, an array of those same objects without that field, and takes no fields.
 
 The playlist actions that have no counterpart in OBS's media control API are proc handlers on the source, so scripts can call them too, and so can anything else that can reach the source:
 
@@ -311,21 +321,37 @@ Every flow is:
   A flow's Save Replay hotkey works either way. What the setting decides is whether saves the flow did not ask for land in it too.
 * **Order**: *oldest first*, added to the end, so the list plays in the order the clips were saved; or *newest first*, added to the top, so the clip that was just saved is the next one up. Not offered for an instant replay, which holds one clip rather than a list.
 * **Limit**: drop the oldest clip once the list is longer than a number you set. The oldest is the one that would be played last, whichever way round the list is built. Off by default, and not offered for highlight lists or instant replays: what is in one was put there on purpose, and the other holds a single clip.
+* **Clip length**: how much of the replay buffer this flow keeps — all of it, which is what it does by default, or the last so many seconds of it. See [clip lengths](#clip-lengths) below.
+* **Other lengths**: lengths in seconds, separated by commas, that this flow offers on top of the one above. Each gets a **Save Replay** hotkey of its own, so a length can be picked in the moment rather than set in advance.
 * **Also feeds**: the flows this one hands every clip it takes on to, so a highlight reel builds itself alongside a replay feed. Links are followed through further links, and a flow already being fed is not fed twice.
 * **Take clips**: a flow that is switched off takes nothing itself, but still passes clips on to the flows it is linked to.
 
-Each flow registers two hotkeys of its own, named after it in Settings → Hotkeys:
+Each flow registers two hotkeys of its own, named after it in Settings → Hotkeys, and one more for each of the other lengths it offers:
 
-* **Warp: Save Replay to *flow*** — saves the replay buffer and keeps the clip for that flow. Pressed while the replay buffer is not running, it says so and offers to start it there and then.
+* **Warp: Save Replay to *flow*** — saves the replay buffer and keeps the clip for that flow, at the length that flow keeps. Pressed while the replay buffer is not running, it says so and offers to start it there and then.
 * **Warp: Add Last Saved Clip to *flow*** — puts the replay that was saved last in that flow without saving a new one, for a clip worth keeping that nobody knew about in advance.
+* **Warp: Save *10s* Replay to *flow*** — one for each of the flow's other lengths, saving the buffer and keeping that much of it.
 
-The keys they are bound to are saved with the flow, so a flow loads with its hotkey the way it was left.
+The keys they are bound to are saved with the flow, so a flow loads with its hotkeys the way it was left. A length that is still offered after the flow has been edited keeps the key it was bound to.
 
 A clip landing in a playlist disturbs nothing about playback: the file list is edited the way the playlist's own Clear Playlist edits it, so whatever is on screen plays out untouched and the new clip is reached in its turn. A clip that is already in the list is not added a second time, and a flow whose playlist source has gone says so in the OBS log rather than losing the clip quietly.
 
 Flows are saved with the scene collection, alongside the sources they feed, so an event day's collection carries its own feed setup and switching collections switches flows.
 
 Every flow action can also be driven from outside OBS — see [obs-websocket control](#obs-websocket-control).
+
+#### Clip lengths
+
+The OBS replay buffer writes everything it is holding, so a save is as long as the buffer is — usually long enough for the worst case, which is longer than most moments are worth. A flow set to keep less than that has its clip **cut from the file the buffer wrote**: the picture and sound are copied across as they were encoded, into a file of its own beside the original, named after it with the length on the end — `Replay 2026-09-14 10-11-12-10s.mkv`. Nothing is encoded again, so a cut takes a moment and costs no quality, and **the file OBS wrote is left exactly where it is**. It is the cut that flows are fed.
+
+The cut lands on the nearest keyframe before the mark, so a clip can run a little longer than it was asked for — by up to the recording's keyframe interval, two seconds at OBS's default. A shorter keyframe interval in Settings → Output tightens it up. A length longer than the buffer is holding is not an error either: there is nothing to cut off, and the whole clip is kept.
+
+Two ways to ask for one:
+
+* **The flow's own length**, in its properties. Every save that flow takes is cut to it, including the ones it takes by listening. Flows are cut one at a time, so a replay list keeping 10 seconds and a highlight list keeping 30 are both fed from the same save, each getting its own.
+* **A length hotkey**, from the flow's *Other lengths*. A length asked for out loud is the length of that clip, so the flows it is handed on to are fed the same cut rather than each taking their own — press *Save 5s Replay to Match Replays* and the highlight list linked to it gets the same five seconds.
+
+Cutting is done off the UI thread, one clip at a time, so saving never holds OBS up and clips land in the order they were saved. A cut that cannot be made for any reason is not a clip lost: the flow is fed the whole one instead, and the log says why.
 
 #### Instant replays
 

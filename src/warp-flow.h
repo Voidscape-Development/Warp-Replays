@@ -50,6 +50,39 @@ extern "C" {
 #define WARP_FLOW_PLAYBACK "playback"
 #define WARP_FLOW_SPEED "speed"
 
+/* How much of the replay buffer a clip is: the last so many seconds of what
+ * the buffer wrote, or the whole of it.
+ *
+ * The buffer always writes everything it is holding, so a shorter clip is cut
+ * from the file it wrote - the picture and sound moved across as they were
+ * encoded, into a file of its own beside the original, which is left alone. The
+ * cut lands on the keyframe at or before the mark, so a clip can run a little
+ * longer than it was asked for.
+ *
+ * WARP_FLOW_LENGTH is the flow's own: what a save with nothing else said about
+ * it gives that flow. WARP_FLOW_LENGTHS is the lengths it offers on top of
+ * that, each with a hotkey of its own, for picking a length in the moment. */
+#define WARP_FLOW_LENGTH "length"
+#define WARP_FLOW_LENGTHS "lengths"
+/* items of the WARP_FLOW_LENGTHS array carry the length they stand for */
+#define WARP_FLOW_LENGTH_SECONDS "seconds"
+
+/* The whole of what the buffer wrote, which is what a flow does by default: a
+ * length of zero is nothing to cut rather than a clip of no length. */
+#define WARP_FLOW_LENGTH_WHOLE 0
+/* asks for the flow's own length, wherever a length can be named */
+#define WARP_FLOW_LENGTH_DEFAULT (-1)
+/* Longer than this is not a replay. A length past what the buffer is holding
+ * is not an error either way: there is simply nothing to cut, and the flow is
+ * fed the whole clip. */
+#define WARP_FLOW_LENGTH_MAX 3600
+/* how many lengths one flow can offer on top of its own, which is how many
+ * hotkeys it puts in Settings -> Hotkeys */
+#define WARP_FLOW_LENGTHS_MAX 8
+
+/* room for what warp_flow_length_label() writes */
+#define WARP_FLOW_LENGTH_LABEL_SIZE 16
+
 /* The range the speed above takes, which is the range a Warp source plays at;
  * warp-flow.c checks the two against each other. Zero, underneath the range,
  * is the flow leaving the source's own speed alone. */
@@ -119,12 +152,28 @@ char *warp_flow_add(obs_data_t *config);
 bool warp_flow_update(const char *id, obs_data_t *config);
 bool warp_flow_remove(const char *id);
 
-/* Saves the replay buffer and keeps the clip for this flow. Answers false when
- * the flow is gone or the replay buffer is not running. */
+/* Saves the replay buffer and keeps the clip for this flow, at the flow's own
+ * length. Answers false when the flow is gone or the replay buffer is not
+ * running. */
 bool warp_flow_save_replay(const char *id);
 /* puts the clip the replay buffer saved last in this flow, without saving a
  * new one */
 bool warp_flow_promote_last(const char *id);
+
+/* The two above at a length of their own: WARP_FLOW_LENGTH_WHOLE for the whole
+ * of what the buffer wrote, WARP_FLOW_LENGTH_DEFAULT for the flow's own length,
+ * anything else for that many seconds.
+ *
+ * A length said out loud is the length of that clip, so the flows this one
+ * hands it on to are fed the same cut rather than each taking their own; a save
+ * that says nothing leaves every flow to its own length. */
+bool warp_flow_save_replay_length(const char *id, int seconds);
+bool warp_flow_promote_last_length(const char *id, int seconds);
+
+/* How a length is said - "10s", "1m30s" - written into a buffer of at least
+ * WARP_FLOW_LENGTH_LABEL_SIZE bytes. A length of zero is the whole buffer,
+ * which has no number to it, and is written as an empty string. */
+void warp_flow_length_label(int seconds, char *buffer, size_t size);
 
 /* Told when a flow's Save Replay hotkey is pressed and there is no replay
  * buffer running for it to save. The UI sets this so the press says so rather

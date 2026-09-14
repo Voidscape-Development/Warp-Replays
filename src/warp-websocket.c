@@ -635,7 +635,13 @@ static bool warp_ws_run(const struct warp_ws_request *req, obs_source_t *source,
  * what its hotkeys do:
  *
  *   {"vendorName": "warp", "requestType": "SaveToFlow",
- *    "requestData": {"flowName": "Match Replays"}} */
+ *    "requestData": {"flowName": "Match Replays"}}
+ *
+ * "seconds" asks for a clip of that length rather than the one the flow keeps
+ * by default, with zero for the whole of what the replay buffer wrote:
+ *
+ *   {"vendorName": "warp", "requestType": "SaveToFlow",
+ *    "requestData": {"flowName": "Match Replays", "seconds": 10}} */
 
 enum warp_ws_flow_action {
 	WARP_WS_FLOW_SAVE,
@@ -688,6 +694,51 @@ static void warp_ws_add_flow_status(obs_data_t *flow, obs_data_t *response)
 	obs_data_set_string(response, "flowKind", obs_data_get_string(flow, WARP_FLOW_KIND));
 	obs_data_set_string(response, "targetName", obs_data_get_string(flow, WARP_FLOW_TARGET_NAME));
 	obs_data_set_int(response, "clipCount", warp_flow_clip_count(id));
+	/* how much of the replay buffer the flow keeps, with zero for all of it,
+	 * and the lengths it offers on top of that */
+	obs_data_set_int(response, "clipLength", obs_data_get_int(flow, WARP_FLOW_LENGTH));
+
+	obs_data_array_t *lengths = obs_data_get_array(flow, WARP_FLOW_LENGTHS);
+	obs_data_array_t *listed = obs_data_array_create();
+	size_t count = lengths ? obs_data_array_count(lengths) : 0;
+
+	for (size_t i = 0; i < count; i++) {
+		obs_data_t *item = obs_data_array_item(lengths, i);
+		obs_data_t *entry = obs_data_create();
+
+		obs_data_set_int(entry, "seconds", obs_data_get_int(item, WARP_FLOW_LENGTH_SECONDS));
+		obs_data_array_push_back(listed, entry);
+
+		obs_data_release(entry);
+		obs_data_release(item);
+	}
+
+	obs_data_set_array(response, "clipLengths", listed);
+
+	obs_data_array_release(listed);
+	obs_data_array_release(lengths);
+}
+
+/* How long a clip the request asked for: the number of seconds it named, zero
+ * for the whole of what the buffer wrote, or the flow's own length when it did
+ * not ask. Answers false with the response saying what was wrong. */
+static bool warp_ws_get_flow_length(obs_data_t *request, obs_data_t *response, int *seconds)
+{
+	*seconds = WARP_FLOW_LENGTH_DEFAULT;
+
+	if (!obs_data_has_user_value(request, "seconds"))
+		return true;
+
+	const long long asked = obs_data_get_int(request, "seconds");
+
+	if (asked < 0 || asked > WARP_FLOW_LENGTH_MAX) {
+		warp_ws_fail(response, "seconds must be between 0 and %d", WARP_FLOW_LENGTH_MAX);
+		return false;
+	}
+
+	*seconds = (int)asked;
+
+	return true;
 }
 
 static void warp_ws_flow_cb(obs_data_t *request, obs_data_t *response, void *priv_data)
@@ -724,15 +775,21 @@ static void warp_ws_flow_cb(obs_data_t *request, obs_data_t *response, void *pri
 		return;
 
 	const char *id = obs_data_get_string(flow, WARP_FLOW_ID);
+	int seconds;
 	bool carried_out;
 
+	if (!warp_ws_get_flow_length(request, response, &seconds)) {
+		obs_data_release(flow);
+		return;
+	}
+
 	if (req->action == WARP_WS_FLOW_SAVE) {
-		carried_out = warp_flow_save_replay(id);
+		carried_out = warp_flow_save_replay_length(id, seconds);
 
 		if (!carried_out)
 			warp_ws_fail(response, "the replay buffer is not running");
 	} else {
-		carried_out = warp_flow_promote_last(id);
+		carried_out = warp_flow_promote_last_length(id, seconds);
 
 		if (!carried_out)
 			warp_ws_fail(response, "there is no saved replay to add");
@@ -741,6 +798,11 @@ static void warp_ws_flow_cb(obs_data_t *request, obs_data_t *response, void *pri
 	if (carried_out) {
 		obs_data_set_bool(response, "success", true);
 		warp_ws_add_flow_status(flow, response);
+
+		/* a length that was asked for stands for the clip, whatever the
+		 * flows it reaches keep by default */
+		if (seconds >= 0)
+			obs_data_set_int(response, "seconds", seconds);
 	}
 
 	obs_data_release(flow);
