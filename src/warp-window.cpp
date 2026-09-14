@@ -57,6 +57,7 @@ enum WarpFlowColumn {
 	WARP_COL_CLIPS,
 	WARP_COL_TRIGGER,
 	WARP_COL_ORDER,
+	WARP_COL_LENGTH,
 	WARP_COL_LINKS,
 	WARP_COL_COUNT,
 };
@@ -180,6 +181,37 @@ QString warp_trigger_name(const char *trigger)
 	return warp_flow_text("Warp.Flow.Trigger.Hotkey");
 }
 
+/* How much of the replay buffer a flow keeps, with the lengths it offers on top
+ * of that in brackets after it: "10s (+5s, 20s)". */
+QString warp_length_name(obs_data_t *flow)
+{
+	char label[WARP_FLOW_LENGTH_LABEL_SIZE];
+	const int length = (int)obs_data_get_int(flow, WARP_FLOW_LENGTH);
+
+	warp_flow_length_label(length, label, sizeof(label));
+
+	const QString own = length > 0 ? QString::fromUtf8(label) : warp_flow_text("Warp.Window.Length.Whole");
+
+	obs_data_array_t *lengths = obs_data_get_array(flow, WARP_FLOW_LENGTHS);
+	const size_t count = lengths ? obs_data_array_count(lengths) : 0;
+	QStringList others;
+
+	for (size_t i = 0; i < count; i++) {
+		obs_data_t *item = obs_data_array_item(lengths, i);
+
+		warp_flow_length_label((int)obs_data_get_int(item, WARP_FLOW_LENGTH_SECONDS), label, sizeof(label));
+		others.append(QString::fromUtf8(label));
+		obs_data_release(item);
+	}
+
+	obs_data_array_release(lengths);
+
+	if (others.isEmpty())
+		return own;
+
+	return warp_flow_text("Warp.Window.Length.Others").arg(own, others.join(QStringLiteral(", ")));
+}
+
 /* What an instant replay flow does with a clip stands in the order column: it
  * holds one clip rather than building a list, so which end of a list a clip
  * goes on says nothing about it. */
@@ -222,6 +254,7 @@ WarpWindow::WarpWindow(QWidget *parent) : QDialog(parent)
 	tree->setHeaderLabels({warp_flow_text("Warp.Window.Column.Flow"), warp_flow_text("Warp.Window.Column.Kind"),
 			       warp_flow_text("Warp.Window.Column.Target"), warp_flow_text("Warp.Window.Column.Clips"),
 			       warp_flow_text("Warp.Window.Column.Trigger"), warp_flow_text("Warp.Window.Column.Order"),
+			       warp_flow_text("Warp.Window.Column.Length"),
 			       warp_flow_text("Warp.Window.Column.Links")});
 	tree->header()->setSectionResizeMode(QHeaderView::ResizeToContents);
 	tree->header()->setStretchLastSection(true);
@@ -350,6 +383,8 @@ void WarpWindow::refresh()
 		item->setText(WARP_COL_TRIGGER, warp_trigger_name(obs_data_get_string(flow, WARP_FLOW_TRIGGER)));
 		item->setText(WARP_COL_ORDER, warp_order_name(kind, obs_data_get_string(flow, WARP_FLOW_ORDER),
 							      obs_data_get_string(flow, WARP_FLOW_PLAYBACK)));
+		item->setText(WARP_COL_LENGTH, warp_length_name(flow));
+		item->setToolTip(WARP_COL_LENGTH, warp_flow_text("Warp.Flow.Length.Desc"));
 
 		QStringList linked;
 		obs_data_array_t *links = obs_data_get_array(flow, WARP_FLOW_LINKS);

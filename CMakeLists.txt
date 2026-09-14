@@ -68,7 +68,7 @@ target_sources(
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 if(ENABLE_FRONTEND_API)
-  target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/warp-flow.c)
+  target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/warp-flow.c src/warp-trim.c)
 endif()
 
 if(ENABLE_FRONTEND_API AND ENABLE_QT)

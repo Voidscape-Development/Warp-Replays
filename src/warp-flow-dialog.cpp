@@ -40,6 +40,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QPair>
 #include <QPixmap>
 #include <QPolygonF>
+#include <QRegularExpression>
 #include <QSpinBox>
 #include <QVBoxLayout>
 
@@ -351,6 +352,121 @@ QWidget *warp_speed_row(QCheckBox **check, QSpinBox **spin, QWidget *parent)
 	return row;
 }
 
+/* how much of the replay buffer a flow keeps, with the bottom of the range
+ * standing for all of it rather than for a clip of no length */
+QWidget *warp_length_row(QSpinBox **spin, QWidget *parent)
+{
+	auto *row = new QWidget(parent);
+	auto *layout = new QHBoxLayout(row);
+
+	layout->setContentsMargins(0, 0, 0, 0);
+
+	*spin = new QSpinBox(row);
+
+	(*spin)->setRange(WARP_FLOW_LENGTH_WHOLE, WARP_FLOW_LENGTH_MAX);
+	(*spin)->setSuffix(warp_flow_text("Warp.Flow.Length.Suffix"));
+	(*spin)->setSpecialValueText(warp_flow_text("Warp.Flow.Length.Whole"));
+
+	layout->addWidget(new QLabel(warp_flow_text("Warp.Flow.Length"), row));
+	layout->addWidget(*spin);
+	layout->addStretch(1);
+
+	row->setToolTip(warp_flow_text("Warp.Flow.Length.Desc"));
+
+	return row;
+}
+
+/* the lengths a flow offers on top of its own, each of which is a hotkey */
+QWidget *warp_lengths_row(QLineEdit **edit, QWidget *parent)
+{
+	auto *row = new QWidget(parent);
+	auto *layout = new QHBoxLayout(row);
+
+	layout->setContentsMargins(0, 0, 0, 0);
+
+	*edit = new QLineEdit(row);
+	(*edit)->setPlaceholderText(warp_flow_text("Warp.Flow.Lengths.Placeholder"));
+
+	layout->addWidget(new QLabel(warp_flow_text("Warp.Flow.Lengths"), row));
+	layout->addWidget(*edit, 1);
+
+	row->setToolTip(warp_flow_text("Warp.Flow.Lengths.Desc"));
+
+	return row;
+}
+
+/* the lengths a flow offers, as they are written in the field */
+QString warp_lengths_text(obs_data_t *config)
+{
+	obs_data_array_t *lengths = config ? obs_data_get_array(config, WARP_FLOW_LENGTHS) : nullptr;
+	const size_t count = lengths ? obs_data_array_count(lengths) : 0;
+	QStringList parts;
+
+	for (size_t i = 0; i < count; i++) {
+		obs_data_t *item = obs_data_array_item(lengths, i);
+
+		parts.append(QString::number(obs_data_get_int(item, WARP_FLOW_LENGTH_SECONDS)));
+		obs_data_release(item);
+	}
+
+	obs_data_array_release(lengths);
+
+	return parts.join(QStringLiteral(", "));
+}
+
+/* What was written in that field, as lengths in seconds: whole numbers, in any
+ * of the ways one might separate them, with the "s" they are said with allowed
+ * and anything offered twice kept once. Says what is wrong with it and answers
+ * false when it cannot be read. */
+bool warp_parse_lengths(QWidget *parent, const QString &title, const QString &text, QList<int> &lengths)
+{
+	static const QRegularExpression separators(QStringLiteral("[,;/\\s]+"));
+
+	const QStringList parts = text.split(separators, Qt::SkipEmptyParts);
+
+	for (const QString &part : parts) {
+		QString number = part;
+
+		if (number.endsWith(QLatin1Char('s'), Qt::CaseInsensitive))
+			number.chop(1);
+
+		bool read = false;
+		const int seconds = number.toInt(&read);
+
+		if (!read || seconds < 1 || seconds > WARP_FLOW_LENGTH_MAX) {
+			QMessageBox::warning(parent, title, warp_flow_text("Warp.Flow.Error.Lengths"));
+			return false;
+		}
+
+		if (!lengths.contains(seconds))
+			lengths.append(seconds);
+	}
+
+	if (lengths.size() > WARP_FLOW_LENGTHS_MAX) {
+		QMessageBox::warning(parent, title,
+				     warp_flow_text("Warp.Flow.Error.LengthsTooMany").arg(WARP_FLOW_LENGTHS_MAX));
+		return false;
+	}
+
+	return true;
+}
+
+void warp_set_lengths(obs_data_t *config, const QList<int> &lengths)
+{
+	obs_data_array_t *array = obs_data_array_create();
+
+	for (int seconds : lengths) {
+		obs_data_t *item = obs_data_create();
+
+		obs_data_set_int(item, WARP_FLOW_LENGTH_SECONDS, seconds);
+		obs_data_array_push_back(array, item);
+		obs_data_release(item);
+	}
+
+	obs_data_set_array(config, WARP_FLOW_LENGTHS, array);
+	obs_data_array_release(array);
+}
+
 QFrame *warp_separator(QWidget *parent)
 {
 	auto *line = new QFrame(parent);
@@ -547,6 +663,9 @@ WarpFlowCreateDialog::WarpFlowCreateDialog(QWidget *parent) : QDialog(parent)
 
 	form->addRow(warp_flow_text("Warp.Flow.Limit.Label"), limit_row);
 
+	form->addRow(warp_flow_text("Warp.Flow.Length.Label"), warp_length_row(&lengthSpin, this));
+	form->addRow(warp_flow_text("Warp.Flow.Lengths.Label"), warp_lengths_row(&lengthsEdit, this));
+
 	/* the replay flows a highlight or instant replay list can be fed from */
 	fedByCombo->addItem(warp_flow_text("Warp.Flow.FedBy.None"), QString());
 
@@ -661,7 +780,7 @@ void WarpFlowCreateDialog::targetChanged()
 
 bool WarpFlowCreateDialog::buildFlow(const char *kind, const QString &name, QComboBox *target_combo,
 				     QLineEdit *new_target_edit, const char *trigger, const char *order, int max_clips,
-				     const QStringList &links, QString &flow_id)
+				     const QList<int> &lengths, const QStringList &links, QString &flow_id)
 {
 	QString uuid;
 	QString target_name;
@@ -681,6 +800,13 @@ bool WarpFlowCreateDialog::buildFlow(const char *kind, const QString &name, QCom
 	obs_data_set_string(config, WARP_FLOW_TARGET_NAME, target_name.toUtf8().constData());
 	obs_data_set_int(config, WARP_FLOW_MAX_CLIPS, max_clips);
 	obs_data_set_bool(config, WARP_FLOW_ENABLED, true);
+
+	/* how much of the buffer a clip is, and the lengths this flow offers on
+	 * top of that: the pair a Combo makes keeps the same length either
+	 * side, and it is the replay list that takes the saves, so the length
+	 * hotkeys are its */
+	obs_data_set_int(config, WARP_FLOW_LENGTH, lengthSpin->value());
+	warp_set_lengths(config, lengths);
 
 	/* what playback does with a clip, and how fast, is the instant replay
 	 * flow's alone: the list kinds put a clip in a list and leave playback
@@ -776,6 +902,12 @@ void WarpFlowCreateDialog::accept()
 	const QByteArray order = orderCombo->currentData().toString().toUtf8();
 	const QByteArray hl_order = hlOrderCombo->currentData().toString().toUtf8();
 	const int max_clips = limitCheck->isChecked() ? limitSpin->value() : 0;
+	QList<int> lengths;
+
+	if (!warp_parse_lengths(this, warp_flow_text("Warp.Flow.Create.Title"), lengthsEdit->text(), lengths)) {
+		lengthsEdit->setFocus();
+		return;
+	}
 
 	if (kind == QString(WARP_FLOW_KIND_COMBO)) {
 		const QString hl_name = name + QStringLiteral(" ") + warp_flow_text("Warp.Flow.Combo.HighlightSuffix");
@@ -788,11 +920,11 @@ void WarpFlowCreateDialog::accept()
 		/* the highlight list first: the replay list is made linked to
 		 * it, so the pair works from the moment it is there */
 		if (!buildFlow(WARP_FLOW_KIND_HIGHLIGHT, hl_name, hlTargetCombo, hlNewTargetEdit,
-			       WARP_FLOW_TRIGGER_HOTKEY, hl_order.constData(), 0, QStringList(), hl_id))
+			       WARP_FLOW_TRIGGER_HOTKEY, hl_order.constData(), 0, QList<int>(), QStringList(), hl_id))
 			return;
 
 		if (!buildFlow(WARP_FLOW_KIND_REPLAY, name, targetCombo, newTargetEdit, trigger.constData(),
-			       order.constData(), max_clips, QStringList() << hl_id, replay_id)) {
+			       order.constData(), max_clips, lengths, QStringList() << hl_id, replay_id)) {
 			/* the highlight list was made for a pair that did not
 			 * come off, so it goes back with it */
 			for (const QString &made : created)
@@ -806,7 +938,7 @@ void WarpFlowCreateDialog::accept()
 		QString flow_id;
 
 		if (!buildFlow(flow_kind.constData(), name, targetCombo, newTargetEdit, trigger.constData(),
-			       order.constData(), 0, QStringList(), flow_id))
+			       order.constData(), 0, lengths, QStringList(), flow_id))
 			return;
 
 		/* fed by a replay flow: it is that flow that has to be told */
@@ -815,7 +947,7 @@ void WarpFlowCreateDialog::accept()
 		QString flow_id;
 
 		if (!buildFlow(WARP_FLOW_KIND_REPLAY, name, targetCombo, newTargetEdit, trigger.constData(),
-			       order.constData(), max_clips, QStringList(), flow_id))
+			       order.constData(), max_clips, lengths, QStringList(), flow_id))
 			return;
 	}
 
@@ -912,6 +1044,12 @@ WarpFlowPropsDialog::WarpFlowPropsDialog(QWidget *parent, const QString &id) : Q
 	form->addRow(warp_flow_text("Warp.Flow.Limit.Label"), limit_row);
 	warp_set_row_visible(form, limit_row, !is_highlight && !isInstant);
 
+	form->addRow(warp_flow_text("Warp.Flow.Length.Label"), warp_length_row(&lengthSpin, this));
+	lengthSpin->setValue(config ? (int)obs_data_get_int(config, WARP_FLOW_LENGTH) : WARP_FLOW_LENGTH_WHOLE);
+
+	form->addRow(warp_flow_text("Warp.Flow.Lengths.Label"), warp_lengths_row(&lengthsEdit, this));
+	lengthsEdit->setText(warp_lengths_text(config));
+
 	enabledCheck = new QCheckBox(warp_flow_text("Warp.Flow.Enabled"), this);
 	enabledCheck->setChecked(config ? obs_data_get_bool(config, WARP_FLOW_ENABLED) : true);
 	form->addRow(QString(), enabledCheck);
@@ -1002,6 +1140,13 @@ void WarpFlowPropsDialog::accept()
 	if (!warp_flow_name_free(this, name, flowId))
 		return;
 
+	QList<int> lengths;
+
+	if (!warp_parse_lengths(this, warp_flow_text("Warp.Flow.Props.Title"), lengthsEdit->text(), lengths)) {
+		lengthsEdit->setFocus();
+		return;
+	}
+
 	QString uuid;
 	QString target_name;
 
@@ -1018,6 +1163,8 @@ void WarpFlowPropsDialog::accept()
 	obs_data_set_string(config, WARP_FLOW_ORDER, orderCombo->currentData().toString().toUtf8().constData());
 	obs_data_set_int(config, WARP_FLOW_MAX_CLIPS, limitCheck->isChecked() ? limitSpin->value() : 0);
 	obs_data_set_bool(config, WARP_FLOW_ENABLED, enabledCheck->isChecked());
+	obs_data_set_int(config, WARP_FLOW_LENGTH, lengthSpin->value());
+	warp_set_lengths(config, lengths);
 
 	if (isInstant) {
 		obs_data_set_string(config, WARP_FLOW_PLAYBACK,

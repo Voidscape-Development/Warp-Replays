@@ -20,6 +20,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <QDialog>
 #include <QIcon>
+#include <QList>
 #include <QString>
 #include <QStringList>
 
@@ -55,7 +56,8 @@ private:
 	void kindChanged();
 	void targetChanged();
 	bool buildFlow(const char *kind, const QString &name, QComboBox *targetCombo, QLineEdit *newTargetEdit,
-		       const char *trigger, const char *order, int maxClips, const QStringList &links, QString &flowId);
+		       const char *trigger, const char *order, int maxClips, const QList<int> &lengths,
+		       const QStringList &links, QString &flowId);
 	void linkFedBy(const QString &fedBy, const QString &flowId);
 
 	QListWidget *kindList = nullptr;
@@ -77,6 +79,8 @@ private:
 	QComboBox *playbackCombo = nullptr;
 	QCheckBox *speedCheck = nullptr;
 	QSpinBox *speedSpin = nullptr;
+	QSpinBox *lengthSpin = nullptr;
+	QLineEdit *lengthsEdit = nullptr;
 
 	/* the id of the source kind targetCombo is listing, so it is only filled
 	 * again when the kind that is picked feeds a different one */
@@ -112,6 +116,8 @@ private:
 	QComboBox *playbackCombo = nullptr;
 	QCheckBox *speedCheck = nullptr;
 	QSpinBox *speedSpin = nullptr;
+	QSpinBox *lengthSpin = nullptr;
+	QLineEdit *lengthsEdit = nullptr;
 	QCheckBox *enabledCheck = nullptr;
 	QListWidget *linkList = nullptr;
 };

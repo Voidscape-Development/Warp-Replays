@@ -55,8 +55,14 @@ runs:
 
         print ::group::Install clang-format-19
         brew update --quiet
-        brew tap --quiet obsproject/tools
+        # Homebrew refuses to load a formula from a third-party tap until the
+        # tap is trusted, and refuses to finish tapping one for the same
+        # reason - so the tap that trust is asked for has to be allowed to
+        # fail. It leaves the clone behind either way, which is all trust
+        # needs; the second tap is the one that has to come off.
+        brew tap --quiet obsproject/tools || true
         brew trust obsproject/tools
+        brew tap --quiet obsproject/tools
         brew install --quiet obsproject/tools/clang-format@19
         print ::endgroup::
 
