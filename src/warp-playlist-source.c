@@ -2769,6 +2769,8 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 	s->hw_decode = obs_data_get_bool(settings, "hw_decode");
 	s->base_speed = speed;
 
+	size_t prev_count = s->paths.num;
+
 	if (warp_pl_load_playlist(s, settings))
 		order_changed = true;
 
@@ -2799,6 +2801,16 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 			if (s->pos >= s->order.num)
 				warp_pl_stop(s);
 		}
+
+		/* A playlist that has run out, or that is not on air, is not in
+		 * the middle of anything, so files added to it send it back to
+		 * the top rather than leaving it wherever it had got to. That is
+		 * the case of one being built up from empty: the first file
+		 * starts playing as it lands, and by the time the rest are in it
+		 * has run on, or run out, partway down the list. */
+		if (s->pos < s->order.num && s->paths.num > prev_count &&
+		    (s->state == OBS_MEDIA_STATE_ENDED || !active))
+			warp_pl_stop(s);
 	}
 
 	for (size_t dir = 0; dir < WARP_PL_NUM_DIRS; dir++) {
