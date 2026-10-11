@@ -25,6 +25,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <graphics/vec4.h>
 #include <util/config-file.h>
+#include <util/platform.h>
 
 #include <QApplication>
 #include <QCheckBox>
@@ -87,6 +88,11 @@ constexpr int WARP_ZOOM_REFRESH_MS = 1000;
 /* the longest side of the picture the dock grabs; a framing pad does not need
  * the full canvas, and this keeps the grab cheap */
 constexpr int WARP_ZOOM_PREVIEW_MAX = 480;
+
+/* how old the frame left from the grab before can be and still be shown: a few
+ * grabs at the resting rate, so a dock that has been put away and brought back
+ * does not open on what was on air when it went */
+constexpr uint64_t WARP_ZOOM_GRAB_STALE_NS = 250000000;
 
 /* how far one press of the dock's pan buttons moves, as a fraction of what is
  * on screen, matching the pan hotkeys */
@@ -1054,10 +1060,19 @@ class WarpZoomGrabber {
 public:
 	~WarpZoomGrabber() { release(); }
 
-	/* What the source is putting out right now, at something like preview
-	 * size. Rendering a source outside the main loop means holding the
-	 * graphics context, so the whole grab is done in one pass and the
-	 * surfaces it needs are kept between frames. */
+	/* What the source is putting out, at something like preview size.
+	 * Rendering a source outside the main loop means holding the graphics
+	 * context, so the whole grab is done in one pass and the surfaces it
+	 * needs are kept between frames.
+	 *
+	 * Reading a frame back the moment it has been copied out makes the
+	 * thread wait on the GPU to finish it, with the graphics context held
+	 * and the render thread queued behind it. So the copy goes into one of
+	 * two surfaces and the frame read is the one copied out on the grab
+	 * before, which the GPU has long since finished: the picture runs a
+	 * grab behind, and nothing waits. Only the first grab after the
+	 * surfaces are made reads its own frame, so the dock never opens on
+	 * nothing. */
 	QImage grab(obs_source_t *source)
 	{
 		uint32_t source_cx = obs_source_get_width(source);
@@ -1094,14 +1109,28 @@ public:
 			cy = grab_cy;
 		}
 
+		/* A frame staged for another source, or long enough ago that it
+		 * is no longer what is on air - the dock was put away, or the
+		 * grabs stopped - is not one to show, so this grab reads its own. */
+		uint64_t now = os_gettime_ns();
+
+		if (source != last_source || now - last_grab > WARP_ZOOM_GRAB_STALE_NS)
+			staged = false;
+
+		last_source = source;
+		last_grab = now;
+
 		if (!texrender)
 			texrender = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
-		if (!stage)
-			stage = gs_stagesurface_create(cx, cy, GS_RGBA);
+
+		for (gs_stagesurf_t *&surface : stages) {
+			if (!surface)
+				surface = gs_stagesurface_create(cx, cy, GS_RGBA);
+		}
 
 		gs_texrender_reset(texrender);
 
-		if (texrender && stage && gs_texrender_begin(texrender, cx, cy)) {
+		if (texrender && stages[0] && stages[1] && gs_texrender_begin(texrender, cx, cy)) {
 			struct vec4 clear;
 
 			vec4_zero(&clear);
@@ -1116,15 +1145,21 @@ public:
 			gs_blend_state_pop();
 			gs_texrender_end(texrender);
 
-			gs_stage_texture(stage, gs_texrender_get_texture(texrender));
+			gs_stage_texture(stages[written], gs_texrender_get_texture(texrender));
 
+			/* the frame staged on the grab before, or this one when
+			 * there has not been one since the surfaces were made */
+			size_t read = staged ? written ^ 1 : written;
 			uint8_t *data = nullptr;
 			uint32_t linesize = 0;
 
-			if (gs_stagesurface_map(stage, &data, &linesize)) {
+			if (gs_stagesurface_map(stages[read], &data, &linesize)) {
 				image = QImage(data, (int)cx, (int)cy, (int)linesize, QImage::Format_RGBA8888).copy();
-				gs_stagesurface_unmap(stage);
+				gs_stagesurface_unmap(stages[read]);
 			}
+
+			staged = true;
+			written ^= 1;
 		}
 
 		obs_leave_graphics();
@@ -1136,7 +1171,7 @@ public:
 
 	void release()
 	{
-		if (!texrender && !stage)
+		if (!texrender && !stages[0] && !stages[1])
 			return;
 
 		obs_enter_graphics();
@@ -1152,14 +1187,26 @@ private:
 			texrender = nullptr;
 		}
 
-		if (stage) {
-			gs_stagesurface_destroy(stage);
-			stage = nullptr;
+		for (gs_stagesurf_t *&surface : stages) {
+			if (surface) {
+				gs_stagesurface_destroy(surface);
+				surface = nullptr;
+			}
 		}
+
+		staged = false;
+		written = 0;
 	}
 
 	gs_texrender_t *texrender = nullptr;
-	gs_stagesurf_t *stage = nullptr;
+	gs_stagesurf_t *stages[2] = {nullptr, nullptr};
+	/* the surface the next frame is copied into, and whether the other
+	 * one holds a frame copied out on an earlier grab */
+	size_t written = 0;
+	bool staged = false;
+	/* only ever compared against, never used to reach the source */
+	const obs_source_t *last_source = nullptr;
+	uint64_t last_grab = 0;
 	uint32_t cx = 0;
 	uint32_t cy = 0;
 };
