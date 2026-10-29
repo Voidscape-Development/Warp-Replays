@@ -19,6 +19,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <obs-module.h>
 #include <plugin-support.h>
 
+#include "warp-status.h"
 #include "warp-websocket.h"
 
 #ifdef WARP_HAVE_FRONTEND_API
@@ -70,6 +71,8 @@ void obs_module_post_load(void)
 
 void obs_module_unload(void)
 {
+	warp_status_set_sink(NULL);
+
 #ifdef WARP_HAVE_FRONTEND_API
 	warp_flow_shutdown();
 #endif
