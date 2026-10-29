@@ -36,6 +36,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QPixmap>
 #include <QPointer>
 #include <QPushButton>
+#include <QStatusBar>
 #include <QStringList>
 #include <QStyle>
 #include <QStyledItemDelegate>
@@ -46,6 +47,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "warp-events.h"
 #include "warp-flow-dialog.hpp"
 #include "warp-flow.h"
+#include "warp-status.h"
 #include "warp-zoom-dock.hpp"
 
 namespace {
@@ -566,6 +568,33 @@ void warp_window_buffer_prompt(const char *flow_name)
 		Qt::QueuedConnection);
 }
 
+/* The main window, whose status bar Warp's messages go in. Held on to rather
+ * than asked for each time: the frontend's pointer outlives the window on the
+ * way out, and this one knows when it has gone. */
+QPointer<QMainWindow> warp_status_window;
+
+/* On the UI thread, with a message to put up. OBS's own status bar is a
+ * QStatusBar underneath, so a message is shown the way OBS shows its own: on
+ * the left, over whatever OBS said last, until it times out or something else
+ * is said. */
+void warp_window_show_status(const char *message, int timeout_ms)
+{
+	if (!warp_status_window || !message)
+		return;
+
+	QStatusBar *bar = warp_status_window->statusBar();
+
+	if (bar)
+		bar->showMessage(QString::fromUtf8(message), timeout_ms);
+}
+
+void warp_status_frontend_event(enum obs_frontend_event event, void *)
+{
+	/* nothing is said on the way out: there is nobody left to read it */
+	if (event == OBS_FRONTEND_EVENT_EXIT)
+		warp_status_set_sink(nullptr);
+}
+
 QPointer<WarpWindow> warp_window;
 
 void show_warp_window(void *)
@@ -589,4 +618,8 @@ extern "C" void warp_register_tools_menu(void)
 {
 	obs_frontend_add_tools_menu_item(obs_module_text("Warp.Tools.Menu"), show_warp_window, nullptr);
 	warp_flow_set_buffer_prompt(warp_window_buffer_prompt);
+
+	warp_status_window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+	warp_status_set_sink(warp_window_show_status);
+	obs_frontend_add_event_callback(warp_status_frontend_event, nullptr);
 }

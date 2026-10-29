@@ -40,13 +40,20 @@ extern "C" {
  * Safe from any thread, and meant for one that is not the UI's: it is disk
  * work. */
 
-/* Writes the last 'seconds' of 'path' to a file beside it and answers that
- * file's path, which the caller frees with bfree().
- *
- * Answers NULL when there is nothing to write - the clip is already that long
- * or shorter - and when the trim could not be made, so the caller carries on
- * with the file it already has. */
-char *warp_trim_tail(const char *path, int seconds);
+enum warp_trim_result {
+	/* the clip was cut, or a cut of the same length was already there */
+	WARP_TRIM_CUT,
+	/* the clip is already that long or shorter: there was nothing to cut */
+	WARP_TRIM_WHOLE,
+	/* the cut could not be made; the log says why */
+	WARP_TRIM_FAILED,
+};
+
+/* Writes the last 'seconds' of 'path' to a file beside it. On WARP_TRIM_CUT,
+ * 'out' is left holding that file's path, which the caller frees with bfree();
+ * otherwise it is left NULL, and the caller carries on with the file it already
+ * has. */
+enum warp_trim_result warp_trim_tail(const char *path, int seconds, char **out);
 
 #ifdef __cplusplus
 }

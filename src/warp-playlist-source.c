@@ -35,6 +35,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #endif
 
 #include "warp-events.h"
+#include "warp-status.h"
 #include "warp-zoom.h"
 
 #define WARP_PL_LOG(level, format, ...) \
@@ -3022,6 +3023,10 @@ static void warp_pl_clear_playlist(struct warp_playlist_source *s)
 	WARP_PL_LOG(LOG_INFO, "clearing playlist (%d files)", (int)s->paths.num);
 	for (size_t i = 0; i < s->paths.num; i++)
 		WARP_PL_LOG(LOG_INFO, "  cleared: %s", s->paths.array[i]);
+
+	/* and say so where it will be seen, since the press that did it may
+	 * well not have been meant */
+	warp_status_post(WARP_STATUS_LONG_MS, obs_module_text("Warp.Status.Cleared"), obs_source_get_name(s->source));
 
 	warp_pl_stop(s);
 

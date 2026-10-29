@@ -208,8 +208,9 @@ static bool warp_trim_copy_packets(AVFormatContext *ic, AVFormatContext *oc, con
 	return written;
 }
 
-char *warp_trim_tail(const char *path, int seconds)
+enum warp_trim_result warp_trim_tail(const char *path, int seconds, char **out)
 {
+	enum warp_trim_result result = WARP_TRIM_FAILED;
 	AVFormatContext *ic = NULL;
 	AVFormatContext *oc = NULL;
 	char *out_path = NULL;
@@ -221,16 +222,19 @@ char *warp_trim_tail(const char *path, int seconds)
 	int64_t seek_ts;
 	int video = -1;
 	int ret;
-	bool ok = false;
 
-	if (!path || !*path || seconds <= 0)
-		return NULL;
+	*out = NULL;
+
+	if (!path || !*path)
+		return WARP_TRIM_FAILED;
+	if (seconds <= 0)
+		return WARP_TRIM_WHOLE;
 
 	ret = avformat_open_input(&ic, path, NULL, NULL);
 
 	if (ret < 0) {
 		WARP_TRIM_LOG(LOG_WARNING, "could not open '%s': %s", path, av_err2str(ret));
-		return NULL;
+		return WARP_TRIM_FAILED;
 	}
 
 	ret = avformat_find_stream_info(ic, NULL);
@@ -252,6 +256,7 @@ char *warp_trim_tail(const char *path, int seconds)
 	if (ic->duration <= want) {
 		WARP_TRIM_LOG(LOG_INFO, "'%s' is %.1fs, already inside the %ds asked for", path,
 			      (double)ic->duration / AV_TIME_BASE, seconds);
+		result = WARP_TRIM_WHOLE;
 		goto done;
 	}
 
@@ -267,7 +272,7 @@ char *warp_trim_tail(const char *path, int seconds)
 	 * whole, so what is there is never half a clip. */
 	if (os_file_exists(out_path) && os_get_file_size(out_path) > 0) {
 		WARP_TRIM_LOG(LOG_INFO, "the last %ds of '%s' is already cut, using '%s'", seconds, path, out_path);
-		ok = true;
+		result = WARP_TRIM_CUT;
 		goto done;
 	}
 
@@ -347,7 +352,7 @@ char *warp_trim_tail(const char *path, int seconds)
 	}
 
 	WARP_TRIM_LOG(LOG_INFO, "cut the last %ds of '%s' into '%s'", seconds, path, out_path);
-	ok = true;
+	result = WARP_TRIM_CUT;
 
 done:
 	if (oc) {
@@ -362,7 +367,7 @@ done:
 
 	bfree(map);
 
-	if (!ok) {
+	if (result != WARP_TRIM_CUT) {
 		/* half a clip is worse than none: the flow is fed the whole one
 		 * instead */
 		if (part)
@@ -374,5 +379,7 @@ done:
 
 	bfree(part);
 
-	return out_path;
+	*out = out_path;
+
+	return result;
 }

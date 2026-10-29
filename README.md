@@ -35,7 +35,7 @@ A playlist source in the spirit of the VLC video source, built on the same playb
 * **Volume**, from silent to 100% of the audio in the files themselves, and **Transition Volume**, the same for the sound a stinger brings with it, which appears alongside it while a stinger is picked. They are set before the playlist reaches the mixer, so the fader, mute, monitoring and audio filters all still apply on top of them. Both apply live, to the file that is playing as well as to the ones after it, so a playlist of clips recorded far louder than the rest of the show can be turned down without touching the files — and because the two levels are separate, a playlist can be run silent while its stinger still sounds.
 * **Hotkeys**: Next Video, Previous Video, Back to First Video, Restart Current Video, Clear Playlist, plus Play/Pause, Stop, the speed hotkeys, and the frame stepping hotkeys.
 
-Clear Playlist empties the source's file list for good — it is written to the scene collection like any other settings change. The cleared file paths are written to the OBS log first, so a playlist cleared by a mis-hit during a show can be rebuilt from there. It is the one playlist hotkey that is not limited to a source that is on screen: the others drive playback, so they are aimed at what the operator has in front of them, while this one edits the file list, which is most often emptied while the playlist is off air.
+Clear Playlist empties the source's file list for good — it is written to the scene collection like any other settings change. The cleared file paths are written to the OBS log first, so a playlist cleared by a mis-hit during a show can be rebuilt from there, and the OBS status bar says it was cleared, so a mis-hit does not go unnoticed. It is the one playlist hotkey that is not limited to a source that is on screen: the others drive playback, so they are aimed at what the operator has in front of them, while this one edits the file list, which is most often emptied while the playlist is off air.
 
 Media controls (the ones in the OBS media controls dock) apply to the playlist: restart starts the playlist over from its first file, next and previous move through the list, and the time and duration shown are those of the file that is playing.
 
@@ -339,6 +339,8 @@ A clip landing in a playlist disturbs nothing about playback: the file list is e
 Flows are saved with the scene collection, alongside the sources they feed, so an event day's collection carries its own feed setup and switching collections switches flows.
 
 Every flow action can also be driven from outside OBS — see [obs-websocket control](#obs-websocket-control).
+
+What a flow is doing is said in the **OBS status bar**, along the bottom of the main window, where OBS itself says a replay was saved: a save on its way for a flow, a clip being cut, the flows a clip landed in, and — held up longer, since it is the one that needs doing something about — a flow that could not take a clip because its source has gone, or a clip that could not be cut and went in whole. It works the same whether the flow was driven by a hotkey, by obs-websocket or by listening. The OBS log stays the full record; the status bar is the line an operator can glance at mid-show.
 
 #### Clip lengths
 

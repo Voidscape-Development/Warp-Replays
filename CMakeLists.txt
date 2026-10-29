@@ -57,6 +57,7 @@ target_sources(
     src/warp-source.c
     src/warp-playlist-source.c
     src/warp-detection-filter.c
+    src/warp-status.c
     src/warp-websocket.c
     src/warp-zoom.c
     src/warp-zoom-filter.c
