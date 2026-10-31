@@ -189,6 +189,38 @@ char *warp_flow_last_clip(void);
  * instant replay flow holds one clip at a time, so it answers 0 or 1. */
 int warp_flow_clip_count(const char *id);
 
+/* The hotkeys a flow puts in Settings -> Hotkeys, so the UI can say which keys
+ * run it: its Save Replay and Add Last Saved Clip ones, and one for each of the
+ * lengths it offers on top of its own, in the order it offers them. */
+struct warp_flow_hotkeys {
+	obs_hotkey_id save;
+	obs_hotkey_id promote;
+	size_t lengths_num;
+	int length_seconds[WARP_FLOW_LENGTHS_MAX];
+	obs_hotkey_id length_hotkeys[WARP_FLOW_LENGTHS_MAX];
+};
+
+/* fills 'hotkeys' in for the flow, answering false when there is no such flow */
+bool warp_flow_get_hotkeys(const char *id, struct warp_flow_hotkeys *hotkeys);
+
+/* The keys of what warp_flow_last_landed() answers with, and of each item of
+ * its flows array. */
+#define WARP_FLOW_LANDED_PATH "path"
+#define WARP_FLOW_LANDED_TIME "time"
+#define WARP_FLOW_LANDED_FLOWS "flows"
+#define WARP_FLOW_LANDED_ID "id"
+#define WARP_FLOW_LANDED_NAME "name"
+#define WARP_FLOW_LANDED_OK "ok"
+
+/* What became of the clip that was handed out last: the file the replay buffer
+ * wrote, when it was handed out by os_gettime_ns(), and each flow it reached
+ * with whether that flow took it. A clip nobody takes is still recorded, with
+ * no flows. NULL before any clip has been handed out; the caller releases it.
+ *
+ * A clip being cut has not been handed out yet, so while one is on its way
+ * warp_flow_last_clip() names a file this does not. */
+obs_data_t *warp_flow_last_landed(void);
+
 #ifdef __cplusplus
 }
 #endif
