@@ -302,7 +302,14 @@ The first four playlist procs are on the Warp Media source as well, along with `
 
 ### Warp flows
 
-A **Warp** entry in the Tools menu opens the Warp window: the flows of the scene collection, what each one feeds, and how much is in it. Underneath the list, a dot says whether the replay buffer is running — green while it is, red while it is not — next to the clip it saved last, and a **Zoom Presets…** button opens the [zoom presets](#the-warp-zoom-dock) of every source that can be framed.
+A **Warp** entry in the Tools menu opens the Warp window, laid out for the middle of a show as much as for setting one up:
+
+* **Along the top**, the replay buffer: whether it is running, with a button to start or stop it. No flow can take a clip without it, so while it is stopped a banner across the window says so and offers to start it, and stopping it is asked about first, since it throws away what the buffer is holding. **Add Flow…**, **Zoom Presets…** — which opens the [zoom presets](#the-warp-zoom-dock) of every source that can be framed — and a **?** that says what flows are sit along the top as well.
+* **The flow list**: each flow with a switch to turn it on and off on the spot, its name with its kind's icon, what it does in a few words underneath — where its clips come from, its order (or, for an instant replay, what playback does with a clip), its length, and the flows it hands its clips on to — the source it feeds, and how many clips are in it, with a bar showing how full a list with a limit is, turning amber once it is dropping its oldest clip. A source that has gone is said in red. A flow fed by another is set in under it, joined to it by a line, so a replay list and the highlight list it fills read as a pair. Each row has a **Save** button, labelled with the key its Save Replay hotkey is bound to, and a menu with the flow's other lengths, Add Last Saved Clip, Properties and Remove.
+* **Beside the list**, everything about the flow that is picked: all of its settings in full, the flows that feed it, and every hotkey it registers with the key bound to it, or *Not set*. Save Replay, Add Last Clip, Properties and Remove are there too, and a flow whose source has gone offers to pick another one.
+* **Along the bottom**, the clip that was saved last: how long ago it was handed out, and every flow it reached, with the ones that could not take it in red — the same news the [status bar](#warp-flows) gives, kept where it can be read after the status bar has moved on.
+
+With no flows in the scene collection, the list says what flows are and offers to add the first one. Double-clicking a flow opens its properties.
 
 A flow takes the clips the OBS replay buffer saves and hands them to a Warp source, so a feed builds itself as an event goes on. Adding one opens a dialog laid out like OBS's own Add Source: the kinds down the left, what the one that is picked does on the right, and the settings it needs underneath.
 
@@ -373,7 +380,7 @@ The same event can frame the clip as well as reveal it: a second Warp Detection 
 
 An instant replay flow takes clips the same way the list kinds do — from its own **Save Replay to** hotkey, or from every replay buffer save — and it can be fed by another flow instead, so one save can fill a replay list *and* load the instant replay source at once. Its **Add Last Saved Clip to** hotkey reloads the clip that was saved last without saving a new one.
 
-The Warp window shows an instant replay flow holding 0 or 1 clips, and what it does with one where a list shows its order.
+The Warp window shows an instant replay flow as *Loaded* or *Empty* rather than as a count, and what it does with a clip where a list shows its order.
 
 ## Building
 

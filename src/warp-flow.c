@@ -135,6 +135,9 @@ static DARRAY(struct warp_flow *) warp_flows;
 /* the clip the replay buffer wrote last, kept so it can be promoted into a
  * flow after the fact */
 static char *warp_flow_last_path = NULL;
+/* what became of the clip that was handed out last, as warp_flow_last_landed()
+ * answers with it */
+static obs_data_t *warp_flow_landed = NULL;
 /* the flow that asked for the save that is on its way, when it asked, and the
  * length it asked for */
 static char *warp_flow_claim_id = NULL;
@@ -624,6 +627,10 @@ static void warp_flow_clear(void)
 		warp_flow_destroy(warp_flows.array[i]);
 
 	da_free(warp_flows);
+
+	/* the flows it names have gone with them */
+	obs_data_release(warp_flow_landed);
+	warp_flow_landed = NULL;
 }
 
 static void warp_flow_set_defaults(obs_data_t *config)
@@ -1178,6 +1185,43 @@ static const char *warp_flow_file_name(const char *path)
 	return name;
 }
 
+/* Writes down what became of a clip, for the Warp window to show: every flow
+ * the plan reached, and whether it took the clip. A plan that reached nobody is
+ * written down too, so the window does not go on showing the clip before it as
+ * the last one handed out. */
+static void warp_flow_note_landed(const struct warp_flow_plan *plan, const char *path)
+{
+	obs_data_t *landed = obs_data_create();
+	obs_data_array_t *flows = obs_data_array_create();
+
+	obs_data_set_string(landed, WARP_FLOW_LANDED_PATH, path);
+	obs_data_set_int(landed, WARP_FLOW_LANDED_TIME, (long long)os_gettime_ns());
+
+	for (size_t i = 0; plan && i < plan->items.num; i++) {
+		const struct warp_flow_delivery *d = &plan->items.array[i];
+
+		if (d->outcome == WARP_FLOW_PENDING)
+			continue;
+
+		obs_data_t *item = obs_data_create();
+
+		obs_data_set_string(item, WARP_FLOW_LANDED_ID, d->flow_id);
+		obs_data_set_string(item, WARP_FLOW_LANDED_NAME, d->flow_name);
+		obs_data_set_bool(item, WARP_FLOW_LANDED_OK,
+				  d->outcome == WARP_FLOW_FED || d->outcome == WARP_FLOW_ALREADY_THERE);
+		obs_data_array_push_back(flows, item);
+		obs_data_release(item);
+	}
+
+	obs_data_set_array(landed, WARP_FLOW_LANDED_FLOWS, flows);
+	obs_data_array_release(flows);
+
+	pthread_mutex_lock(&warp_flow_mutex);
+	obs_data_release(warp_flow_landed);
+	warp_flow_landed = landed;
+	pthread_mutex_unlock(&warp_flow_mutex);
+}
+
 /* One line in the status bar for a clip that has been handed out: the flows
  * that could not take it, if there were any, since those are what need doing
  * something about, and the flows it landed in otherwise. */
@@ -1286,6 +1330,7 @@ static void warp_flow_deliver_task(void *param)
 			warp_flow_deliver_one(&job->plan.items.array[i]);
 
 		warp_flow_report(&job->plan, job->path);
+		warp_flow_note_landed(&job->plan, job->path);
 	}
 
 	warp_flow_job_free(job);
@@ -1505,8 +1550,10 @@ static void warp_flow_deliver(const char *path, const char *claimed_by, int seco
 
 	pthread_mutex_unlock(&warp_flow_mutex);
 
-	if (!plan.items.num)
+	if (!plan.items.num) {
 		WARP_FLOW_LOG(LOG_INFO, "no flow takes '%s'", path);
+		warp_flow_note_landed(NULL, path);
+	}
 
 	warp_flow_run_plan(&plan, path);
 }
@@ -1739,6 +1786,46 @@ int warp_flow_clip_count(const char *id)
 	obs_source_release(target);
 
 	return count;
+}
+
+bool warp_flow_get_hotkeys(const char *id, struct warp_flow_hotkeys *hotkeys)
+{
+	if (!hotkeys)
+		return false;
+
+	memset(hotkeys, 0, sizeof(*hotkeys));
+	hotkeys->save = OBS_INVALID_HOTKEY_ID;
+	hotkeys->promote = OBS_INVALID_HOTKEY_ID;
+
+	pthread_mutex_lock(&warp_flow_mutex);
+	struct warp_flow *flow = warp_flow_find(id);
+
+	if (flow) {
+		hotkeys->save = flow->save_hotkey;
+		hotkeys->promote = flow->promote_hotkey;
+
+		for (size_t i = 0; i < flow->lengths.num && i < WARP_FLOW_LENGTHS_MAX; i++) {
+			hotkeys->length_seconds[i] = flow->lengths.array[i].seconds;
+			hotkeys->length_hotkeys[i] = flow->lengths.array[i].hotkey;
+			hotkeys->lengths_num = i + 1;
+		}
+	}
+
+	pthread_mutex_unlock(&warp_flow_mutex);
+
+	return flow != NULL;
+}
+
+obs_data_t *warp_flow_last_landed(void)
+{
+	obs_data_t *landed;
+
+	pthread_mutex_lock(&warp_flow_mutex);
+	landed = warp_flow_landed;
+	obs_data_addref(landed);
+	pthread_mutex_unlock(&warp_flow_mutex);
+
+	return landed;
 }
 
 /* ------------------------------------------------------------------------- */
