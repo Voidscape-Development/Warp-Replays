@@ -217,8 +217,8 @@ bool warp_flow_get_hotkeys(const char *id, struct warp_flow_hotkeys *hotkeys);
  * with whether that flow took it. A clip nobody takes is still recorded, with
  * no flows. NULL before any clip has been handed out; the caller releases it.
  *
- * A clip being cut has not been handed out yet, so while one is on its way
- * warp_flow_last_clip() names a file this does not. */
+ * A clip is handed out on the UI thread once it has been saved, so for the
+ * moment it is on its way warp_flow_last_clip() names a file this does not. */
 obs_data_t *warp_flow_last_landed(void);
 
 #ifdef __cplusplus

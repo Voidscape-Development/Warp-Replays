@@ -23,7 +23,7 @@ extern "C" {
 #endif
 
 /* A line in the OBS status bar, along the bottom of the main window, saying
- * what Warp is doing: a clip being cut, a clip landing in a flow, a flow that
+ * what Warp is doing: a save on its way, a clip landing in a flow, a flow that
  * had nowhere to put one. It is where OBS itself says a replay was saved, so it
  * is where an operator is already looking.
  *

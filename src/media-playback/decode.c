@@ -18,6 +18,7 @@
 
 #include "media-playback.h"
 #include "media.h"
+#include <libavutil/hwcontext.h>
 #include <libavutil/mastering_display_metadata.h>
 
 enum AVHWDeviceType hw_priority[] = {
@@ -42,26 +43,93 @@ static bool has_hw_type(const AVCodec *c, enum AVHWDeviceType type, enum AVPixel
 	return false;
 }
 
+/* The decoder whose frames can be drawn straight off the GPU on this platform:
+ * D3D11 textures are shared into OBS's D3D11 device on Windows, and VAAPI
+ * surfaces imported into OBS's EGL context as dma-bufs on Linux. */
+enum AVHWDeviceType mp_decode_gpu_direct_type(void)
+{
+#if defined(_WIN32)
+	return AV_HWDEVICE_TYPE_D3D11VA;
+#elif defined(__linux__)
+	return AV_HWDEVICE_TYPE_VAAPI;
+#else
+	return AV_HWDEVICE_TYPE_NONE;
+#endif
+}
+
+/* Makes the device frames that are to go out on the GPU are decoded on. On
+ * Windows that is the adapter OBS draws with, so a texture can be shared from
+ * one device to the other. */
+static bool create_gpu_direct_device(struct media_playback *m)
+{
+	enum AVHWDeviceType type = mp_decode_gpu_direct_type();
+	const char *device = NULL;
+	AVBufferRef *hw_ctx = NULL;
+
+#if defined(_WIN32)
+	char adapter[16];
+	struct obs_video_info ovi;
+
+	if (obs_get_video_info(&ovi)) {
+		snprintf(adapter, sizeof(adapter), "%u", ovi.adapter);
+		device = adapter;
+	}
+#endif
+
+	if (type == AV_HWDEVICE_TYPE_NONE || av_hwdevice_ctx_create(&hw_ctx, type, device, NULL, 0) != 0)
+		return false;
+
+	av_buffer_unref(&m->hw_device);
+	m->hw_device = hw_ctx;
+	m->hw_type = type;
+	return true;
+}
+
+/* The hardware device is the engine's rather than the decoder's: creating one
+ * is the slowest part of opening a file, and a new clip is decoded on the same
+ * device as the last one. */
 static void init_hw_decoder(struct mp_decode *d, AVCodecContext *c)
 {
+	struct media_playback *m = d->m;
 	enum AVHWDeviceType *priority = hw_priority;
-	AVBufferRef *hw_ctx = NULL;
+	enum AVHWDeviceType direct = mp_decode_gpu_direct_type();
+
+	/* frames that are to be drawn off the GPU have to come from the
+	 * decoder that can share them, whatever would be tried first
+	 * otherwise */
+	if (m->gpu_direct && direct != AV_HWDEVICE_TYPE_NONE && has_hw_type(d->codec, direct, &d->hw_format) &&
+	    ((m->hw_device && m->hw_type == direct) || create_gpu_direct_device(m))) {
+		c->hw_device_ctx = av_buffer_ref(m->hw_device);
+		c->opaque = d;
+		d->hw = true;
+		return;
+	}
+
+	if (m->hw_device && has_hw_type(d->codec, m->hw_type, &d->hw_format)) {
+		c->hw_device_ctx = av_buffer_ref(m->hw_device);
+		c->opaque = d;
+		d->hw = true;
+		return;
+	}
 
 	while (*priority != AV_HWDEVICE_TYPE_NONE) {
 		if (has_hw_type(d->codec, *priority, &d->hw_format)) {
+			AVBufferRef *hw_ctx = NULL;
 			int ret = av_hwdevice_ctx_create(&hw_ctx, *priority, NULL, NULL, 0);
-			if (ret == 0)
-				break;
+
+			if (ret == 0) {
+				av_buffer_unref(&m->hw_device);
+				m->hw_device = hw_ctx;
+				m->hw_type = *priority;
+
+				c->hw_device_ctx = av_buffer_ref(hw_ctx);
+				c->opaque = d;
+				d->hw = true;
+				return;
+			}
 		}
 
 		priority++;
-	}
-
-	if (hw_ctx) {
-		c->hw_device_ctx = av_buffer_ref(hw_ctx);
-		c->opaque = d;
-		d->hw_ctx = hw_ctx;
-		d->hw = true;
 	}
 }
 
@@ -85,6 +153,12 @@ static int mp_open_codec(struct mp_decode *d, bool hw)
 	if (hw)
 		init_hw_decoder(d, c);
 
+	/* Frames that go out on the GPU are held on to while they wait to be
+	 * drawn, and they come out of the decoder's fixed pool of surfaces:
+	 * the pool is made big enough for the decoder to carry on regardless. */
+	if (d->hw && d->m->gpu_direct)
+		c->extra_hw_frames = MP_GPU_EXTRA_SURFACES;
+
 	if (c->thread_count == 1 && c->codec_id != AV_CODEC_ID_PNG && c->codec_id != AV_CODEC_ID_TIFF &&
 	    c->codec_id != AV_CODEC_ID_JPEG2000 && c->codec_id != AV_CODEC_ID_MPEG4 && c->codec_id != AV_CODEC_ID_WEBP)
 		c->thread_count = 0;
@@ -98,8 +172,6 @@ static int mp_open_codec(struct mp_decode *d, bool hw)
 
 fail:
 	avcodec_free_context(&c);
-	avcodec_free_context(&d->decoder);
-
 	return ret;
 }
 
@@ -136,80 +208,136 @@ static uint16_t get_max_luminance(const AVStream *stream)
 	return max_luminance;
 }
 
-bool mp_decode_init(mp_media_t *m, enum AVMediaType type, bool hw)
+static int codecpar_channels(const AVCodecParameters *p)
 {
-	struct mp_decode *d = type == AVMEDIA_TYPE_VIDEO ? &m->v : &m->a;
-	enum AVCodecID id;
-	AVStream *stream;
-	int ret;
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 24, 100)
+	return p->ch_layout.nb_channels;
+#else
+	return p->channels;
+#endif
+}
 
-	memset(d, 0, sizeof(*d));
-	d->m = m;
-	d->audio = type == AVMEDIA_TYPE_AUDIO;
-
-	ret = av_find_best_stream(m->fmt, type, -1, -1, NULL, 0);
-	if (ret < 0)
+/* whether a decoder opened with 'a' can be handed a stream described by 'b'
+ * without being opened again */
+static bool same_codec_params(const AVCodecParameters *a, const AVCodecParameters *b)
+{
+	if (a->codec_id != b->codec_id || a->format != b->format || a->width != b->width || a->height != b->height ||
+	    a->sample_rate != b->sample_rate || codecpar_channels(a) != codecpar_channels(b) ||
+	    a->extradata_size != b->extradata_size)
 		return false;
-	stream = d->stream = m->fmt->streams[ret];
-	id = stream->codecpar->codec_id;
 
-	if (type == AVMEDIA_TYPE_VIDEO)
-		d->max_luminance = get_max_luminance(stream);
+	return !a->extradata_size || memcmp(a->extradata, b->extradata, (size_t)a->extradata_size) == 0;
+}
+
+static const AVCodec *find_decoder(const AVStream *stream)
+{
+	enum AVCodecID id = stream->codecpar->codec_id;
 
 	if (id == AV_CODEC_ID_VP8 || id == AV_CODEC_ID_VP9) {
-		AVDictionaryEntry *tag = NULL;
-		tag = av_dict_get(stream->metadata, "alpha_mode", tag, AV_DICT_IGNORE_SUFFIX);
+		AVDictionaryEntry *tag = av_dict_get(stream->metadata, "alpha_mode", NULL, AV_DICT_IGNORE_SUFFIX);
 
 		if (tag && strcmp(tag->value, "1") == 0) {
-			char *codec = (id == AV_CODEC_ID_VP8) ? "libvpx" : "libvpx-vp9";
-			d->codec = avcodec_find_decoder_by_name(codec);
+			const AVCodec *codec =
+				avcodec_find_decoder_by_name(id == AV_CODEC_ID_VP8 ? "libvpx" : "libvpx-vp9");
+
+			if (codec)
+				return codec;
 		}
 	}
 
-	if (!d->codec)
-		d->codec = avcodec_find_decoder(id);
+	return avcodec_find_decoder(id);
+}
 
-	if (!d->codec) {
+/* lets go of the decoder itself, keeping the packet queue and the frames */
+static void mp_decode_close_codec(struct mp_decode *d)
+{
+	if (d->decoder)
+		avcodec_free_context(&d->decoder);
+	if (d->params)
+		avcodec_parameters_free(&d->params);
+	d->codec = NULL;
+	d->hw = false;
+}
+
+bool mp_decode_open(struct mp_decode *d, struct media_playback *m, AVStream *stream, bool audio, bool hw)
+{
+	const AVCodec *codec = find_decoder(stream);
+	enum AVMediaType type = audio ? AVMEDIA_TYPE_AUDIO : AVMEDIA_TYPE_VIDEO;
+
+	d->m = m;
+	d->audio = audio;
+
+	mp_decode_clear_packets(d);
+
+	if (!codec) {
 		blog(LOG_WARNING, "MP: Failed to find %s codec", av_get_media_type_string(type));
+		mp_decode_close_codec(d);
 		return false;
 	}
 
-	ret = mp_open_codec(d, hw);
-	if (ret < 0) {
-		blog(LOG_WARNING, "MP: Failed to open %s decoder: %s", av_get_media_type_string(type), av_err2str(ret));
-		return false;
+	bool reuse = d->decoder && d->params && d->codec == codec && d->params_hw == hw &&
+		     d->params_gpu_direct == m->gpu_direct && same_codec_params(d->params, stream->codecpar);
+
+	d->stream = stream;
+
+	if (reuse) {
+		avcodec_flush_buffers(d->decoder);
+	} else {
+		mp_decode_close_codec(d);
+
+		d->codec = codec;
+
+		int ret = mp_open_codec(d, hw);
+		if (ret < 0) {
+			blog(LOG_WARNING, "MP: Failed to open %s decoder: %s", av_get_media_type_string(type),
+			     av_err2str(ret));
+			d->codec = NULL;
+			return false;
+		}
+
+		d->params = avcodec_parameters_alloc();
+		if (d->params)
+			avcodec_parameters_copy(d->params, stream->codecpar);
+		d->params_hw = hw;
+		d->params_gpu_direct = m->gpu_direct;
+
+#if LIBAVCODEC_VERSION_MAJOR < 60
+		if (d->codec->capabilities & CODEC_CAP_TRUNC)
+			d->decoder->flags |= CODEC_FLAG_TRUNC;
+#endif
 	}
 
-	d->sw_frame = av_frame_alloc();
-	if (!d->sw_frame) {
+	if (!audio)
+		d->max_luminance = get_max_luminance(stream);
+
+	if (!d->sw_frame)
+		d->sw_frame = av_frame_alloc();
+	if (d->hw && !d->hw_frame)
+		d->hw_frame = av_frame_alloc();
+	if (!d->orig_pkt)
+		d->orig_pkt = av_packet_alloc();
+	if (!d->pkt)
+		d->pkt = av_packet_alloc();
+
+	if (!d->sw_frame || (d->hw && !d->hw_frame) || !d->orig_pkt || !d->pkt) {
 		blog(LOG_WARNING, "MP: Failed to allocate %s frame", av_get_media_type_string(type));
 		return false;
 	}
 
-	if (d->hw) {
-		d->hw_frame = av_frame_alloc();
-		if (!d->hw_frame) {
-			blog(LOG_WARNING, "MP: Failed to allocate %s hw frame", av_get_media_type_string(type));
-			return false;
-		}
-
-		d->in_frame = d->hw_frame;
-	} else {
-		d->in_frame = d->sw_frame;
-	}
-
-#if LIBAVCODEC_VERSION_MAJOR < 60
-	if (d->codec->capabilities & CODEC_CAP_TRUNC)
-		d->decoder->flags |= CODEC_FLAG_TRUNC;
-#endif
-
-	d->orig_pkt = av_packet_alloc();
-	d->pkt = av_packet_alloc();
+	d->in_frame = d->hw ? d->hw_frame : d->sw_frame;
+	d->frame = NULL;
+	d->frame_ready = false;
+	d->eof = false;
+	d->got_first_keyframe = false;
+	d->frame_pts = 0;
+	d->next_pts = 0;
+	d->last_duration = 0;
+	d->packet_pending = false;
 
 	return true;
 }
 
-extern void mp_media_free_packet(mp_media_t *m, AVPacket *pkt);
+extern void mp_media_free_packet(struct media_playback *m, AVPacket *pkt);
 
 void mp_decode_clear_packets(struct mp_decode *d)
 {
@@ -238,16 +366,11 @@ void mp_decode_free(struct mp_decode *d)
 		av_free(d->hw_frame);
 	}
 
-	if (d->decoder)
-		avcodec_free_context(&d->decoder);
+	mp_decode_close_codec(d);
 
 	if (d->sw_frame) {
 		av_frame_unref(d->sw_frame);
 		av_free(d->sw_frame);
-	}
-
-	if (d->hw_ctx) {
-		av_buffer_unref(&d->hw_ctx);
 	}
 
 	memset(d, 0, sizeof(*d));
@@ -312,6 +435,18 @@ static int decode_packet(struct mp_decode *d, int *got_frame)
 		if (d->hw_frame->format != d->hw_format) {
 			d->frame = d->hw_frame;
 			return ret;
+		}
+
+		/* A frame that is to be drawn off the GPU stays there: it is
+		 * handed out as the surface it was decoded into. Only the two
+		 * layouts the drawing side imports go that way. */
+		if (d->m->gpu_direct && d->m->hw_type == mp_decode_gpu_direct_type() && d->hw_frame->hw_frames_ctx) {
+			const AVHWFramesContext *fc = (const AVHWFramesContext *)d->hw_frame->hw_frames_ctx->data;
+
+			if (fc->sw_format == AV_PIX_FMT_NV12 || fc->sw_format == AV_PIX_FMT_P010) {
+				d->frame = d->hw_frame;
+				return ret;
+			}
 		}
 
 		/* the frame history keeps references to sw_frame's buffers
@@ -415,15 +550,10 @@ bool mp_decode_next(struct mp_decode *d)
 		else
 			duration = av_rescale_q(duration, d->stream->time_base, (AVRational){1, 1000000000});
 
-		if (d->m->speed != 100) {
-			d->frame_pts = av_rescale_q(d->frame_pts, (AVRational){1, d->m->speed}, (AVRational){1, 100});
-			duration = av_rescale_q(duration, (AVRational){1, d->m->speed}, (AVRational){1, 100});
-		}
-
 		d->last_duration = duration;
 		d->next_pts = d->frame_pts + duration;
 
-		if (!d->audio && d->m->is_local_file && !d->m->full_decode)
+		if (!d->audio && d->m->is_local_file)
 			mp_media_hist_push(d->m, d);
 	}
 

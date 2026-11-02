@@ -41,20 +41,35 @@ extern "C" {
 #define CODEC_FLAG_TRUNC AV_CODEC_FLAG_TRUNCATED
 #endif
 
-struct mp_media;
+struct media_playback;
 
+/* One stream of the file that is open, and the decoder for it.
+ *
+ * Timestamps here are media time: nanoseconds on the file's own timeline,
+ * whatever speed it is being played at. Speed is applied by the playback clock
+ * when a frame is handed out, never to the timestamps themselves, so nothing
+ * decoded ever has to be rescaled when the speed changes.
+ *
+ * The decoder outlives the file. A new file whose stream has the same codec
+ * parameters as the last one - which is every clip a replay buffer writes - is
+ * decoded by the same decoder, flushed, rather than by a new one. */
 struct mp_decode {
-	struct mp_media *m;
+	struct media_playback *m;
 	AVStream *stream;
 	bool audio;
 
 	AVCodecContext *decoder;
-	AVBufferRef *hw_ctx;
+	/* what the decoder was opened with, to tell whether the next file's
+	 * stream can be handed to it as it is */
+	AVCodecParameters *params;
+	bool params_hw;
+	bool params_gpu_direct;
 	const AVCodec *codec;
 
 	int64_t last_duration;
 	int64_t frame_pts;
 	int64_t next_pts;
+
 	AVFrame *in_frame;
 	AVFrame *sw_frame;
 	AVFrame *hw_frame;
@@ -64,6 +79,7 @@ struct mp_decode {
 	bool frame_ready;
 	bool eof;
 	bool hw;
+
 	uint16_t max_luminance;
 
 	AVPacket *orig_pkt;
@@ -72,7 +88,17 @@ struct mp_decode {
 	struct deque packets;
 };
 
-extern bool mp_decode_init(struct mp_media *media, enum AVMediaType type, bool hw);
+/* how many surfaces the decoder's pool is given on top of what it needs, for the
+ * frames held while they wait to be drawn off the GPU */
+#define MP_GPU_EXTRA_SURFACES 12
+
+/* the decoder whose frames can be drawn off the GPU on this platform, or
+ * AV_HWDEVICE_TYPE_NONE */
+extern enum AVHWDeviceType mp_decode_gpu_direct_type(void);
+
+/* Gets 'd' ready to decode 'stream' of the file that has just been opened,
+ * reusing the decoder it already has when the stream's parameters match. */
+extern bool mp_decode_open(struct mp_decode *d, struct media_playback *m, AVStream *stream, bool audio, bool hw);
 extern void mp_decode_free(struct mp_decode *decode);
 
 extern void mp_decode_clear_packets(struct mp_decode *decode);

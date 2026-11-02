@@ -18,6 +18,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #pragma once
 
+#include <string.h>
+
 #include <obs-module.h>
 
 /* ids of the sources that emit the events below */
@@ -97,9 +99,10 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define WARP_MEDIA_ACTION_RESTART "restart"
 #define WARP_MEDIA_ACTION_LOADED "loaded"
 
-/* Puts a file in a Warp Media source, as a proc on the source itself:
+/* Puts a clip in a Warp Media source, as a proc on the source itself:
  *
- *   warp_media_load(string path, int speed, string playback)
+ *   warp_media_load(string path, int speed, string playback,
+ *                   int in_ms, int out_ms, int tail_ms, out int seq)
  *
  * The source is switched to that local file, played at 'speed' percent when
  * that is anything other than zero, and left doing whatever 'playback' says.
@@ -107,11 +110,41 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  * playback was left, so a Warp Detection filter can bring the source on screen
  * the moment a clip arrives.
  *
- * This is what a Warp Instant Replay flow calls; it is a proc rather than a
- * settings change so that holding a clip on its first frame - which has to
- * wait for the file to open and decode - is done by the source, on its own
- * tick, rather than by whoever handed the clip over. */
+ * in_ms and out_ms, when they are given, are where the clip starts and ends in
+ * the file; tail_ms makes the clip the last that many milliseconds of the file
+ * instead. The cut is frame-accurate and nothing is written to disk: the source
+ * plays that stretch of the file as though it were the whole of it, and its
+ * position and duration are those of the clip. All three are left out, or 0,
+ * to play the file whole.
+ *
+ * 'seq' comes back as the number of the load, which warp_media_ready answers
+ * for (see below).
+ *
+ * This is what a Warp Instant Replay flow calls, and what the Warp Playlist
+ * loads each of its files with. It is a proc rather than a settings change so
+ * the clip is loaded there and then, and the settings are only brought up to
+ * date to be saved. */
 #define WARP_MEDIA_LOAD_PROC "warp_media_load"
+
+/* Whether a Warp Media source has the clip it was last loaded with ready to go
+ * on screen:
+ *
+ *   warp_media_ready(out bool ready, out bool failed, out int seq)
+ *
+ * 'ready' once the file is open and, when it has video, a frame of it is in
+ * the source's texture - a frame of the clip that was in it before does not
+ * count; 'failed' once the file has turned out not to open; 'seq' is the number
+ * of the load both are about, as warp_media_load handed it back. */
+#define WARP_MEDIA_READY_PROC "warp_media_ready"
+
+/* Closes the file a Warp Media source has open and clears its picture, keeping
+ * the source itself for the next one to be loaded into:
+ *
+ *   warp_media_close()
+ *
+ * The Warp Playlist keeps the items it has played this way rather than making a
+ * new one for every file. The settings are left alone. */
+#define WARP_MEDIA_CLOSE_PROC "warp_media_close"
 
 /* what playback does with a file that has just been loaded:
  *
@@ -176,4 +209,97 @@ static inline void warp_signal_media_action(obs_source_t *source, const char *ac
 	calldata_set_string(&cd, "action", action);
 
 	signal_handler_signal(obs_source_get_signal_handler(source), WARP_SIGNAL_MEDIA_ACTION, &cd);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Warp Playlist clips
+ *
+ * A file in a Warp Playlist can be played as a clip of itself: from an in point
+ * to an out point, or as its last few seconds, and at a speed of its own. The
+ * file list stays a list of paths, the way OBS's editable list keeps it; what
+ * each file is cut to is kept beside it in the playlist's settings, under
+ * WARP_PL_CLIPS_KEY, as an array of objects keyed by path:
+ *
+ *   {"path": "...", "in_ms": 0, "out_ms": 0, "tail_ms": 8000, "speed": 0}
+ *
+ * A file with no entry is played whole, at the playlist's speed, and an entry
+ * for a file that is no longer in the list is ignored. A Warp Playlist flow
+ * writes one for every clip it adds with a length, which is what makes the clip
+ * that length: the replay buffer's file is played from that far before its
+ * end, rather than being cut into a file of its own first. */
+#define WARP_PL_CLIPS_KEY "clips"
+#define WARP_PL_CLIP_PATH "path"
+#define WARP_PL_CLIP_IN_MS "in_ms"
+#define WARP_PL_CLIP_OUT_MS "out_ms"
+#define WARP_PL_CLIP_TAIL_MS "tail_ms"
+#define WARP_PL_CLIP_SPEED "speed"
+
+/* Sets what 'path' is played as in a playlist's 'settings'. All four values
+ * at zero takes the entry out, so the file is played whole. */
+static inline void warp_pl_clips_set(obs_data_t *settings, const char *path, long long in_ms, long long out_ms,
+				     long long tail_ms, long long speed)
+{
+	obs_data_array_t *clips = obs_data_get_array(settings, WARP_PL_CLIPS_KEY);
+	obs_data_array_t *next = obs_data_array_create();
+	size_t count = clips ? obs_data_array_count(clips) : 0;
+
+	for (size_t i = 0; i < count; i++) {
+		obs_data_t *clip = obs_data_array_item(clips, i);
+
+		if (strcmp(obs_data_get_string(clip, WARP_PL_CLIP_PATH), path) != 0)
+			obs_data_array_push_back(next, clip);
+
+		obs_data_release(clip);
+	}
+
+	if (in_ms || out_ms || tail_ms || speed) {
+		obs_data_t *clip = obs_data_create();
+
+		obs_data_set_string(clip, WARP_PL_CLIP_PATH, path);
+		obs_data_set_int(clip, WARP_PL_CLIP_IN_MS, in_ms);
+		obs_data_set_int(clip, WARP_PL_CLIP_OUT_MS, out_ms);
+		obs_data_set_int(clip, WARP_PL_CLIP_TAIL_MS, tail_ms);
+		obs_data_set_int(clip, WARP_PL_CLIP_SPEED, speed);
+		obs_data_array_push_back(next, clip);
+		obs_data_release(clip);
+	}
+
+	obs_data_set_array(settings, WARP_PL_CLIPS_KEY, next);
+	obs_data_array_release(next);
+	obs_data_array_release(clips);
+}
+
+/* Takes the entries for files that are no longer in the playlist out of its
+ * 'settings', so clips that have dropped off the end of a list do not pile
+ * up in the scene collection. */
+static inline void warp_pl_clips_prune(obs_data_t *settings)
+{
+	obs_data_array_t *clips = obs_data_get_array(settings, WARP_PL_CLIPS_KEY);
+	obs_data_array_t *files = obs_data_get_array(settings, "playlist");
+	obs_data_array_t *next = obs_data_array_create();
+	size_t count = clips ? obs_data_array_count(clips) : 0;
+	size_t file_count = files ? obs_data_array_count(files) : 0;
+
+	for (size_t i = 0; i < count; i++) {
+		obs_data_t *clip = obs_data_array_item(clips, i);
+		const char *path = obs_data_get_string(clip, WARP_PL_CLIP_PATH);
+		bool listed = false;
+
+		for (size_t j = 0; j < file_count && !listed; j++) {
+			obs_data_t *file = obs_data_array_item(files, j);
+
+			listed = strcmp(obs_data_get_string(file, "value"), path) == 0;
+			obs_data_release(file);
+		}
+
+		if (listed)
+			obs_data_array_push_back(next, clip);
+
+		obs_data_release(clip);
+	}
+
+	obs_data_set_array(settings, WARP_PL_CLIPS_KEY, next);
+	obs_data_array_release(next);
+	obs_data_array_release(files);
+	obs_data_array_release(clips);
 }

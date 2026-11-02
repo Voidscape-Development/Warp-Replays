@@ -8,11 +8,15 @@ Warp is an OBS Studio plugin for handling replays at video game events and in an
 
 A media source based on OBS Studio's built-in Media Source, with the same properties and behavior, plus live playback control designed for replay operation:
 
-* **On-the-fly playback speed** from 10% to 400%, changed without restarting or losing the current position:
+* **On-the-fly playback speed** from 10% to 400%, changed without restarting or losing the current position. The sound keeps its pitch at any speed, so a slow-motion replay sounds slowed down rather than deeper; turn *Keep pitch at other speeds* off in the source settings for the old effect, where the pitch moves with the speed:
   * Speed Up (+10%) / Slow Down (-10%) / Reset Speed (100%) hotkeys
   * Preset speed hotkeys: 25%, 50%, 125%, 150%, 200%
   * The Speed property in the source settings also applies live
 * **Frame stepping** hotkeys: step 1, 5, 10, or 20 frames forward or backward. Stepping while the video is playing pauses it first; stepping is frame-accurate, including backward steps.
+* **Clips of a file**: a clip loaded into the source can be played from an in point to an out point, or as the last so many seconds of its file. The cut is frame-accurate and nothing is written to disk — the source plays that stretch of the file as if it were the whole of it, and the media controls show the clip's own position and length. This is how an [instant replay flow](#instant-replays) keeps the last few seconds of a save, and it is open to scripts and obs-websocket through `LoadClip`.
+* **Draws its own picture**: the source picks the frame due for each video frame by its own playback clock, and uploads and converts only that one — with the same shaders, and the same handling of colour range, colour space and HDR, that OBS uses for a media source. A source that is off screen keeps its latest frame and puts it up the moment it is shown, so a clip loaded or held off air has picture from its first frame on air. OBS's right-click *Deinterlacing* option is for sources OBS draws itself, so it does not apply to a Warp Media source; replay buffer recordings are progressive and do not need it.
+* **GPU direct decoding** (experimental, off by default): with hardware decoding on, *Draw decoded video straight from the GPU* draws each frame where the GPU decoded it, instead of copying it back to memory and uploading it again — which is most of the cost of playing 1080p60 and 4K clips. Windows (D3D11) and Linux (VAAPI). If it does not work on a machine, the source says so in the OBS log and goes back to copying, so the picture is never lost. macOS keeps copying for now; see [ROADMAP.md](ROADMAP.md).
+* **Seamless reloads**: loading a new clip keeps the picture that is up on screen until the new clip has a frame to replace it with, so a clip landing in a source that is on air cuts from one picture to the next rather than flashing black. The source keeps its decoder from one clip to the next, so a clip loads in a few milliseconds.
 * **Zoom and framing** of the clip that is loaded — see [zoom](#zoom). The framing goes back to the whole picture as each clip lands, so an [instant replay](#instant-replays) arrives ready to go on screen rather than still zoomed into the last one.
 
 All hotkeys are per-source and are bound in OBS under Settings → Hotkeys. Every one of these actions can also be driven from outside OBS — see [obs-websocket control](#obs-websocket-control).
@@ -30,6 +34,9 @@ A playlist source in the spirit of the VLC video source, built on the same playb
   * **Scaling** and **alignment**, for playlists whose files are not all the same size.
   * **Use a different transition when going back**, asked just above the transition sections, which gives moving back through the playlist a transition of its own — a second section with its own transition, properties, duration, scaling and alignment. The first section is then the one the playlist goes forward with: automatic advance, Next Video and starting the playlist over. With the option off, the one transition handles both directions. Both transitions are kept live and set up separately, so a stinger for going back keeps its own video loaded and is ready the moment it is asked for, and the picture is handed from one to the other as the direction changes rather than blinking out in between. Going back has no timing setting of its own: only automatic advance is placed against the end of a file, and that only ever moves forward.
 * **Playback speed and frame stepping** for the file that is playing, with the same hotkeys as the Warp Media source. The speed resets to the configured Speed value whenever the playlist moves to another file.
+* **Clips of a file**: each file in the list can be played as a clip of itself — from an in point to an out point, or as its last so many seconds — and at a speed of its own, set with `SetClip` over obs-websocket or by a [flow](#warp-flows) with a clip length. A file with nothing set is played whole, at the playlist's speed.
+* **Play next**: a file can be put in front of whatever the playlist would play next, with `PlayNext`. Once it has played, the playlist picks up where it would have been.
+* **Previous is as quick as Next**: the file before the one that is playing is kept parked on its first frame, so going back to it does not wait for it to open. A file that cannot be opened is skipped as soon as that is known, and a playlist none of whose files can be opened stops rather than going round them.
 * **Zoom and framing** for the video that is playing — see [zoom](#zoom) — with the same rule the speed follows: the framing belongs to the video, not to the playlist. Zoom into a corner of one replay and the playlist moves on to the next file at the whole picture, ready to go, however far in the last one was left. The file being transitioned away from keeps the framing it was being watched at, so it plays out the transition as it was on screen while the incoming one is already framed at the top.
 * **Audio in the OBS mixer.** The playlist hands OBS the sound of the file that is playing as its own, the way any other source does, so it sits in the audio mixer with a fader, a mute, monitoring, audio filters and its own track routing. The files themselves are played only through the playlist, so the fader is the last word on how loud it is. A transition crossfades the two files it is holding, and a stinger brings its own sound with it.
 * **Volume**, from silent to 100% of the audio in the files themselves, and **Transition Volume**, the same for the sound a stinger brings with it, which appears alongside it while a stinger is picked. They are set before the playlist reaches the mixer, so the fader, mute, monitoring and audio filters all still apply on top of them. Both apply live, to the file that is playing as well as to the ones after it, so a playlist of clips recorded far louder than the rest of the show can be turned down without touching the files — and because the two levels are separate, a playlist can be run silent while its stinger still sounds.
@@ -192,7 +199,7 @@ Every request names the source it applies to, with `sourceName` or `sourceUuid`.
 | `StepBackward` | `frames` | Steps backward |
 | `GetStatus` | | Changes nothing, and answers with where playback stands |
 
-Five more apply to a Warp Playlist source, and answer with an error when they are sent to a Warp Media source:
+Eight more apply to a Warp Playlist source, and answer with an error when they are sent to a Warp Media source:
 
 | Request | What it does |
 | --- | --- |
@@ -201,6 +208,15 @@ Five more apply to a Warp Playlist source, and answer with an error when they ar
 | `First` | Back to the first video |
 | `RestartCurrent` | Restarts the video that is playing |
 | `ClearPlaylist` | Clears the playlist, exactly as the hotkey does — the file list is emptied for good, and written to the log first |
+| `PlayNext` | Plays a file next, named by `file` (its path) or `index` (its place in the file list, from 0), ahead of whatever the playlist would have gone on to. Files asked for this way play in the order they were asked for, then the playlist picks up where it would have been. The file has to be in the list |
+| `ClearQueue` | Forgets the files asked to play next. The playlist carries on from the file that is playing |
+| `SetClip` | Sets what a file in the list, named by `file`, is played as: from `inMs` to `outMs`, or as its last `tailMs`, in milliseconds, and at `speed` percent. Fields left out are 0, which is the start and end of the file and the playlist's own speed; all of them 0 plays the file whole again. It applies the next time the file is played, and is saved with the playlist |
+
+One applies to a Warp Media source only:
+
+| Request | What it does |
+| --- | --- |
+| `LoadClip` | Loads the file named by `file`, as `playback` says — `keep`, `play` or `hold`, as the [instant replay](#instant-replays) settings describe — at `speed` percent when it is given. `inMs` and `outMs` play it from and to those points, and `tailMs` plays its last that many milliseconds instead. The cut is frame-accurate and nothing is written to disk |
 
 Nine more frame the source rather than driving playback, and are the one group that is not limited to the Warp sources: they work on anything that can be zoomed, which is a Warp source or any source carrying a [Warp Zoom filter](#the-warp-zoom-filter). Add `filterName` to name which filter to frame with when a source carries more than one; without it the source's own zoom is used, or the one filter it has.
 
@@ -236,7 +252,7 @@ Every response says whether the request was carried out, and reports where playb
 }
 ```
 
-Every response also reports `zoom`, `zoomX` and `zoomY` — how the source is framed, in percent — along with `zoomFilter` when the framing lives in a filter rather than in the source itself, so a zoom can be followed without asking for it separately. `zoomConfirm` says whether that source lines shots up, and `zoomStaged` whether one is waiting; when one is, `zoomStagedZoom`, `zoomStagedX` and `zoomStagedY` are the shot it would take. A Warp Playlist source also reports `playlistIndex` (-1 when nothing is playing), `playlistLength` and `currentFile`. A request that could not be carried out — no such source, a source that is not a Warp source, or a value outside the range the action takes — answers with `"success": false` and an `error` saying what was wrong, and changes nothing.
+Every response also reports `zoom`, `zoomX` and `zoomY` — how the source is framed, in percent — along with `zoomFilter` when the framing lives in a filter rather than in the source itself, so a zoom can be followed without asking for it separately. `zoomConfirm` says whether that source lines shots up, and `zoomStaged` whether one is waiting; when one is, `zoomStagedZoom`, `zoomStagedX` and `zoomStagedY` are the shot it would take. A Warp Playlist source also reports `playlistIndex` (-1 when nothing is playing), `playlistLength`, `currentFile`, and `playlistQueued`, the number of files asked to play next. A request that could not be carried out — no such source, a source that is not a Warp source, or a value outside the range the action takes — answers with `"success": false` and an `error` saying what was wrong, and changes nothing.
 
 The requests do exactly what the matching hotkeys do, including emitting the signals above, so a Warp Detection filter reacts to a speed change driven over the websocket the same way it reacts to the hotkey. The difference is that a hotkey only applies to a source that is on screen, because the operator is pressing it at whatever is in front of them, while a request names the source it means and is carried out whether or not it is being shown. There are two exceptions, one either way. `Restart` on a Warp Media source only restarts playback while the source is being shown, over the websocket as from the hotkey. `ClearPlaylist` edits the file list rather than driving playback, so its hotkey is carried out whether or not the playlist is on screen, the same as the request.
 
@@ -248,7 +264,7 @@ Three more work on a [Warp flow](#warp-flows) rather than on a source, and name 
 | `AddLastReplayToFlow` | Puts the replay that was saved last in that flow, as its Add Last Saved Clip hotkey does |
 | `GetFlows` | Changes nothing, and answers with every flow in the scene collection |
 
-`SaveToFlow` and `AddLastReplayToFlow` also take `seconds`, which asks for a clip of that length rather than the one the flow keeps — `0` for the whole of what the replay buffer wrote, up to 3600, and anything a [clip length](#clip-lengths) can be. A length asked for this way is the length of that clip, so the flows it is handed on to are fed the same cut. Left out, each flow keeps what it is set to.
+`SaveToFlow` and `AddLastReplayToFlow` also take `seconds`, which asks for a clip of that length rather than the one the flow keeps — `0` for the whole of what the replay buffer wrote, up to 3600, and anything a [clip length](#clip-lengths) can be. A length asked for this way is the length of that clip, so the flows it is handed on to are fed the same length. Left out, each flow keeps what it is set to.
 
 ```json
 {"vendorName": "warp", "requestType": "SaveToFlow",
@@ -279,7 +295,10 @@ The playlist actions that have no counterpart in OBS's media control API are pro
 warp_set_speed(int speed)          warp_playlist_first()
 warp_adjust_speed(int delta)       warp_playlist_restart_current()
 warp_get_speed(out int speed)      warp_playlist_clear()
-warp_step_frames(int frames)       warp_playlist_status(out int index, out int count, out string current_file)
+warp_step_frames(int frames)       warp_playlist_status(out int index, out int count, out string current_file, out int queued)
+warp_playlist_queue(string path, int index, out bool queued)
+warp_playlist_clear_queue()
+warp_playlist_set_clip(string path, int in_ms, int out_ms, int tail_ms, int speed)
 ```
 
 Everything that can be zoomed carries the framing procs as well, which is how the dock, the websocket requests and a Warp Detection filter all drive it without caring which kind of source they are holding:
@@ -298,7 +317,15 @@ warp_zoom_drop(out bool dropped)
 
 These take the zoom as a factor from 1 to 8 and the position from 0 to 1, rather than the percentages the websocket requests and the properties use. `warp_zoom_presets` answers with the presets as JSON, since a calldata cannot carry an array.
 
-The first four playlist procs are on the Warp Media source as well, along with `warp_media_load(string path, int speed, string playback)`, which points the source at a file and says what playback does with it — `keep`, `play` or `hold`, as the [Instant Replay flow](#instant-replays) settings describe. It is what an instant replay flow calls, and it emits the source's `loaded` media action. Play, pause, stop, restart, next, previous and seeking are OBS's own media controls on both sources, so obs-websocket's built-in `TriggerMediaInputAction`, `SetMediaInputCursor` and `GetMediaInputStatus` requests work on them too.
+The first four playlist procs are on the Warp Media source as well, along with three of its own:
+
+```
+warp_media_load(string path, int speed, string playback, int in_ms, int out_ms, int tail_ms, out int seq)
+warp_media_ready(out bool ready, out bool failed, out int seq)
+warp_media_close()
+```
+
+`warp_media_load` loads a file into the source and says what playback does with it — `keep`, `play` or `hold`, as the [Instant Replay flow](#instant-replays) settings describe — and, with `in_ms`, `out_ms` or `tail_ms`, which stretch of the file is the clip. It is what an instant replay flow calls, and what the Warp Playlist loads each of its files with, and it emits the source's `loaded` media action. It answers with `seq`, the number of the load; `warp_media_ready` says whether that load has a picture in the source yet, or `failed` once the file has turned out not to open. `warp_media_close` closes the file and clears the picture. Play, pause, stop, restart, next, previous and seeking are OBS's own media controls on both sources, so obs-websocket's built-in `TriggerMediaInputAction`, `SetMediaInputCursor` and `GetMediaInputStatus` requests work on them too.
 
 ### Warp flows
 
@@ -347,20 +374,20 @@ Flows are saved with the scene collection, alongside the sources they feed, so a
 
 Every flow action can also be driven from outside OBS — see [obs-websocket control](#obs-websocket-control).
 
-What a flow is doing is said in the **OBS status bar**, along the bottom of the main window, where OBS itself says a replay was saved: a save on its way for a flow, a clip being cut, the flows a clip landed in, and — held up longer, since it is the one that needs doing something about — a flow that could not take a clip because its source has gone, or a clip that could not be cut and went in whole. It works the same whether the flow was driven by a hotkey, by obs-websocket or by listening. The OBS log stays the full record; the status bar is the line an operator can glance at mid-show.
+What a flow is doing is said in the **OBS status bar**, along the bottom of the main window, where OBS itself says a replay was saved: a save on its way for a flow, the flows a clip landed in, and — held up longer, since it is the one that needs doing something about — a flow that could not take a clip because its source has gone. It works the same whether the flow was driven by a hotkey, by obs-websocket or by listening. The OBS log stays the full record; the status bar is the line an operator can glance at mid-show.
 
 #### Clip lengths
 
-The OBS replay buffer writes everything it is holding, so a save is as long as the buffer is — usually long enough for the worst case, which is longer than most moments are worth. A flow set to keep less than that has its clip **cut from the file the buffer wrote**: the picture and sound are copied across as they were encoded, into a file of its own beside the original, named after it with the length on the end — `Replay 2026-09-14 10-11-12-10s.mkv`. Nothing is encoded again, so a cut takes a moment and costs no quality, and **the file OBS wrote is left exactly where it is**. It is the cut that flows are fed.
+The OBS replay buffer writes everything it is holding, so a save is as long as the buffer is — usually long enough for the worst case, which is longer than most moments are worth. A flow set to keep less than that is handed **the file the buffer wrote, with the length it keeps**, and its source plays that much of the end of the file: a Warp Media source loads it as a clip of the file, and a Warp Playlist source lists the file and keeps the length beside it. Nothing is cut, copied or encoded again, so a clip lands the moment it is saved, and **the file OBS wrote is left exactly as it is**.
 
-The cut lands on the nearest keyframe before the mark, so a clip can run a little longer than it was asked for — by up to the recording's keyframe interval, two seconds at OBS's default. A shorter keyframe interval in Settings → Output tightens it up. A length longer than the buffer is holding is not an error either: there is nothing to cut off, and the whole clip is kept.
+The clip starts on the exact frame, however the recording was encoded — there is no rounding back to a keyframe. A length longer than the buffer is holding is not an error either: the whole clip is played.
 
 Two ways to ask for one:
 
-* **The flow's own length**, in its properties. Every save that flow takes is cut to it, including the ones it takes by listening. Flows are cut one at a time, so a replay list keeping 10 seconds and a highlight list keeping 30 are both fed from the same save, each getting its own.
-* **A length hotkey**, from the flow's *Other lengths*. A length asked for out loud is the length of that clip, so the flows it is handed on to are fed the same cut rather than each taking their own — press *Save 5s Replay to Match Replays* and the highlight list linked to it gets the same five seconds.
+* **The flow's own length**, in its properties. Every save that flow takes is kept to it, including the ones it takes by listening, so a replay list keeping 10 seconds and a highlight list keeping 30 are both fed from the same save, each getting its own.
+* **A length hotkey**, from the flow's *Other lengths*. A length asked for out loud is the length of that clip, so the flows it is handed on to are fed the same length rather than each taking their own — press *Save 5s Replay to Match Replays* and the highlight list linked to it gets the same five seconds.
 
-Cutting is done off the UI thread, one clip at a time, so saving never holds OBS up and clips land in the order they were saved. A cut that cannot be made for any reason is not a clip lost: the flow is fed the whole one instead, and the log says why.
+A playlist holds each file once, so two flows feeding the same playlist with different lengths share the entry for that file, and the one that lands last sets its length.
 
 #### Instant replays
 
@@ -382,11 +409,19 @@ An instant replay flow takes clips the same way the list kinds do — from its o
 
 The Warp window shows an instant replay flow as *Loaded* or *Empty* rather than as a count, and what it does with a clip where a list shows its order.
 
+## Roadmap
+
+Ideas that are designed but not built yet live in [ROADMAP.md](ROADMAP.md), with notes to pick them up from:
+
+* **In-memory replay buffer** — keep the last few minutes of the stream's encoded packets in memory and play replays straight out of them, with no save to wait for.
+* **GPU direct decoding on macOS**, and verifying the Windows and Linux paths on more hardware.
+* Background probing of playlist files, a playlist panel in the Warp window, deinterlacing, and the test harness in CI.
+
 ## Building
 
 This plugin is based on the [OBS plugin template](https://github.com/obsproject/obs-plugintemplate) and builds the same way. See the template's [wiki](https://github.com/obsproject/obs-plugintemplate/wiki) for build system requirements and options.
 
-In addition to the template's requirements, the plugin links against FFmpeg (`avcodec`, `avdevice`, `avformat`, `avutil`, `swscale`). On Linux, install the corresponding `-dev` packages; on Windows and macOS the obs-deps prebuilt dependencies already include FFmpeg.
+In addition to the template's requirements, the plugin links against FFmpeg (`avcodec`, `avdevice`, `avfilter`, `avformat`, `avutil`, `swscale`). On Linux, install the corresponding `-dev` packages; on Windows and macOS the obs-deps prebuilt dependencies already include FFmpeg.
 
 Quick start on Linux:
 
@@ -399,4 +434,4 @@ GitHub Actions workflows build the plugin for Windows, macOS, and Ubuntu on ever
 
 ## License
 
-GNU General Public License v2.0 (or later). `src/obs-websocket-api.h` is the header [obs-websocket](https://github.com/obsproject/obs-websocket) ships for plugins that add vendor requests, taken as-is (GPL v2.0 or later). The `src/media-playback` directory is adapted from [obs-studio](https://github.com/obsproject/obs-studio)'s `deps/media-playback` library (see `src/media-playback/LICENSE`), extended with on-the-fly speed changes and frame stepping. `src/warp-source.c` is adapted from obs-studio's Media Source (`plugins/obs-ffmpeg/obs-ffmpeg-source.c`).
+GNU General Public License v2.0 (or later). `src/obs-websocket-api.h` is the header [obs-websocket](https://github.com/obsproject/obs-websocket) ships for plugins that add vendor requests, taken as-is (GPL v2.0 or later). The `src/media-playback` directory is adapted from [obs-studio](https://github.com/obsproject/obs-studio)'s `deps/media-playback` library (see `src/media-playback/LICENSE`), rebuilt around a single playback clock and a command queue, with on-the-fly speed changes, frame-accurate seeking and stepping, clips of a file, and files loaded into a long-lived engine. `src/warp-source.c` is adapted from obs-studio's Media Source (`plugins/obs-ffmpeg/obs-ffmpeg-source.c`). `src/warp-video.c` follows obs-studio's own drawing of async video (`libobs/obs-source.c`), and `data/shaders/format_conversion.effect` and `data/shaders/color.effect` are obs-studio's colour conversion shaders (`libobs/data`, OBS Studio 32.2), GPL v2.0 or later.

@@ -33,7 +33,6 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "warp-events.h"
 #include "warp-flow.h"
 #include "warp-status.h"
-#include "warp-trim.h"
 
 /* the speed a flow plays a clip at is the source's speed, so the range the UI
  * offers has to be the range the source takes */
@@ -97,12 +96,13 @@ struct warp_flow_delivery {
 	char *flow_name;
 	char *target_uuid;
 	char *target_name;
-	/* how much of the clip this flow is fed, and the file that turned out
-	 * to be: the whole one, or the cut made from it */
+	/* How much of the clip this flow is fed, and the file it is in. The
+	 * file is always the one the replay buffer wrote: a flow that takes
+	 * less than all of it is handed the file with the length it wants, and
+	 * the source plays that much of the end of it. Nothing is cut or
+	 * written to disk. */
 	int seconds;
 	char *path;
-	/* it was meant to be cut, and could not be, so it is fed whole */
-	bool uncut;
 	enum warp_flow_outcome outcome;
 	/* a Warp Media source holding the one clip, rather than a Warp Playlist
 	 * source holding a list of them */
@@ -997,6 +997,13 @@ static void warp_flow_deliver_playlist(struct warp_flow_delivery *d, const char 
 
 		obs_data_set_array(settings, WARP_FLOW_PLAYLIST_KEY, next);
 		obs_data_array_release(next);
+
+		/* the clip is played as its last 'seconds', and the files that
+		 * fell off the end of the list take their entries with them */
+		if (d->seconds > 0)
+			warp_pl_clips_set(settings, path, 0, 0, (long long)d->seconds * 1000, 0);
+		warp_pl_clips_prune(settings);
+
 		obs_source_update(target, settings);
 
 		warp_flow_count_clip(d->flow_id);
@@ -1042,6 +1049,8 @@ static void warp_flow_deliver_instant(struct warp_flow_delivery *d, const char *
 	calldata_set_string(&cd, "path", path);
 	calldata_set_string(&cd, "playback", d->playback ? d->playback : WARP_MEDIA_LOAD_KEEP);
 	calldata_set_int(&cd, "speed", d->speed);
+	/* a flow that takes less than the whole buffer plays the end of it */
+	calldata_set_int(&cd, "tail_ms", d->seconds > 0 ? (long long)d->seconds * 1000 : 0);
 
 	bool loaded = proc_handler_call(obs_source_get_proc_handler(target), WARP_MEDIA_LOAD_PROC, &cd);
 
@@ -1230,7 +1239,6 @@ static void warp_flow_report(const struct warp_flow_plan *plan, const char *path
 	struct dstr fed = {0};
 	struct dstr failed = {0};
 	bool fresh = false;
-	bool uncut = false;
 
 	for (size_t i = 0; i < plan->items.num; i++) {
 		const struct warp_flow_delivery *d = &plan->items.array[i];
@@ -1239,7 +1247,6 @@ static void warp_flow_report(const struct warp_flow_plan *plan, const char *path
 		switch (d->outcome) {
 		case WARP_FLOW_FED:
 			fresh = true;
-			uncut = uncut || d->uncut;
 			list = &fed;
 			break;
 		case WARP_FLOW_ALREADY_THERE:
@@ -1270,8 +1277,6 @@ static void warp_flow_report(const struct warp_flow_plan *plan, const char *path
 		if (!fresh)
 			warp_status_post(WARP_STATUS_SHORT_MS, obs_module_text("Warp.Status.AlreadyThere"), name,
 					 fed.array);
-		else if (uncut)
-			warp_status_post(WARP_STATUS_LONG_MS, obs_module_text("Warp.Status.FedUncut"), name, fed.array);
 		else
 			warp_status_post(WARP_STATUS_SHORT_MS, obs_module_text("Warp.Status.Fed"), name, fed.array);
 	}
@@ -1283,32 +1288,16 @@ static void warp_flow_report(const struct warp_flow_plan *plan, const char *path
 /* ------------------------------------------------------------------------- */
 /* carrying a plan out
  *
- * A flow that takes less than the whole buffer has its clip cut out of the file
- * the buffer wrote, which is disk work: it is done on a thread of its own so
- * that saving never holds the UI up, and on one thread so that clips land in
- * the order they were saved.
- *
- * The deliveries themselves are always made on the UI thread, which is where a
- * source is touched from - including for a plan with nothing to cut, which can
- * be started from obs-websocket's thread as well as from the UI. Started from
- * the UI, a plan with nothing to cut is carried out there and then. */
+ * The deliveries are always made on the UI thread, which is where a source is
+ * touched from - including for a plan started from obs-websocket's thread. A
+ * flow that takes less than the whole buffer is handed the whole file with the
+ * length it wants, so there is no disk work to wait for first. */
 
 struct warp_flow_job {
 	struct warp_flow_plan plan;
-	/* the file the replay buffer wrote, which every cut is made from */
+	/* the file the replay buffer wrote */
 	char *path;
 };
-
-/* Guards the queue below and whether the thread is there to take it. It is
- * made once and kept until the module is unloaded rather than going with the
- * thread, because a plan can be started from obs-websocket's thread at the
- * same moment OBS is shutting the thread down from the UI. */
-static pthread_mutex_t warp_flow_job_mutex;
-static pthread_cond_t warp_flow_job_cond;
-static DARRAY(struct warp_flow_job *) warp_flow_jobs;
-static pthread_t warp_flow_job_thread;
-static bool warp_flow_job_running = false;
-static bool warp_flow_job_stopping = false;
 
 static void warp_flow_job_free(struct warp_flow_job *job)
 {
@@ -1317,14 +1306,14 @@ static void warp_flow_job_free(struct warp_flow_job *job)
 	bfree(job);
 }
 
-/* on the UI thread, with every file in hand */
+/* on the UI thread */
 static void warp_flow_deliver_task(void *param)
 {
 	struct warp_flow_job *job = param;
 
-	/* Everything Warp had was given back while the clip was being cut.
-	 * Both this and the shutdown that clears the flows run on the UI
-	 * thread, so one is never half way through the other. */
+	/* Everything Warp had was given back while the task was queued. Both
+	 * this and the shutdown that clears the flows run on the UI thread, so
+	 * one is never half way through the other. */
 	if (warp_flow_ready) {
 		for (size_t i = 0; i < job->plan.items.num; i++)
 			warp_flow_deliver_one(&job->plan.items.array[i]);
@@ -1336,154 +1325,16 @@ static void warp_flow_deliver_task(void *param)
 	warp_flow_job_free(job);
 }
 
-/* Works out the file each flow in the plan is fed: the one the replay buffer
- * wrote, or the last few seconds of it cut into a file of their own. Flows
- * asking for the same length share a cut, so a save is one cut per length
- * however many flows it reaches. */
-static void warp_flow_job_cut(struct warp_flow_job *job)
-{
-	const char *name = warp_flow_file_name(job->path);
-
-	for (size_t i = 0; i < job->plan.items.num; i++) {
-		struct warp_flow_delivery *d = &job->plan.items.array[i];
-		char label[WARP_FLOW_LENGTH_LABEL_SIZE];
-		char *cut;
-
-		if (d->seconds <= 0) {
-			d->path = bstrdup(job->path);
-			continue;
-		}
-
-		for (size_t j = 0; j < i; j++) {
-			const struct warp_flow_delivery *other = &job->plan.items.array[j];
-
-			if (other->seconds == d->seconds && other->path) {
-				d->path = bstrdup(other->path);
-				d->uncut = other->uncut;
-				break;
-			}
-		}
-
-		if (d->path)
-			continue;
-
-		/* a cut takes a moment, and the clip is not anywhere until it is
-		 * made, so the operator is told it is on its way */
-		warp_flow_length_label(d->seconds, label, sizeof(label));
-		warp_status_post(WARP_STATUS_SHORT_MS, obs_module_text("Warp.Status.Cutting"), label, name);
-
-		/* A cut that could not be made is not a clip lost, and neither
-		 * is one there was nothing to take off: the flow is fed the
-		 * whole clip instead. Only the first is worth a word. */
-		d->uncut = warp_trim_tail(job->path, d->seconds, &cut) == WARP_TRIM_FAILED;
-		d->path = cut ? cut : bstrdup(job->path);
-	}
-}
-
-static void *warp_flow_job_thread_run(void *param)
-{
-	UNUSED_PARAMETER(param);
-
-	os_set_thread_name("warp-flow-cut");
-
-	for (;;) {
-		struct warp_flow_job *job;
-
-		pthread_mutex_lock(&warp_flow_job_mutex);
-
-		while (!warp_flow_job_stopping && !warp_flow_jobs.num)
-			pthread_cond_wait(&warp_flow_job_cond, &warp_flow_job_mutex);
-
-		if (warp_flow_job_stopping) {
-			pthread_mutex_unlock(&warp_flow_job_mutex);
-			break;
-		}
-
-		job = warp_flow_jobs.array[0];
-		da_erase(warp_flow_jobs, 0);
-
-		pthread_mutex_unlock(&warp_flow_job_mutex);
-
-		warp_flow_job_cut(job);
-		obs_queue_task(OBS_TASK_UI, warp_flow_deliver_task, job, false);
-	}
-
-	return NULL;
-}
-
-/* the queue and its lock, which last as long as the module does */
-static void warp_flow_jobs_init(void)
-{
-	pthread_mutex_init(&warp_flow_job_mutex, NULL);
-	pthread_cond_init(&warp_flow_job_cond, NULL);
-	da_init(warp_flow_jobs);
-}
-
-static void warp_flow_jobs_free(void)
-{
-	pthread_cond_destroy(&warp_flow_job_cond);
-	pthread_mutex_destroy(&warp_flow_job_mutex);
-}
-
-static void warp_flow_jobs_start(void)
-{
-	pthread_mutex_lock(&warp_flow_job_mutex);
-
-	if (!warp_flow_job_running) {
-		warp_flow_job_stopping = false;
-
-		if (pthread_create(&warp_flow_job_thread, NULL, warp_flow_job_thread_run, NULL) == 0)
-			warp_flow_job_running = true;
-		else
-			WARP_FLOW_LOG(LOG_WARNING, "there is no thread to cut clips on, so they will be fed whole");
-	}
-
-	pthread_mutex_unlock(&warp_flow_job_mutex);
-}
-
-static void warp_flow_jobs_stop(void)
-{
-	pthread_mutex_lock(&warp_flow_job_mutex);
-
-	if (!warp_flow_job_running) {
-		pthread_mutex_unlock(&warp_flow_job_mutex);
-		return;
-	}
-
-	warp_flow_job_stopping = true;
-	pthread_cond_signal(&warp_flow_job_cond);
-	pthread_mutex_unlock(&warp_flow_job_mutex);
-
-	pthread_join(warp_flow_job_thread, NULL);
-
-	pthread_mutex_lock(&warp_flow_job_mutex);
-
-	warp_flow_job_running = false;
-
-	/* a clip still waiting to be cut is not going anywhere now */
-	for (size_t i = 0; i < warp_flow_jobs.num; i++)
-		warp_flow_job_free(warp_flow_jobs.array[i]);
-
-	da_free(warp_flow_jobs);
-
-	pthread_mutex_unlock(&warp_flow_job_mutex);
-}
-
-/* Carries the plan out and takes it over: whatever has to be cut is cut first,
- * and the plan is freed once every flow in it has been fed. */
+/* Carries the plan out and takes it over; the plan is freed once every flow in
+ * it has been fed. */
 static void warp_flow_run_plan(struct warp_flow_plan *plan, const char *path)
 {
 	struct warp_flow_job *job;
-	bool cutting = false;
-	bool queued = false;
 
 	if (!plan->items.num) {
 		warp_flow_plan_free(plan);
 		return;
 	}
-
-	for (size_t i = 0; i < plan->items.num; i++)
-		cutting = cutting || plan->items.array[i].seconds > 0;
 
 	job = bzalloc(sizeof(struct warp_flow_job));
 	job->plan = *plan;
@@ -1493,29 +1344,8 @@ static void warp_flow_run_plan(struct warp_flow_plan *plan, const char *path)
 	da_init(plan->items);
 	da_init(plan->visited);
 
-	if (cutting) {
-		pthread_mutex_lock(&warp_flow_job_mutex);
-
-		if (warp_flow_job_running) {
-			da_push_back(warp_flow_jobs, &job);
-			pthread_cond_signal(&warp_flow_job_cond);
-			queued = true;
-		}
-
-		pthread_mutex_unlock(&warp_flow_job_mutex);
-
-		if (queued)
-			return;
-
-		WARP_FLOW_LOG(LOG_WARNING, "'%s' cannot be cut just now, feeding it whole", path);
-	}
-
-	for (size_t i = 0; i < job->plan.items.num; i++) {
-		struct warp_flow_delivery *d = &job->plan.items.array[i];
-
-		d->path = bstrdup(path);
-		d->uncut = d->seconds > 0;
-	}
+	for (size_t i = 0; i < job->plan.items.num; i++)
+		job->plan.items.array[i].path = bstrdup(path);
 
 	obs_queue_task(OBS_TASK_UI, warp_flow_deliver_task, job, false);
 }
@@ -1724,9 +1554,8 @@ bool warp_flow_promote_last_length(const char *id, int seconds)
 		return false;
 	}
 
-	/* A clip that has to be cut is fed once the cut is made rather than
-	 * here and now, so this is the flow taking the clip on, not the clip
-	 * having landed. */
+	/* The clip is fed on the UI thread rather than here and now, so this is
+	 * the flow taking the clip on, not the clip having landed. */
 	bool delivered = plan.items.num > 0;
 
 	warp_flow_run_plan(&plan, path);
@@ -1905,10 +1734,8 @@ static void warp_flow_frontend_event(enum obs_frontend_event event, void *privat
 		break;
 	/* On the way out the flows go for good - the hotkeys they registered
 	 * are given back while libobs is still there to take them, rather than
-	 * at module unload - and so does anything still being cut: there is
-	 * nowhere left for it to land. */
+	 * at module unload. */
 	case OBS_FRONTEND_EVENT_EXIT:
-		warp_flow_jobs_stop();
 		pthread_mutex_lock(&warp_flow_mutex);
 		warp_flow_clear();
 		pthread_mutex_unlock(&warp_flow_mutex);
@@ -1934,8 +1761,6 @@ void warp_flow_init(void)
 
 	pthread_mutex_init(&warp_flow_mutex, NULL);
 	da_init(warp_flows);
-	warp_flow_jobs_init();
-	warp_flow_jobs_start();
 
 	warp_flow_ready = true;
 
@@ -1954,8 +1779,6 @@ void warp_flow_shutdown(void)
 	obs_frontend_remove_event_callback(warp_flow_frontend_event, NULL);
 	obs_frontend_remove_save_callback(warp_flow_save_cb, NULL);
 
-	warp_flow_jobs_stop();
-
 	pthread_mutex_lock(&warp_flow_mutex);
 	warp_flow_clear();
 
@@ -1968,5 +1791,4 @@ void warp_flow_shutdown(void)
 	pthread_mutex_unlock(&warp_flow_mutex);
 
 	pthread_mutex_destroy(&warp_flow_mutex);
-	warp_flow_jobs_free();
 }

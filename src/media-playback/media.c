@@ -14,18 +14,49 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <util/platform.h>
+/* The Warp playback engine. See media-playback.h for what it is; this is how.
+ *
+ * Everything below the "media thread" heading runs on the engine's own thread
+ * and touches nothing the callers can see except through 'status', which is
+ * published under the mutex. The callers only ever queue commands. The thread
+ * sleeps until either a command arrives or the next frame falls due, carries
+ * every queued command out in order, then hands out whatever has fallen due.
+ *
+ * There is one clock, and every timestamp handed out is read off it: a frame
+ * at media time t is stamped anchor_wall + (t - anchor_media) * 100 / speed.
+ * Pausing, resuming, seeking, looping and changing speed all just move the
+ * anchor, so the stamps handed out never jump against the system clock -
+ * which is the timeline libobs keeps for an async source - and nothing that
+ * has been decoded ever has to be rescaled. */
 
-#include <assert.h>
+#include <util/platform.h>
+#include <util/bmem.h>
 
 #include "media-playback.h"
 #include "media.h"
 #include "closest-format.h"
 
 #include <libavdevice/avdevice.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
 
-static int64_t base_sys_ts = 0;
+#define NS_PER_MS 1000000LL
+#define NS_PER_SEC 1000000000LL
+
+/* A frame falling due further than this from where the clock says it should
+ * is a discontinuity in the input rather than playback running late or early,
+ * and the clock is put back on it. */
+#define MAX_TS_VAR (2 * NS_PER_SEC)
+
+/* how early a frame is handed out rather than slept for */
+#define DUE_SLACK_NS (1 * NS_PER_MS)
+
+/* A video frame this far behind the clock is not converted or handed out: the
+ * engine is behind, and libobs would only drop it on arrival. */
+#define LATE_DROP_NS (100 * NS_PER_MS)
+
+/* ------------------------------------------------------------------------- */
+/* format conversion */
 
 static inline enum video_format convert_pixel_format(int f)
 {
@@ -150,64 +181,6 @@ static inline enum video_range_type convert_color_range(enum AVColorRange r)
 	return r == AVCOL_RANGE_JPEG ? VIDEO_RANGE_FULL : VIDEO_RANGE_DEFAULT;
 }
 
-static inline struct mp_decode *get_packet_decoder(mp_media_t *media, const AVPacket *pkt)
-{
-	if (media->has_audio && pkt->stream_index == media->a.stream->index)
-		return &media->a;
-	if (media->has_video && pkt->stream_index == media->v.stream->index)
-		return &media->v;
-
-	return NULL;
-}
-
-void mp_media_free_packet(struct mp_media *media, AVPacket *pkt)
-{
-	av_packet_unref(pkt);
-	da_push_back(media->packet_pool, &pkt);
-}
-
-static int mp_media_next_packet(mp_media_t *media)
-{
-	AVPacket *pkt;
-	AVPacket **const cached = da_end(media->packet_pool);
-	if (cached) {
-		pkt = *cached;
-		da_pop_back(media->packet_pool);
-	} else {
-		pkt = av_packet_alloc();
-	}
-
-	int ret = av_read_frame(media->fmt, pkt);
-	if (ret < 0) {
-		if (ret != AVERROR_EOF && ret != AVERROR_EXIT)
-			blog(LOG_WARNING, "MP: av_read_frame failed: %s (%d)", av_err2str(ret), ret);
-		return ret;
-	}
-
-	struct mp_decode *d = get_packet_decoder(media, pkt);
-	if (d && pkt->size) {
-		mp_decode_push_packet(d, pkt);
-	} else {
-		mp_media_free_packet(media, pkt);
-	}
-
-	return ret;
-}
-
-static inline bool mp_media_ready_to_start(mp_media_t *m)
-{
-	if (m->has_audio && !m->a.eof && !m->a.frame_ready)
-		return false;
-	if (m->has_video && !m->v.eof && !m->v.frame_ready)
-		return false;
-	return true;
-}
-
-static inline bool mp_decode_frame(struct mp_decode *d)
-{
-	return d->frame_ready || mp_decode_next(d);
-}
-
 static inline int get_sws_colorspace(enum AVColorSpace cs)
 {
 	switch (cs) {
@@ -237,15 +210,41 @@ static inline int get_sws_range(enum AVColorRange r)
 
 #define FIXED_1_0 (1 << 16)
 
-static bool mp_media_init_scaling(mp_media_t *m)
+static void free_scaling(mp_media_t *m)
 {
-	int space = get_sws_colorspace(m->v.frame->colorspace);
-	int range = get_sws_range(m->v.frame->color_range);
+	sws_freeContext(m->swscale);
+	m->swscale = NULL;
+	av_freep(&m->scale_pic[0]);
+	memset(m->scale_pic, 0, sizeof(m->scale_pic));
+	m->scale_w = 0;
+	m->scale_h = 0;
+	m->scale_src = AV_PIX_FMT_NONE;
+}
+
+/* Works out what 'f' is handed to libobs as, and sets up a conversion when that
+ * is not the format it was decoded in. The engine outlives the file, so this is
+ * worked out again whenever the size or format of what is decoded changes. */
+static bool prepare_scaling(mp_media_t *m, const AVFrame *f)
+{
+	if (m->scale_src == f->format && m->scale_w == f->width && m->scale_h == f->height)
+		return true;
+
+	free_scaling(m);
+
+	m->scale_src = f->format;
+	m->scale_w = f->width;
+	m->scale_h = f->height;
+	m->scale_format = closest_format(f->format);
+
+	if (m->scale_format == f->format)
+		return true;
+
+	int space = get_sws_colorspace(f->colorspace);
+	int range = get_sws_range(f->color_range);
 	const int *coeff = sws_getCoefficients(space);
 
-	m->swscale = sws_getCachedContext(NULL, m->v.frame->width, m->v.frame->height, m->v.frame->format,
-					  m->v.frame->width, m->v.frame->height, m->scale_format, SWS_POINT, NULL, NULL,
-					  NULL);
+	m->swscale = sws_getCachedContext(NULL, f->width, f->height, f->format, f->width, f->height, m->scale_format,
+					  SWS_POINT, NULL, NULL, NULL);
 	if (!m->swscale) {
 		blog(LOG_WARNING, "MP: Failed to initialize scaler");
 		return false;
@@ -253,8 +252,7 @@ static bool mp_media_init_scaling(mp_media_t *m)
 
 	sws_setColorspaceDetails(m->swscale, coeff, range, coeff, range, 0, FIXED_1_0, FIXED_1_0);
 
-	int ret = av_image_alloc(m->scale_pic, m->scale_linesizes, m->v.frame->width, m->v.frame->height,
-				 m->scale_format, 32);
+	int ret = av_image_alloc(m->scale_pic, m->scale_linesizes, f->width, f->height, m->scale_format, 32);
 	if (ret < 0) {
 		blog(LOG_WARNING, "MP: Failed to create scale pic data");
 		return false;
@@ -263,143 +261,27 @@ static bool mp_media_init_scaling(mp_media_t *m)
 	return true;
 }
 
-bool mp_media_prepare_frames(mp_media_t *m)
+/* Fills in m->obsframe from 'f'. Returns NULL for a frame there is nothing to
+ * show from. */
+static struct obs_source_frame *convert_video(mp_media_t *m, AVFrame *f)
 {
-	bool actively_seeking = m->seek_next_ts && m->pause;
-
-	while (!mp_media_ready_to_start(m)) {
-		if (!m->eof) {
-			int ret = mp_media_next_packet(m);
-			if (ret == AVERROR_EOF || ret == AVERROR_EXIT) {
-				if (!actively_seeking) {
-					m->eof = true;
-				} else {
-					break;
-				}
-			} else if (ret < 0) {
-				return false;
-			}
-		}
-
-		/* kind of a cheap fix, but because a stinger might be
-		 * interrupted and restart playback, the request_preload signal
-		 * might happen when the current frame is invalid, so clear out
-		 * these pointers to signify they're not valid. (the obsframe
-		 * structure is only used in the media thread, so this isn't a
-		 * threading issue) */
-		m->obsframe.data[0] = NULL;
-
-		if (m->has_video && !mp_decode_frame(&m->v))
-			return false;
-		if (m->has_audio && !mp_decode_frame(&m->a))
-			return false;
-	}
-
-	if (m->has_video && m->v.frame_ready && !m->swscale) {
-		m->scale_format = closest_format(m->v.frame->format);
-		if (m->scale_format != m->v.frame->format) {
-			if (!mp_media_init_scaling(m)) {
-				return false;
-			}
-		}
-	}
-
-	return true;
-}
-
-static inline int64_t mp_media_get_next_min_pts(mp_media_t *m)
-{
-	int64_t min_next_ns = 0x7FFFFFFFFFFFFFFFLL;
-
-	if (m->has_video && m->v.frame_ready) {
-		if (m->v.frame_pts < min_next_ns)
-			min_next_ns = m->v.frame_pts;
-	}
-	if (m->has_audio && m->a.frame_ready) {
-		if (m->a.frame_pts < min_next_ns)
-			min_next_ns = m->a.frame_pts;
-	}
-
-	return min_next_ns;
-}
-
-static inline int64_t mp_media_get_base_pts(mp_media_t *m)
-{
-	int64_t base_ts = 0;
-
-	if (m->has_video && m->v.next_pts > base_ts)
-		base_ts = m->v.next_pts;
-	if (m->has_audio && m->a.next_pts > base_ts)
-		base_ts = m->a.next_pts;
-
-	return base_ts;
-}
-
-/* maximum timestamp variance in nanoseconds */
-#define MAX_TS_VAR 2000000000LL
-
-static inline bool mp_media_can_play_frame(mp_media_t *m, struct mp_decode *d)
-{
-	if (m->full_decode)
-		return d->frame_ready;
-	return d->frame_ready && (d->frame_pts <= m->next_pts_ns || (d->frame_pts - m->next_pts_ns > MAX_TS_VAR));
-}
-
-void mp_media_next_audio(mp_media_t *m)
-{
-	struct mp_decode *d = &m->a;
-	struct obs_source_audio audio = {0};
-	AVFrame *f = d->frame;
-	int channels;
-
-	if (!mp_media_can_play_frame(m, d))
-		return;
-
-#if LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(59, 19, 100)
-	channels = f->channels;
-#else
-	channels = f->ch_layout.nb_channels;
-#endif
-
-	d->frame_ready = false;
-	if (!m->a_cb)
-		return;
-
-	for (size_t i = 0; i < MAX_AV_PLANES; i++)
-		audio.data[i] = f->data[i];
-
-	audio.samples_per_sec = f->sample_rate * m->speed / 100;
-	audio.speakers = convert_speaker_layout(channels);
-	audio.format = convert_sample_format(f->format);
-	audio.frames = f->nb_samples;
-	audio.timestamp = m->full_decode ? d->frame_pts
-					 : m->base_ts + d->frame_pts - m->start_ts + m->play_sys_ts - base_sys_ts;
-
-	if (audio.format == AUDIO_FORMAT_UNKNOWN)
-		return;
-
-	m->a_cb(m->opaque, &audio);
-}
-
-void mp_media_next_video(mp_media_t *m, bool preload)
-{
-	struct mp_decode *d = &m->v;
 	struct obs_source_frame *frame = &m->obsframe;
-	enum video_format new_format;
-	enum video_colorspace new_space;
-	enum video_range_type new_range;
-	AVFrame *f = d->frame;
+	struct mp_decode *d = &m->v;
 
-	if (!preload) {
-		if (!mp_media_can_play_frame(m, d))
-			return;
+	if (!f || !prepare_scaling(m, f))
+		return NULL;
 
-		d->frame_ready = false;
+	/* network input picks up wherever it is joined, so nothing is shown
+	 * until a frame that can be decoded whole */
+	if (!m->is_local_file && !d->got_first_keyframe) {
+#if LIBAVUTIL_VERSION_INT < AV_VERSION_INT(58, 29, 100)
+		if (!f->key_frame)
+#else
+		if (!(f->flags & AV_FRAME_FLAG_KEY))
+#endif
+			return NULL;
 
-		if (!m->v_cb)
-			return;
-	} else if (!d->frame_ready) {
-		return;
+		d->got_first_keyframe = true;
 	}
 
 	bool flip = false;
@@ -407,14 +289,17 @@ void mp_media_next_video(mp_media_t *m, bool preload)
 		int ret = sws_scale(m->swscale, (const uint8_t *const *)f->data, f->linesize, 0, f->height,
 				    m->scale_pic, m->scale_linesizes);
 		if (ret < 0)
-			return;
+			return NULL;
 
 		flip = m->scale_linesizes[0] < 0 && m->scale_linesizes[1] == 0;
 		for (size_t i = 0; i < 4; i++) {
 			frame->data[i] = m->scale_pic[i];
 			frame->linesize[i] = abs(m->scale_linesizes[i]);
 		}
-
+		for (size_t i = 4; i < MAX_AV_PLANES; i++) {
+			frame->data[i] = NULL;
+			frame->linesize[i] = 0;
+		}
 	} else {
 		flip = f->linesize[0] < 0 && f->linesize[1] == 0;
 
@@ -427,40 +312,37 @@ void mp_media_next_video(mp_media_t *m, bool preload)
 	if (flip)
 		frame->data[0] -= frame->linesize[0] * ((size_t)f->height - 1);
 
-	new_format = convert_pixel_format(m->scale_format);
-	new_space = convert_color_space(f->colorspace, f->color_trc, f->color_primaries);
-	new_range = m->force_range == VIDEO_RANGE_DEFAULT ? convert_color_range(f->color_range) : m->force_range;
+	enum video_format new_format = convert_pixel_format(m->scale_format);
+	enum video_colorspace new_space = convert_color_space(f->colorspace, f->color_trc, f->color_primaries);
+	enum video_range_type new_range = m->force_range == VIDEO_RANGE_DEFAULT ? convert_color_range(f->color_range)
+										: m->force_range;
 
 	if (new_format != frame->format || new_space != m->cur_space || new_range != m->cur_range) {
-		bool success;
-
 		frame->format = new_format;
 		frame->full_range = new_range == VIDEO_RANGE_FULL;
 
-		success = video_format_get_parameters_for_format(new_space, new_range, new_format, frame->color_matrix,
-								 frame->color_range_min, frame->color_range_max);
+		bool success = video_format_get_parameters_for_format(new_space, new_range, new_format,
+								      frame->color_matrix, frame->color_range_min,
+								      frame->color_range_max);
 
-		frame->format = new_format;
 		m->cur_space = new_space;
 		m->cur_range = new_range;
 
 		if (!success) {
 			frame->format = VIDEO_FORMAT_NONE;
-			return;
+			return NULL;
 		}
 	}
 
 	if (frame->format == VIDEO_FORMAT_NONE)
-		return;
-
-	frame->timestamp = m->full_decode ? d->frame_pts
-					  : (m->base_ts + d->frame_pts - m->start_ts + m->play_sys_ts - base_sys_ts);
+		return NULL;
 
 	frame->width = f->width;
 	frame->height = f->height;
 	frame->max_luminance = d->max_luminance;
 	frame->flip = flip;
-	frame->flags = m->is_linear_alpha ? OBS_SOURCE_FRAME_LINEAR_ALPHA : 0;
+	frame->flags = os_atomic_load_bool(&m->is_linear_alpha) ? OBS_SOURCE_FRAME_LINEAR_ALPHA : 0;
+
 	switch (f->color_trc) {
 	case AVCOL_TRC_BT709:
 	case AVCOL_TRC_GAMMA22:
@@ -480,431 +362,159 @@ void mp_media_next_video(mp_media_t *m, bool preload)
 		frame->trc = VIDEO_TRC_DEFAULT;
 	}
 
-	if (!m->is_local_file && !d->got_first_keyframe) {
+	return frame;
+}
 
+/* Describes 'f', a frame on the GPU, without touching its picture: its size, the
+ * layout of its planes, its colour. False when it is not to be shown (network
+ * input waiting for a frame it can decode whole) or its colour cannot be
+ * worked out. */
+static bool describe_gpu_frame(mp_media_t *m, AVFrame *f, struct obs_source_frame *info)
+{
+	struct mp_decode *d = &m->v;
+	const AVHWFramesContext *fc = (const AVHWFramesContext *)f->hw_frames_ctx->data;
+
+	if (!m->is_local_file && !d->got_first_keyframe) {
 #if LIBAVUTIL_VERSION_INT < AV_VERSION_INT(58, 29, 100)
 		if (!f->key_frame)
 #else
 		if (!(f->flags & AV_FRAME_FLAG_KEY))
 #endif
-			return;
+			return false;
 
 		d->got_first_keyframe = true;
 	}
 
-	if (preload) {
-		if (m->seek_next_ts && m->v_seek_cb) {
-			m->v_seek_cb(m->opaque, frame);
-		} else if (!m->request_preload) {
-			m->v_preload_cb(m->opaque, frame);
-		}
-		m->v_frame_displayed = true;
-	} else {
-		m->v_cb(m->opaque, frame);
-		m->v_frame_displayed = false;
-	}
-}
+	memset(info, 0, sizeof(*info));
+	info->format = fc->sw_format == AV_PIX_FMT_P010 ? VIDEO_FORMAT_P010 : VIDEO_FORMAT_NV12;
 
-static void mp_media_calc_next_ns(mp_media_t *m)
-{
-	int64_t min_next_ns = mp_media_get_next_min_pts(m);
-	int64_t delta = min_next_ns - m->next_pts_ns;
+	enum video_colorspace space = convert_color_space(f->colorspace, f->color_trc, f->color_primaries);
+	enum video_range_type range = m->force_range == VIDEO_RANGE_DEFAULT ? convert_color_range(f->color_range)
+									    : m->force_range;
 
-	if (m->seek_next_ts) {
-		delta = 0;
-		m->seek_next_ts = false;
-	} else {
-#ifdef _DEBUG
-		assert(delta >= 0);
-#endif
-		if (delta < 0)
-			delta = 0;
-		if (delta > 3000000000)
-			delta = 0;
-	}
-
-	m->next_ns += delta;
-	m->next_pts_ns = min_next_ns;
-}
-
-static void seek_to(mp_media_t *m, int64_t pos)
-{
-	AVStream *stream = m->fmt->streams[0];
-	int64_t seek_pos = pos;
-	int seek_flags;
-
-	if (m->fmt->duration == AV_NOPTS_VALUE)
-		seek_flags = AVSEEK_FLAG_FRAME;
-	else
-		seek_flags = AVSEEK_FLAG_BACKWARD;
-
-	int64_t seek_target = seek_flags == AVSEEK_FLAG_BACKWARD
-				      ? av_rescale_q(seek_pos, AV_TIME_BASE_Q, stream->time_base)
-				      : seek_pos;
-
-	if (m->is_local_file) {
-		int ret = av_seek_frame(m->fmt, 0, seek_target, seek_flags);
-		if (ret < 0) {
-			blog(LOG_WARNING, "MP: Failed to seek: %s", av_err2str(ret));
-		}
-	}
-
-	if (m->has_video && m->is_local_file) {
-		mp_decode_flush(&m->v);
-		if (m->seek_next_ts && m->pause && m->v_preload_cb && mp_media_prepare_frames(m))
-			mp_media_next_video(m, true);
-	}
-	if (m->has_audio && m->is_local_file)
-		mp_decode_flush(&m->a);
-}
-
-bool mp_media_reset(mp_media_t *m)
-{
-	bool stopping;
-	bool active;
-
-	int64_t next_ts = mp_media_get_base_pts(m);
-	int64_t offset = next_ts - m->next_pts_ns;
-	int64_t start_time = m->fmt->start_time;
-	if (start_time == AV_NOPTS_VALUE)
-		start_time = 0;
-
-	m->eof = false;
-	/* Warp addition: what a restart hands over to base_ts is the span that
-	 * was played under the anchor being retired, not the position the file
-	 * reached. The two are the same thing only while the anchor is the
-	 * start of the file; an unpause or a speed change moves start_ts to
-	 * wherever playback was when the clock was last re-anchored, and from
-	 * then on the position counts everything before that point a second
-	 * time, which lands as a jump in the emitted timeline at the loop point
-	 * of a file that has been paused or had its speed changed. See
-	 * mp_media_apply_speed() for what such a jump costs. */
-	m->base_ts += next_ts - m->start_ts;
-	m->seek_next_ts = false;
-
-	seek_to(m, start_time);
-
-	pthread_mutex_lock(&m->mutex);
-	stopping = m->stopping;
-	active = m->active;
-	m->stopping = false;
-	pthread_mutex_unlock(&m->mutex);
-
-	if (!mp_media_prepare_frames(m))
+	info->full_range = range == VIDEO_RANGE_FULL;
+	if (!video_format_get_parameters_for_format(space, range, info->format, info->color_matrix,
+						    info->color_range_min, info->color_range_max))
 		return false;
 
-	if (active) {
-		if (!m->play_sys_ts)
-			m->play_sys_ts = (int64_t)os_gettime_ns();
-		m->start_ts = m->next_pts_ns = mp_media_get_next_min_pts(m);
-		if (m->next_ns)
-			m->next_ns += offset;
-	} else {
-		m->start_ts = m->next_pts_ns = mp_media_get_next_min_pts(m);
-		m->play_sys_ts = (int64_t)os_gettime_ns();
-		m->next_ns = 0;
+	info->width = (uint32_t)f->width;
+	info->height = (uint32_t)f->height;
+	info->max_luminance = d->max_luminance;
+	info->flags = os_atomic_load_bool(&m->is_linear_alpha) ? OBS_SOURCE_FRAME_LINEAR_ALPHA : 0;
+
+	switch (f->color_trc) {
+	case AVCOL_TRC_SMPTE2084:
+		info->trc = VIDEO_TRC_PQ;
+		break;
+	case AVCOL_TRC_ARIB_STD_B67:
+		info->trc = VIDEO_TRC_HLG;
+		break;
+	case AVCOL_TRC_BT709:
+	case AVCOL_TRC_GAMMA22:
+	case AVCOL_TRC_GAMMA28:
+	case AVCOL_TRC_SMPTE170M:
+	case AVCOL_TRC_SMPTE240M:
+	case AVCOL_TRC_IEC61966_2_1:
+		info->trc = VIDEO_TRC_SRGB;
+		break;
+	default:
+		info->trc = VIDEO_TRC_DEFAULT;
 	}
-
-	m->pause = false;
-
-	if (!active && m->is_local_file && m->v_preload_cb)
-		mp_media_next_video(m, true);
-	if (stopping && m->stop_cb)
-		m->stop_cb(m->opaque);
-	return true;
-}
-
-static inline bool mp_media_sleep(mp_media_t *m)
-{
-	bool timeout = false;
-
-	if (!m->next_ns) {
-		m->next_ns = os_gettime_ns();
-	} else {
-		const uint64_t t = os_gettime_ns();
-		if (m->next_ns > t) {
-			const uint32_t delta_ms = (uint32_t)((m->next_ns - t + 500000) / 1000000);
-			if (delta_ms > 0) {
-				static const uint32_t timeout_ms = 200;
-				timeout = delta_ms > timeout_ms;
-				os_sleep_ms(timeout ? timeout_ms : delta_ms);
-			}
-		}
-	}
-
-	return timeout;
-}
-
-bool mp_media_eof(mp_media_t *m)
-{
-	bool v_ended = !m->has_video || !m->v.frame_ready;
-	bool a_ended = !m->has_audio || !m->a.frame_ready;
-	bool eof = v_ended && a_ended;
-
-	if (eof) {
-		bool looping;
-
-		pthread_mutex_lock(&m->mutex);
-		looping = m->looping;
-		if (!looping) {
-			m->active = false;
-			m->stopping = true;
-		}
-		pthread_mutex_unlock(&m->mutex);
-
-		mp_media_reset(m);
-	}
-
-	return eof;
-}
-
-static int interrupt_callback(void *data)
-{
-	mp_media_t *m = data;
-	bool stop = false;
-	uint64_t ts = os_gettime_ns();
-
-	if ((ts - m->interrupt_poll_ts) > 20000000) {
-		pthread_mutex_lock(&m->mutex);
-		stop = m->kill || m->stopping;
-		pthread_mutex_unlock(&m->mutex);
-
-		m->interrupt_poll_ts = ts;
-	}
-
-	return stop;
-}
-
-#define RIST_PROTO "rist"
-
-static bool init_avformat(mp_media_t *m)
-{
-#if LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(59, 0, 100)
-	AVInputFormat *format = NULL;
-#else
-	const AVInputFormat *format = NULL;
-#endif
-
-	if (m->format_name && *m->format_name) {
-		format = av_find_input_format(m->format_name);
-		if (!format)
-			blog(LOG_INFO,
-			     "MP: Unable to find input format for "
-			     "'%s'",
-			     m->path);
-	}
-
-	AVDictionary *opts = NULL;
-	bool is_rist = strncmp(m->path, RIST_PROTO, strlen(RIST_PROTO)) == 0;
-	if (m->buffering && !m->is_local_file && !is_rist)
-		av_dict_set_int(&opts, "buffer_size", m->buffering, 0);
-
-	if (m->ffmpeg_options) {
-		int ret = av_dict_parse_string(&opts, m->ffmpeg_options, "=", " ", 0);
-		if (ret)
-			blog(LOG_WARNING, "Failed to parse FFmpeg options: %s\n%s", av_err2str(ret), m->ffmpeg_options);
-	}
-
-	m->fmt = avformat_alloc_context();
-	if (m->buffering == 0) {
-		m->fmt->flags |= AVFMT_FLAG_NOBUFFER;
-	}
-	if (!m->is_local_file) {
-		av_dict_set(&opts, "stimeout", "30000000", 0);
-		m->fmt->interrupt_callback.callback = interrupt_callback;
-		m->fmt->interrupt_callback.opaque = m;
-	}
-
-	int ret = avformat_open_input(&m->fmt, m->path, format, opts ? &opts : NULL);
-	av_dict_free(&opts);
-
-	if (ret < 0) {
-		if (!m->reconnecting)
-			blog(LOG_WARNING, "MP: Failed to open media: '%s'", m->path);
-		return false;
-	}
-
-	if (avformat_find_stream_info(m->fmt, NULL) < 0) {
-		blog(LOG_WARNING, "MP: Failed to find stream info for '%s'", m->path);
-		return false;
-	}
-
-	m->reconnecting = false;
-	m->has_video = mp_decode_init(m, AVMEDIA_TYPE_VIDEO, m->hw);
-	m->has_audio = mp_decode_init(m, AVMEDIA_TYPE_AUDIO, m->hw);
-
-	if (!m->has_video && !m->has_audio) {
-		blog(LOG_WARNING,
-		     "MP: Could not initialize audio or video: "
-		     "'%s'",
-		     m->path);
-		return false;
-	}
-
-	/* Warp addition: last, so that nothing outside the media thread can
-	 * conclude the file is open until everything read out of it is true */
-	os_atomic_set_bool(&m->opened, true);
 
 	return true;
 }
 
-static void reset_ts(mp_media_t *m)
+/* Hands 'f' out to be shown as 'use' says, stamped 'timestamp': on the GPU, as
+ * the surface it was decoded into, when it is still there, and as a copy in
+ * memory otherwise. False when there was nothing to show. */
+static bool hand_out(mp_media_t *m, AVFrame *f, enum mp_frame_use use, uint64_t timestamp)
 {
-	m->base_ts += mp_media_get_base_pts(m);
-	m->play_sys_ts = (int64_t)os_gettime_ns();
-	m->start_ts = m->next_pts_ns = mp_media_get_next_min_pts(m);
-	m->next_ns = 0;
-}
+	if (!f)
+		return false;
 
-/* Warp addition: hand the frame that is on screen over again once playback has
- * been re-anchored to the current clock.
- *
- * reset_ts() moves the anchor the timestamps are built from to the current
- * wall clock, so the first frame handed out after a resume can be a long way
- * ahead of the last one the frontend saw: everything the file spent paused,
- * on top of the position it was paused at. libobs only treats a jump of more
- * than two seconds as a clock that has been invalidated; anything short of
- * that it takes at face value and holds the frames back until its own clock
- * has caught up with them, which stalls playback for as long as the jump
- * lasted. Handing the frame that is ready over under the new anchor closes the
- * gap: it is the frame that is already being displayed, so nothing changes on
- * screen, but everything that follows it is timed from there. */
-static void mp_media_resume(mp_media_t *m)
-{
-	bool seeking;
+	if (f->hw_frames_ctx && f->format != AV_PIX_FMT_NONE && m->v_gpu_cb) {
+		struct mp_gpu_frame gpu;
 
-	if (!m->has_video || !m->v.frame_ready || !m->v_seek_cb)
-		return;
+		if (!describe_gpu_frame(m, f, &gpu.info))
+			return false;
 
-	seeking = m->seek_next_ts;
+		gpu.frame = av_frame_clone(f);
+		if (!gpu.frame)
+			return false;
 
-	/* the seek callback is the one that hands a frame over as the one the
-	 * frames that follow are timed against */
-	m->seek_next_ts = true;
-	mp_media_next_video(m, true);
-	m->seek_next_ts = seeking;
-
-	/* the audio is timed against that same frame, and has nothing of its
-	 * own to be handed over with */
-	if (m->resume_cb)
-		m->resume_cb(m->opaque);
-}
-
-/* Warp addition: apply a speed change without restarting playback.
- * Decoded frame timestamps are scaled by 100/speed at decode time
- * (see mp_decode_next), so rescale the pending decoder state to the
- * new factor and move the anchor those timestamps are measured from
- * into the new scale; the current position and open decoders are
- * preserved. */
-static void mp_media_apply_speed(mp_media_t *m, int new_speed)
-{
-	if (new_speed < MP_SPEED_MIN)
-		new_speed = MP_SPEED_MIN;
-	else if (new_speed > MP_SPEED_MAX)
-		new_speed = MP_SPEED_MAX;
-
-	if (!m->is_local_file || new_speed == m->speed)
-		return;
-
-	const int old_speed = m->speed;
-	/* where playback has got to, in the scale the timestamps handed out
-	 * so far were counted in */
-	const int64_t played_to = m->next_pts_ns;
-
-	if (m->has_video) {
-		m->v.frame_pts = av_rescale(m->v.frame_pts, old_speed, new_speed);
-		m->v.next_pts = av_rescale(m->v.next_pts, old_speed, new_speed);
-		m->v.last_duration = av_rescale(m->v.last_duration, old_speed, new_speed);
-	}
-	if (m->has_audio) {
-		m->a.frame_pts = av_rescale(m->a.frame_pts, old_speed, new_speed);
-		m->a.next_pts = av_rescale(m->a.next_pts, old_speed, new_speed);
-		m->a.last_duration = av_rescale(m->a.last_duration, old_speed, new_speed);
+		gpu.info.timestamp = timestamp;
+		m->v_gpu_cb(m->opaque, &gpu, use);
+		return true;
 	}
 
-	m->speed = new_speed;
+	mp_video_cb cb = use == MP_FRAME_TIMED ? m->v_cb : use == MP_FRAME_STILL ? m->v_still_cb : m->v_preload_cb;
+	if (!cb)
+		return false;
 
-	/* Frames are handed over timestamped base_ts + frame_pts - start_ts,
-	 * so rescaling every pts under the frontend's feet takes the emitted
-	 * timeline with it unless the anchor moves by the same amount. What a
-	 * speed change is not, though, is a restart or an unpause: it spends
-	 * none of the timeline, because the file is in the same place it was a
-	 * moment ago and the next frame is due when it was always due. So
-	 * base_ts takes over only the span that has actually been played under
-	 * this anchor, and start_ts moves to where the position sits in the new
-	 * scale, which leaves the next frame timestamped where the last one
-	 * left off.
-	 *
-	 * Handing that over to reset_ts() instead is what put a hitch in the
-	 * picture: it adds the whole rescaled position to base_ts, as a restart
-	 * wants, which throws the next frame a position's worth into the
-	 * future. libobs holds frames back until its own clock has caught up
-	 * with them and only writes the clock off as invalid once a jump passes
-	 * two seconds, so a jump short of that freezes the picture for as long
-	 * as the jump lasts. Hence a hitch on a file that had only just started
-	 * -- 3 seconds into a clip is 2 seconds of jump at 150% -- and none
-	 * further in, where the jump cleared two seconds and libobs re-anchored.
-	 *
-	 * next_ns is left alone: it is the pacing deadline in wall-clock terms,
-	 * the thread is midway between two of them here, and the next interval
-	 * added to it is worked out from the rescaled timestamps. */
-	m->base_ts += played_to - m->start_ts;
-	m->start_ts = m->next_pts_ns = av_rescale(played_to, old_speed, new_speed);
+	struct obs_source_frame *frame = convert_video(m, f);
+	if (!frame)
+		return false;
+
+	frame->timestamp = timestamp;
+	cb(m->opaque, frame);
+	return true;
 }
 
-/* Warp addition: ring buffer of recently decoded video frames. Frames are
- * pushed as references (no pixel copies) each time the video decoder
- * produces one, so during playback the history always covers the frames
- * just behind the current position. Backward steps that land inside the
- * history can be displayed immediately instead of stalling on the
- * keyframe re-decode. */
+/* ------------------------------------------------------------------------- */
+/* frame history */
 
-static size_t mp_media_hist_frame_bytes(const AVFrame *f)
+static size_t hist_frame_bytes(const AVFrame *f)
 {
 	int size = av_image_get_buffer_size(f->format, f->width, f->height, 1);
 	return size > 0 ? (size_t)size : 0;
 }
 
-static void mp_media_hist_pop_oldest(mp_media_t *m)
+static void hist_pop_oldest(mp_media_t *m)
 {
 	AVFrame **slot = &m->hist_frames[m->hist_start];
-	m->hist_bytes -= mp_media_hist_frame_bytes(*slot);
+	m->hist_bytes -= hist_frame_bytes(*slot);
 	av_frame_free(slot);
 	m->hist_start = (m->hist_start + 1) % MP_FRAME_HIST_SIZE;
 	m->hist_num--;
 }
 
-static void mp_media_hist_clear(mp_media_t *m)
+static void hist_clear(mp_media_t *m)
 {
 	while (m->hist_num)
-		mp_media_hist_pop_oldest(m);
+		hist_pop_oldest(m);
 	m->hist_start = 0;
 }
 
 void mp_media_hist_push(mp_media_t *m, struct mp_decode *d)
 {
-	/* GPU-surface frames are not cached: holding references to them
-	 * would starve the decoder's fixed surface pool */
+	/* GPU-surface frames are not kept: holding references to them would
+	 * starve the decoder's fixed surface pool */
 	if (!d->frame || d->frame->hw_frames_ctx)
 		return;
+
+	/* a frame already in the history - decoding forward again over ground
+	 * just stepped back across - is not kept twice */
+	for (size_t i = 0; i < m->hist_num; i++) {
+		if (m->hist_pts[(m->hist_start + i) % MP_FRAME_HIST_SIZE] == d->frame_pts)
+			return;
+	}
 
 	AVFrame *clone = av_frame_clone(d->frame);
 	if (!clone)
 		return;
 
-	size_t bytes = mp_media_hist_frame_bytes(clone);
+	size_t bytes = hist_frame_bytes(clone);
 	while (m->hist_num && (m->hist_num >= MP_FRAME_HIST_SIZE || m->hist_bytes + bytes > MP_FRAME_HIST_MAX_BYTES))
-		mp_media_hist_pop_oldest(m);
+		hist_pop_oldest(m);
 
 	size_t idx = (m->hist_start + m->hist_num) % MP_FRAME_HIST_SIZE;
 	m->hist_frames[idx] = clone;
-	/* store unscaled media time so entries survive speed changes */
-	m->hist_pts[idx] = av_rescale(d->frame_pts, m->speed, 100);
+	m->hist_pts[idx] = d->frame_pts;
 	m->hist_num++;
 	m->hist_bytes += bytes;
 }
 
-static AVFrame *mp_media_hist_find(mp_media_t *m, int64_t pts, int64_t tolerance, int64_t *found_pts)
+static AVFrame *hist_find(mp_media_t *m, int64_t pts, int64_t tolerance, int64_t *found_pts)
 {
 	AVFrame *best = NULL;
 	int64_t best_diff = tolerance;
@@ -924,453 +534,1323 @@ static AVFrame *mp_media_hist_find(mp_media_t *m, int64_t pts, int64_t tolerance
 	return best;
 }
 
-/* Warp addition: step the paused video by a signed number of frames and
- * display the resulting frame through the seek callback. Forward steps
- * decode ahead from the current decoder state; backward steps seek to
- * the keyframe before the target and decode forward to the exact frame. */
-static void mp_media_step(mp_media_t *m, int frames)
+/* the latest frame in the history at or before 'pts' */
+static AVFrame *hist_at_or_before(mp_media_t *m, int64_t pts, int64_t *found_pts)
+{
+	AVFrame *best = NULL;
+	int64_t best_pts = INT64_MIN;
+
+	for (size_t i = 0; i < m->hist_num; i++) {
+		size_t idx = (m->hist_start + i) % MP_FRAME_HIST_SIZE;
+
+		if (m->hist_pts[idx] <= pts && m->hist_pts[idx] > best_pts) {
+			best_pts = m->hist_pts[idx];
+			best = m->hist_frames[idx];
+		}
+	}
+
+	if (best)
+		*found_pts = best_pts;
+	return best;
+}
+
+/* ------------------------------------------------------------------------- */
+/* status and events */
+
+static void emit_event(mp_media_t *m, enum mp_event event, uint64_t seq)
+{
+	if (m->event_cb)
+		m->event_cb(m->opaque, event, seq);
+}
+
+static int64_t clip_end_ns(mp_media_t *m)
+{
+	if (m->out_ns)
+		return m->out_ns;
+	return m->file_end_ns;
+}
+
+static int64_t estimate_frames(mp_media_t *m, int64_t duration_ns)
+{
+	if (!m->has_video || duration_ns <= 0)
+		return 0;
+
+	AVStream *stream = m->v.stream;
+	AVRational fr = stream->avg_frame_rate;
+
+	if (fr.num > 0 && fr.den > 0)
+		return av_rescale(duration_ns, fr.num, (int64_t)fr.den * NS_PER_SEC);
+
+	return stream->nb_frames > 0 ? stream->nb_frames : 0;
+}
+
+/* publishes where the engine has got to; 'loaded' marks the end of a load */
+static void publish(mp_media_t *m)
+{
+	struct mp_status st;
+	bool open = m->fmt != NULL;
+	int64_t end = clip_end_ns(m);
+	int64_t duration = open && end > m->in_ns ? end - m->in_ns : 0;
+	int64_t time = open && m->have_cur ? m->cur_pts - m->in_ns : 0;
+
+	if (time < 0)
+		time = 0;
+	if (duration && time > duration)
+		time = duration;
+
+	pthread_mutex_lock(&m->mutex);
+	st = m->status;
+	st.state = m->state;
+	st.open = open;
+	st.has_video = open && m->has_video;
+	st.has_audio = open && m->has_audio;
+	st.speed = m->speed;
+	st.looping = m->looping;
+	st.time_ms = time / NS_PER_MS;
+	st.duration_ms = duration / NS_PER_MS;
+	st.frames = estimate_frames(m, duration);
+	m->status = st;
+	pthread_mutex_unlock(&m->mutex);
+}
+
+static void publish_loaded(mp_media_t *m, uint64_t seq)
+{
+	pthread_mutex_lock(&m->mutex);
+	m->status.loaded_seq = seq;
+	pthread_mutex_unlock(&m->mutex);
+
+	publish(m);
+}
+
+/* ------------------------------------------------------------------------- */
+/* the clock */
+
+static inline uint64_t clock_wall_for(mp_media_t *m, int64_t media)
+{
+	int64_t delta = (media - m->anchor_media) * 100 / m->speed;
+	return (uint64_t)((int64_t)m->anchor_wall + delta);
+}
+
+static inline int64_t clock_media_at(mp_media_t *m, uint64_t wall)
+{
+	int64_t delta = (int64_t)(wall - m->anchor_wall);
+	return m->anchor_media + delta * m->speed / 100;
+}
+
+static inline void clock_anchor(mp_media_t *m, uint64_t wall, int64_t media)
+{
+	m->anchor_wall = wall;
+	m->anchor_media = media;
+	m->need_anchor = false;
+}
+
+/* ------------------------------------------------------------------------- */
+/* reading and decoding */
+
+void mp_media_free_packet(mp_media_t *m, AVPacket *pkt)
+{
+	av_packet_unref(pkt);
+	da_push_back(m->packet_pool, &pkt);
+}
+
+static inline struct mp_decode *get_packet_decoder(mp_media_t *m, const AVPacket *pkt)
+{
+	if (m->has_audio && pkt->stream_index == m->a.stream->index)
+		return &m->a;
+	if (m->has_video && pkt->stream_index == m->v.stream->index)
+		return &m->v;
+
+	return NULL;
+}
+
+static int read_packet(mp_media_t *m)
+{
+	AVPacket *pkt;
+
+	if (m->packet_pool.num) {
+		pkt = m->packet_pool.array[m->packet_pool.num - 1];
+		da_pop_back(m->packet_pool);
+	} else {
+		pkt = av_packet_alloc();
+		if (!pkt)
+			return AVERROR(ENOMEM);
+	}
+
+	int ret = av_read_frame(m->fmt, pkt);
+	if (ret < 0) {
+		if (ret != AVERROR_EOF && ret != AVERROR_EXIT)
+			blog(LOG_WARNING, "MP: av_read_frame failed: %s (%d)", av_err2str(ret), ret);
+		mp_media_free_packet(m, pkt);
+		return ret;
+	}
+
+	struct mp_decode *d = get_packet_decoder(m, pkt);
+	if (d && pkt->size)
+		mp_decode_push_packet(d, pkt);
+	else
+		mp_media_free_packet(m, pkt);
+
+	return ret;
+}
+
+static inline bool needs_frame(struct mp_decode *d)
+{
+	return !d->frame_ready && !d->eof;
+}
+
+/* Decodes until every stream has a frame ready or has run out. False when the
+ * file could not be read: an error on network input, or the read being given
+ * up on. A local file that fails to read part way through is treated as having
+ * ended there. */
+static bool prepare_frames(mp_media_t *m)
+{
+	while ((m->has_video && needs_frame(&m->v)) || (m->has_audio && needs_frame(&m->a))) {
+		if (!m->eof) {
+			int ret = read_packet(m);
+
+			if (ret == AVERROR_EOF) {
+				m->eof = true;
+			} else if (ret == AVERROR_EXIT) {
+				return false;
+			} else if (ret < 0) {
+				if (!m->is_local_file)
+					return false;
+				m->eof = true;
+			}
+		}
+
+		if (m->has_video && needs_frame(&m->v) && !mp_decode_next(&m->v))
+			return false;
+		if (m->has_audio && needs_frame(&m->a) && !mp_decode_next(&m->a))
+			return false;
+	}
+
+	return true;
+}
+
+/* whether 'd' is holding a frame that belongs to the clip */
+static inline bool in_clip(mp_media_t *m, struct mp_decode *d)
+{
+	return d->frame_ready && (!m->out_ns || d->frame_pts < m->out_ns);
+}
+
+static int64_t frame_interval(mp_media_t *m)
 {
 	struct mp_decode *d = &m->v;
 
-	if (!m->has_video || !m->is_local_file || !frames)
+	if (d->last_duration > 0)
+		return d->last_duration;
+
+	AVRational fr = d->stream ? d->stream->avg_frame_rate : (AVRational){0, 1};
+	return fr.num > 0 ? av_rescale(NS_PER_SEC, fr.den, fr.num) : 33333333LL;
+}
+
+/* drops audio that sits wholly before 'pts', so playback picks up in sync with
+ * the video frame on screen */
+static void drop_audio_before(mp_media_t *m, int64_t pts)
+{
+	while (m->has_audio && m->a.frame_ready && m->a.next_pts <= pts) {
+		m->a.frame_ready = false;
+		if (!prepare_frames(m))
+			break;
+	}
+}
+
+/* Moves to 'target', in media time, frame-accurately: the video decoder is left
+ * holding the frame that is on screen at that moment, and the audio decoder the
+ * sound from then on. Input that cannot seek is left where it is. */
+static void seek_exact(mp_media_t *m, int64_t target)
+{
+	if (!m->fmt)
 		return;
 
-	/* decode with actively-seeking semantics so hitting the end of the
-	 * file while stepping does not trigger looping or stop callbacks */
-	m->seek_next_ts = true;
+	int64_t end = clip_end_ns(m);
+	if (end > m->in_ns && m->has_video && target > end - frame_interval(m))
+		target = end - frame_interval(m);
+	if (target < m->start_ns)
+		target = m->start_ns;
+
+	m->shown = false;
+	m->still_target = target;
+
+	/* the sound the stretcher is holding was from where the clip was */
+	mp_stretch_reset(&m->stretch);
+
+	if (!m->is_local_file)
+		return;
+
+	struct mp_decode *d = m->has_video ? &m->v : &m->a;
+	int64_t ts = av_rescale_q(target, (AVRational){1, 1000000000}, d->stream->time_base);
+
+	int ret = av_seek_frame(m->fmt, d->stream->index, ts, AVSEEK_FLAG_BACKWARD);
+	if (ret < 0)
+		blog(LOG_WARNING, "MP: Failed to seek: %s", av_err2str(ret));
+
+	if (m->has_video)
+		mp_decode_flush(&m->v);
+	if (m->has_audio)
+		mp_decode_flush(&m->a);
+	m->eof = false;
+
+	if (!prepare_frames(m))
+		return;
+
+	/* Decode up to the frame the target falls inside. The frame before it
+	 * is the one shown if the file runs out first, so it is not let go of
+	 * until there is one after it: it stays in the history. */
+	while (m->has_video && m->v.frame_ready && m->v.next_pts <= target) {
+		m->v.frame_ready = false;
+		if (!prepare_frames(m) || !m->v.frame_ready)
+			break;
+	}
+
+	drop_audio_before(m, target);
+}
+
+/* ------------------------------------------------------------------------- */
+/* handing frames out */
+
+/* Puts the frame the video decoder is holding on screen now, or the last one
+ * decoded if it is holding none. */
+static void show_still(mp_media_t *m)
+{
+	AVFrame *f = NULL;
+	int64_t pts = 0;
+	bool from_decoder = false;
+
+	if (!m->has_video || !m->v_still_cb)
+		return;
+
+	if (m->v.frame_ready) {
+		f = m->v.frame;
+		pts = m->v.frame_pts;
+		from_decoder = true;
+	} else {
+		f = hist_at_or_before(m, m->still_target, &pts);
+	}
+
+	if (!hand_out(m, f, MP_FRAME_STILL, os_gettime_ns()))
+		return;
+
+	m->cur_pts = pts;
+	m->have_cur = true;
+	m->shown = from_decoder;
+}
+
+/* hands the first frame of a clip that is being cued over to be put up the
+ * moment it is started */
+static void cue_first_frame(mp_media_t *m)
+{
+	if (!m->has_video || !m->v.frame_ready || !m->v_preload_cb)
+		return;
+
+	hand_out(m, m->v.frame, MP_FRAME_PRELOAD, os_gettime_ns());
+}
+
+static void emit_video(mp_media_t *m, uint64_t due, uint64_t now)
+{
+	struct mp_decode *d = &m->v;
+	int64_t pts = d->frame_pts;
+
+	d->frame_ready = false;
+	m->cur_pts = pts;
+	m->have_cur = true;
+	m->shown = false;
+
+	if (!m->v_cb || due + LATE_DROP_NS < now)
+		return;
+
+	hand_out(m, d->frame, MP_FRAME_TIMED, due);
+}
+
+static void emit_stretched(void *param, AVFrame *f, uint64_t timestamp)
+{
+	mp_media_t *m = param;
+	struct obs_source_audio audio = {0};
+
+	for (size_t i = 0; i < MAX_AV_PLANES; i++)
+		audio.data[i] = f->data[i];
+
+#if LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(59, 19, 100)
+	audio.speakers = convert_speaker_layout((uint8_t)f->channels);
+#else
+	audio.speakers = convert_speaker_layout((uint8_t)f->ch_layout.nb_channels);
+#endif
+	audio.samples_per_sec = (uint32_t)f->sample_rate;
+	audio.format = convert_sample_format(f->format);
+	audio.frames = (uint32_t)f->nb_samples;
+	audio.timestamp = timestamp;
+
+	if (audio.format != AUDIO_FORMAT_UNKNOWN)
+		m->a_cb(m->opaque, &audio);
+}
+
+static void emit_audio(mp_media_t *m, uint64_t due)
+{
+	struct mp_decode *d = &m->a;
+	AVFrame *f = d->frame;
+	struct obs_source_audio audio = {0};
+	int channels;
+
+	d->frame_ready = false;
+
+	if (!m->has_video) {
+		m->cur_pts = d->frame_pts;
+		m->have_cur = true;
+	}
+
+	if (!m->a_cb)
+		return;
+
+	/* At another speed the sound is stretched in time rather than played
+	 * at another rate, when it is to keep its pitch. Sound the stretcher
+	 * cannot take falls through to the plain way below. */
+	if (m->preserve_pitch && m->speed != 100 && m->is_local_file) {
+		if (mp_stretch_push(&m->stretch, f, m->speed, due, emit_stretched, m))
+			return;
+	} else if (m->stretch.graph) {
+		mp_stretch_reset(&m->stretch);
+	}
+
+#if LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(59, 19, 100)
+	channels = f->channels;
+#else
+	channels = f->ch_layout.nb_channels;
+#endif
+
+	for (size_t i = 0; i < MAX_AV_PLANES; i++)
+		audio.data[i] = f->data[i];
+
+	/* Speed is applied to the sound by playing it at a rate that much
+	 * faster or slower; libobs resamples it to the mix rate. */
+	audio.samples_per_sec = (uint32_t)((int64_t)f->sample_rate * m->speed / 100);
+	audio.speakers = convert_speaker_layout((uint8_t)channels);
+	audio.format = convert_sample_format(f->format);
+	audio.frames = f->nb_samples;
+	audio.timestamp = due;
+
+	if (audio.format == AUDIO_FORMAT_UNKNOWN || !audio.samples_per_sec)
+		return;
+
+	m->a_cb(m->opaque, &audio);
+}
+
+/* Whatever the clip holds next, out of both streams, or NULL when it has run
+ * out. */
+static struct mp_decode *next_up(mp_media_t *m)
+{
+	bool v = m->has_video && in_clip(m, &m->v);
+	bool a = m->has_audio && in_clip(m, &m->a);
+
+	if (v && a)
+		return m->a.frame_pts < m->v.frame_pts ? &m->a : &m->v;
+	if (v)
+		return &m->v;
+	if (a)
+		return &m->a;
+	return NULL;
+}
+
+static void cue_clip(mp_media_t *m)
+{
+	seek_exact(m, m->in_ns);
+	cue_first_frame(m);
+	m->have_cur = false;
+}
+
+static void start_playing(mp_media_t *m)
+{
+	m->state = MP_STATE_PLAYING;
+	m->need_anchor = true;
+}
+
+/* the clip has run out: around again, or finished */
+static void reached_end(mp_media_t *m)
+{
+	if (m->looping && m->is_local_file) {
+		/* The clip goes round with no gap: its start falls due when
+		 * its end would have. Both are the clip's own bounds rather
+		 * than wherever the audio frames either side of them happen
+		 * to start or stop, which would open a gap of up to a frame
+		 * of sound at each end. */
+		int64_t end = m->played_end;
+		if (m->out_ns && end > m->out_ns)
+			end = m->out_ns;
+
+		uint64_t end_wall = clock_wall_for(m, end);
+		uint64_t now = os_gettime_ns();
+
+		seek_exact(m, m->in_ns);
+
+		if (!next_up(m)) {
+			m->state = MP_STATE_ENDED;
+			publish(m);
+			emit_event(m, MP_EVENT_ENDED, 0);
+			return;
+		}
+
+		if (end_wall + MAX_TS_VAR < now)
+			end_wall = now;
+		clock_anchor(m, end_wall, m->in_ns);
+		m->played_end = m->in_ns;
+		return;
+	}
+
+	m->state = MP_STATE_ENDED;
+
+	if (m->is_local_file)
+		cue_clip(m);
+
+	publish(m);
+	emit_event(m, MP_EVENT_ENDED, 0);
+}
+
+/* Hands out everything that has fallen due. Returns how long until the next
+ * thing does, or 0 if playback has stopped. */
+static uint64_t play_due(mp_media_t *m)
+{
+	for (int handed = 0; handed < 16; handed++) {
+		struct mp_decode *d = next_up(m);
+
+		if (!d) {
+			reached_end(m);
+			if (m->state != MP_STATE_PLAYING)
+				return 0;
+			continue;
+		}
+
+		uint64_t now = os_gettime_ns();
+
+		if (m->need_anchor)
+			clock_anchor(m, now, d->frame_pts);
+
+		uint64_t due = clock_wall_for(m, d->frame_pts);
+
+		/* a gap or a jump in the input: carry on from here */
+		if (due > now + MAX_TS_VAR || due + MAX_TS_VAR < now) {
+			clock_anchor(m, now, d->frame_pts);
+			due = now;
+		}
+
+		if (due > now + DUE_SLACK_NS)
+			return due - now;
+
+		if (d->next_pts > m->played_end)
+			m->played_end = d->next_pts;
+
+		if (d == &m->v)
+			emit_video(m, due, now);
+		else
+			emit_audio(m, due);
+
+		if (!prepare_frames(m)) {
+			if (os_atomic_load_bool(&m->interrupt))
+				return 1;
+
+			if (m->is_local_file) {
+				reached_end(m);
+			} else {
+				m->state = MP_STATE_ERROR;
+				publish(m);
+				emit_event(m, MP_EVENT_ERROR, 0);
+			}
+			return 0;
+		}
+	}
+
+	/* let the commands in before carrying on */
+	return 1;
+}
+
+/* ------------------------------------------------------------------------- */
+/* opening files */
+
+static int interrupt_callback(void *data)
+{
+	mp_media_t *m = data;
+	return os_atomic_load_bool(&m->interrupt);
+}
+
+static void close_input(mp_media_t *m)
+{
+	if (m->has_video)
+		mp_decode_clear_packets(&m->v);
+	if (m->has_audio)
+		mp_decode_clear_packets(&m->a);
+
+	avformat_close_input(&m->fmt);
+	hist_clear(m);
+	mp_stretch_reset(&m->stretch);
+
+	m->has_video = false;
+	m->has_audio = false;
+	m->v.frame_ready = false;
+	m->a.frame_ready = false;
+	m->eof = false;
+	m->have_cur = false;
+	m->shown = false;
+	m->start_ns = 0;
+	m->in_ns = 0;
+	m->out_ns = 0;
+	m->file_end_ns = 0;
+}
+
+#define RIST_PROTO "rist"
+
+static bool open_input(mp_media_t *m, const struct mp_load *load)
+{
+	const AVInputFormat *format = NULL;
+
+	if (load->format && *load->format) {
+		format = av_find_input_format(load->format);
+		if (!format)
+			blog(LOG_INFO, "MP: Unable to find input format for '%s'", load->path);
+	}
+
+	AVDictionary *opts = NULL;
+	bool is_rist = strncmp(load->path, RIST_PROTO, strlen(RIST_PROTO)) == 0;
+	if (load->buffering && !load->is_local_file && !is_rist)
+		av_dict_set_int(&opts, "buffer_size", load->buffering, 0);
+
+	if (load->ffmpeg_options && *load->ffmpeg_options) {
+		int ret = av_dict_parse_string(&opts, load->ffmpeg_options, "=", " ", 0);
+		if (ret)
+			blog(LOG_WARNING, "Failed to parse FFmpeg options: %s\n%s", av_err2str(ret),
+			     load->ffmpeg_options);
+	}
+
+	m->fmt = avformat_alloc_context();
+	if (!m->fmt) {
+		av_dict_free(&opts);
+		return false;
+	}
+
+	if (load->buffering == 0 && !load->is_local_file)
+		m->fmt->flags |= AVFMT_FLAG_NOBUFFER;
+	if (!load->is_local_file)
+		av_dict_set(&opts, "stimeout", "30000000", 0);
+
+	m->fmt->interrupt_callback.callback = interrupt_callback;
+	m->fmt->interrupt_callback.opaque = m;
+
+	int ret = avformat_open_input(&m->fmt, load->path, format, opts ? &opts : NULL);
+	av_dict_free(&opts);
+
+	if (ret < 0) {
+		if (!load->reconnecting && ret != AVERROR_EXIT)
+			blog(LOG_WARNING, "MP: Failed to open media: '%s'", load->path);
+		return false;
+	}
+
+	if (avformat_find_stream_info(m->fmt, NULL) < 0) {
+		blog(LOG_WARNING, "MP: Failed to find stream info for '%s'", load->path);
+		return false;
+	}
+
+	int vi = av_find_best_stream(m->fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+	int ai = av_find_best_stream(m->fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+
+	m->has_video = vi >= 0 && mp_decode_open(&m->v, m, m->fmt->streams[vi], false, load->hw);
+	m->has_audio = ai >= 0 && mp_decode_open(&m->a, m, m->fmt->streams[ai], true, load->hw);
+
+	if (!m->has_video && !m->has_audio) {
+		blog(LOG_WARNING, "MP: Could not initialize audio or video: '%s'", load->path);
+		return false;
+	}
+
+	return true;
+}
+
+/* where the clip sits in the file, worked out once the file is open */
+static void place_clip(mp_media_t *m, const struct mp_load *load)
+{
+	int64_t start = m->fmt->start_time;
+	int64_t duration = m->fmt->duration;
+
+	m->start_ns = start == AV_NOPTS_VALUE ? 0 : av_rescale(start, NS_PER_SEC, AV_TIME_BASE);
+	m->file_end_ns = duration == AV_NOPTS_VALUE || duration <= 0
+				 ? 0
+				 : m->start_ns + av_rescale(duration, NS_PER_SEC, AV_TIME_BASE);
+
+	m->in_ns = m->start_ns;
+	m->out_ns = 0;
+
+	if (!load->is_local_file)
+		return;
+
+	if (load->out_ms > 0) {
+		int64_t out = m->start_ns + load->out_ms * NS_PER_MS;
+
+		if (!m->file_end_ns || out < m->file_end_ns)
+			m->out_ns = out;
+	}
+
+	int64_t end = clip_end_ns(m);
+
+	if (load->tail_ms > 0) {
+		if (end) {
+			int64_t in = end - load->tail_ms * NS_PER_MS;
+			m->in_ns = in > m->start_ns ? in : m->start_ns;
+		}
+	} else if (load->in_ms > 0) {
+		int64_t in = m->start_ns + load->in_ms * NS_PER_MS;
+
+		if (!end || in < end)
+			m->in_ns = in;
+	}
+}
+
+static void do_load(mp_media_t *m, struct mp_load *load)
+{
+	emit_event(m, MP_EVENT_LOADING, load->seq);
+
+	close_input(m);
+
+	if (m->cur) {
+		bfree(m->cur->path);
+		bfree(m->cur->format);
+		bfree(m->cur->ffmpeg_options);
+		bfree(m->cur);
+	}
+	m->cur = load;
+
+	m->is_local_file = load->is_local_file;
+	m->looping = load->looping;
+	m->force_range = load->force_range;
+	os_atomic_set_bool(&m->is_linear_alpha, load->is_linear_alpha);
+	m->preserve_pitch = load->preserve_pitch;
+	/* read by the decoder as it is opened for the file, and from then on
+	 * as each frame comes out of it */
+	m->gpu_direct = load->hw && load->gpu_direct && m->v_gpu_cb &&
+			mp_decode_gpu_direct_type() != AV_HWDEVICE_TYPE_NONE;
+	m->speed = load->is_local_file && load->speed >= MP_SPEED_MIN && load->speed <= MP_SPEED_MAX ? load->speed
+												     : 100;
+	m->state = MP_STATE_OPENING;
+	publish(m);
+
+	if (!open_input(m, load)) {
+		close_input(m);
+		m->state = MP_STATE_ERROR;
+		publish_loaded(m, load->seq);
+		emit_event(m, MP_EVENT_LOAD_FAILED, load->seq);
+		return;
+	}
+
+	place_clip(m, load);
+
+	if (m->in_ns > m->start_ns) {
+		seek_exact(m, m->in_ns);
+	} else if (!prepare_frames(m)) {
+		close_input(m);
+		m->state = MP_STATE_ERROR;
+		publish_loaded(m, load->seq);
+		emit_event(m, MP_EVENT_LOAD_FAILED, load->seq);
+		return;
+	}
+
+	m->played_end = m->in_ns;
+
+	switch (load->start) {
+	case MP_START_PLAY:
+		start_playing(m);
+		break;
+	case MP_START_HOLD:
+		show_still(m);
+		m->state = MP_STATE_PAUSED;
+		break;
+	case MP_START_CUE:
+	default:
+		cue_first_frame(m);
+		m->state = MP_STATE_STOPPED;
+		break;
+	}
+
+	publish_loaded(m, load->seq);
+	emit_event(m, MP_EVENT_LOADED, load->seq);
+}
+
+/* ------------------------------------------------------------------------- */
+/* commands */
+
+static void do_restart(mp_media_t *m)
+{
+	if (!m->fmt) {
+		/* a file that could not be read is given another go */
+		if (m->cur && m->state == MP_STATE_ERROR) {
+			struct mp_load *again = bmemdup(m->cur, sizeof(*again));
+
+			again->path = bstrdup(m->cur->path);
+			again->format = m->cur->format ? bstrdup(m->cur->format) : NULL;
+			again->ffmpeg_options = m->cur->ffmpeg_options ? bstrdup(m->cur->ffmpeg_options) : NULL;
+			again->start = MP_START_PLAY;
+			do_load(m, again);
+		}
+		return;
+	}
+
+	if (m->is_local_file)
+		seek_exact(m, m->in_ns);
+
+	m->played_end = m->in_ns;
+	start_playing(m);
+}
+
+static void do_pause(mp_media_t *m, bool pause)
+{
+	if (!m->fmt)
+		return;
+
+	if (pause) {
+		switch (m->state) {
+		case MP_STATE_PLAYING:
+			m->state = MP_STATE_PAUSED;
+			break;
+		case MP_STATE_STOPPED:
+		case MP_STATE_ENDED:
+			/* hold the start of the clip on screen */
+			show_still(m);
+			m->state = MP_STATE_PAUSED;
+			break;
+		default:
+			break;
+		}
+		return;
+	}
+
+	switch (m->state) {
+	case MP_STATE_PAUSED:
+		/* the frame on screen has been seen; play on from the one
+		 * after it, timed from now */
+		if (m->shown && m->has_video) {
+			m->v.frame_ready = false;
+			prepare_frames(m);
+		}
+		if (m->have_cur)
+			drop_audio_before(m, m->cur_pts);
+		m->shown = false;
+		start_playing(m);
+		break;
+	case MP_STATE_STOPPED:
+	case MP_STATE_ENDED:
+		do_restart(m);
+		break;
+	default:
+		break;
+	}
+}
+
+static void do_stop(mp_media_t *m)
+{
+	if (!m->fmt)
+		return;
+
+	if (m->is_local_file)
+		cue_clip(m);
+	m->state = MP_STATE_STOPPED;
+}
+
+static void do_seek(mp_media_t *m, int64_t ms)
+{
+	if (!m->fmt || !m->is_local_file)
+		return;
+
+	seek_exact(m, m->in_ns + ms * NS_PER_MS);
+	m->played_end = m->in_ns + ms * NS_PER_MS;
+
+	if (m->state == MP_STATE_PLAYING) {
+		m->need_anchor = true;
+	} else {
+		show_still(m);
+		m->state = MP_STATE_PAUSED;
+	}
+}
+
+static void do_step(mp_media_t *m, int frames)
+{
+	struct mp_decode *d = &m->v;
+
+	if (!m->fmt || !m->has_video || !m->is_local_file || !frames)
+		return;
+
+	bool was_still = m->state != MP_STATE_PLAYING && m->state != MP_STATE_PAUSED;
+	m->state = MP_STATE_PAUSED;
 
 	if (frames > 0) {
-		/* if the ready frame has not been shown yet (paused mid
-		 * playback), displaying it is the first step */
-		int advance = frames - (m->v_frame_displayed ? 0 : 1);
+		int left = frames;
 
-		for (int i = 0; i < advance; i++) {
+		/* a frame that is ready but has not been seen - paused part way
+		 * through, or sitting at the start - is the first step */
+		if (!m->shown && d->frame_ready)
+			left--;
+
+		while (left > 0) {
 			d->frame_ready = false;
-			if (!mp_media_prepare_frames(m) || !d->frame_ready)
+			if (!prepare_frames(m) || !in_clip(m, d)) {
+				/* stepped off the end: stay on the last frame */
+				seek_exact(m, clip_end_ns(m));
 				break;
+			}
+			left--;
 		}
 	} else {
-		int64_t interval = d->last_duration;
-		if (interval <= 0) {
-			AVRational fr = d->stream->avg_frame_rate;
-			interval = fr.num > 0 ? av_rescale(1000000000LL, fr.den, fr.num) : 33333333LL;
-			if (m->speed != 100)
-				interval = av_rescale(interval, 100, m->speed);
-		}
+		int64_t interval = frame_interval(m);
+		int64_t from = m->have_cur && !was_still ? m->cur_pts : m->in_ns;
+		int64_t target = from + (int64_t)frames * interval;
 
-		int64_t cur = d->frame_pts - (m->v_frame_displayed ? 0 : interval);
-		int64_t target = cur + (int64_t)frames * interval;
-		if (target < 0)
-			target = 0;
+		if (target < m->in_ns)
+			target = m->in_ns;
 
-		/* if the target frame is still in the frame history, show it
-		 * right away; the keyframe re-decode below then only serves
-		 * to re-synchronize the decoder with what is on screen */
+		/* a frame still in the history goes up straight away; the
+		 * decode below then only puts the decoder back in step with
+		 * what is on screen */
 		int64_t found_pts;
-		AVFrame *cached = mp_media_hist_find(m, av_rescale(target, m->speed, 100),
-						     av_rescale(interval, m->speed, 100) / 2, &found_pts);
-		if (cached && m->v_seek_cb) {
-			AVFrame *dec_frame = d->frame;
-			int64_t dec_pts = d->frame_pts;
-			bool dec_ready = d->frame_ready;
+		AVFrame *cached = hist_find(m, target, interval / 2, &found_pts);
 
-			/* borrow the decoder slot so the cached frame runs
-			 * through the normal conversion/callback path */
-			d->frame = cached;
-			d->frame_pts = av_rescale(found_pts, 100, m->speed);
-			d->frame_ready = true;
-			mp_media_next_video(m, true);
+		if (cached && m->v_still_cb)
+			hand_out(m, cached, MP_FRAME_STILL, os_gettime_ns());
 
-			d->frame = dec_frame;
-			d->frame_pts = dec_pts;
-			d->frame_ready = dec_ready;
-		}
-
-		/* seek to the keyframe before the target without letting
-		 * seek_to preview it, then decode forward to the exact
-		 * frame; timestamps here are in the speed-scaled domain,
-		 * seek_to expects unscaled microseconds */
-		m->seek_next_ts = false;
-		seek_to(m, av_rescale(target, m->speed, 100) / 1000);
-		m->eof = false;
-		m->seek_next_ts = true;
-
-		while (mp_media_prepare_frames(m) && d->frame_ready && d->frame_pts < target - interval / 2)
-			d->frame_ready = false;
+		/* the middle of the frame, so rounding in the interval cannot
+		 * land the seek on the frame next to it */
+		seek_exact(m, target + interval / 2);
 	}
 
-	if (d->frame_ready && m->v_seek_cb)
-		mp_media_next_video(m, true);
-
-	/* drop audio frames that fall behind the stepped video position so
-	 * playback resumes in sync */
-	while (m->has_audio && m->a.frame_ready && m->a.frame_pts < d->frame_pts) {
-		m->a.frame_ready = false;
-		if (!mp_media_prepare_frames(m))
-			break;
-	}
-
-	m->seek_next_ts = false;
+	show_still(m);
+	drop_audio_before(m, m->cur_pts);
 }
 
-bool mp_media_init2(mp_media_t *m)
+static void do_speed(mp_media_t *m, int speed)
 {
-	if (!init_avformat(m)) {
-		return false;
+	if (speed < MP_SPEED_MIN)
+		speed = MP_SPEED_MIN;
+	else if (speed > MP_SPEED_MAX)
+		speed = MP_SPEED_MAX;
+
+	if (!m->is_local_file || speed == m->speed)
+		return;
+
+	/* the clock carries on from where it has got to, at the new rate: the
+	 * next frame falls due as late or as early as it now should */
+	if (m->state == MP_STATE_PLAYING && !m->need_anchor) {
+		uint64_t now = os_gettime_ns();
+		clock_anchor(m, now, clock_media_at(m, now));
 	}
+
+	m->speed = speed;
+}
+
+static void free_load(struct mp_load *load)
+{
+	if (!load)
+		return;
+	bfree(load->path);
+	bfree(load->format);
+	bfree(load->ffmpeg_options);
+	bfree(load);
+}
+
+/* Takes the next command off the queue. Commands that a later one in the queue
+ * makes pointless are dropped on the way: a load overtaken by another load, a
+ * seek or a speed overtaken by another of the same, and steps next to each
+ * other are added together. */
+static bool next_command(mp_media_t *m, struct mp_cmd *out)
+{
+	pthread_mutex_lock(&m->mutex);
+
+	while (m->cmds.num) {
+		struct mp_cmd cmd = m->cmds.array[0];
+		bool superseded = false;
+
+		da_erase(m->cmds, 0);
+
+		/* Steps add up: the ones queued behind this one are carried
+		 * out with it, past anything in between that does not move
+		 * the clip or set it playing - a speed change, a pause - which
+		 * still happens, after. */
+		if (cmd.type == MP_CMD_STEP) {
+			for (size_t i = 0; i < m->cmds.num;) {
+				struct mp_cmd *later = &m->cmds.array[i];
+
+				if (later->type == MP_CMD_STEP) {
+					cmd.value += later->value;
+					da_erase(m->cmds, i);
+				} else if (later->type == MP_CMD_SPEED || later->type == MP_CMD_LOOPING ||
+					   later->type == MP_CMD_PITCH ||
+					   (later->type == MP_CMD_PAUSE && later->value)) {
+					i++;
+				} else {
+					break;
+				}
+			}
+		}
+
+		if (cmd.type == MP_CMD_LOAD || cmd.type == MP_CMD_SPEED) {
+			for (size_t i = 0; i < m->cmds.num; i++) {
+				if (m->cmds.array[i].type == cmd.type ||
+				    (cmd.type != MP_CMD_LOAD && m->cmds.array[i].type == MP_CMD_LOAD)) {
+					superseded = true;
+					break;
+				}
+			}
+		} else if (cmd.type == MP_CMD_SEEK || cmd.type == MP_CMD_STEP) {
+			/* Where a seek or a step would leave the clip does not
+			 * matter if a later command moves it again. Seeks and
+			 * steps can be asked for far faster than a backward step
+			 * can be decoded, and carrying out every one of them in
+			 * turn leaves playback behind for as long as the backlog
+			 * takes. A step pauses a clip that is playing, which a
+			 * later seek would not, so one overtaken by a seek still
+			 * pauses. */
+			for (size_t i = 0; i < m->cmds.num; i++) {
+				enum mp_cmd_type later = m->cmds.array[i].type;
+
+				if (later == MP_CMD_SEEK && cmd.type == MP_CMD_STEP) {
+					cmd.type = MP_CMD_PAUSE;
+					cmd.value = 1;
+					break;
+				}
+
+				if (later == MP_CMD_SEEK || later == MP_CMD_RESTART || later == MP_CMD_STOP ||
+				    later == MP_CMD_LOAD) {
+					superseded = true;
+					break;
+				}
+			}
+		}
+
+		if (superseded) {
+			free_load(cmd.load);
+			continue;
+		}
+
+		if (cmd.type == MP_CMD_LOAD) {
+			/* nothing still queued is asking the load to give up */
+			bool pending = false;
+			for (size_t i = 0; i < m->cmds.num; i++)
+				pending |= m->cmds.array[i].type == MP_CMD_LOAD || m->cmds.array[i].type == MP_CMD_KILL;
+			if (!pending)
+				os_atomic_set_bool(&m->interrupt, false);
+		}
+
+		*out = cmd;
+		pthread_mutex_unlock(&m->mutex);
+		return true;
+	}
+
+	pthread_mutex_unlock(&m->mutex);
+	return false;
+}
+
+/* Carries out every queued command. False once the engine is being shut. */
+static bool run_commands(mp_media_t *m)
+{
+	struct mp_cmd cmd;
+	bool any = false;
+
+	while (next_command(m, &cmd)) {
+		any = true;
+
+		switch (cmd.type) {
+		case MP_CMD_KILL:
+			free_load(cmd.load);
+			return false;
+		case MP_CMD_LOAD:
+			do_load(m, cmd.load);
+			cmd.load = NULL;
+			break;
+		case MP_CMD_CLOSE:
+			close_input(m);
+			m->state = MP_STATE_IDLE;
+			break;
+		case MP_CMD_RESTART:
+			do_restart(m);
+			break;
+		case MP_CMD_PAUSE:
+			do_pause(m, cmd.value != 0);
+			break;
+		case MP_CMD_STOP:
+			do_stop(m);
+			break;
+		case MP_CMD_SEEK:
+			do_seek(m, cmd.value);
+			break;
+		case MP_CMD_STEP:
+			do_step(m, (int)cmd.value);
+			break;
+		case MP_CMD_SPEED:
+			do_speed(m, (int)cmd.value);
+			break;
+		case MP_CMD_LOOPING:
+			m->looping = cmd.value != 0;
+			break;
+		case MP_CMD_PITCH:
+			m->preserve_pitch = cmd.value != 0;
+			break;
+		case MP_CMD_NO_GPU_DIRECT:
+			/* the frames still to be decoded come out as copies; the
+			 * decoder is opened afresh for the next file, without the
+			 * extra surfaces */
+			m->gpu_direct = false;
+			if (m->cur)
+				m->cur->gpu_direct = false;
+			break;
+		}
+
+		free_load(cmd.load);
+	}
+
+	if (any)
+		publish(m);
+
 	return true;
 }
 
-static inline bool mp_media_thread(mp_media_t *m)
-{
-	os_set_thread_name("mp_media_thread");
+/* ------------------------------------------------------------------------- */
+/* the media thread */
 
-	if (!mp_media_init2(m)) {
-		return false;
-	}
-	if (!mp_media_reset(m)) {
-		return false;
-	}
-
-	for (;;) {
-		bool reset, kill, is_active, seek, pause, reset_time, preload_frame;
-		int64_t seek_pos;
-		int new_speed, step;
-		bool timeout = false;
-
-		pthread_mutex_lock(&m->mutex);
-		is_active = m->active;
-		pause = m->pause;
-		pthread_mutex_unlock(&m->mutex);
-
-		if (!is_active || pause) {
-			if (os_sem_wait(m->sem) < 0)
-				return false;
-			if (pause)
-				reset_ts(m);
-		} else {
-			timeout = mp_media_sleep(m);
-		}
-
-		pthread_mutex_lock(&m->mutex);
-
-		reset = m->reset;
-		kill = m->kill;
-		m->reset = false;
-		m->kill = false;
-
-		preload_frame = m->preload_frame;
-		pause = m->pause;
-		seek_pos = m->seek_pos;
-		seek = m->seek;
-		reset_time = m->reset_ts;
-		new_speed = m->speed_request;
-		step = m->step_frames;
-		m->preload_frame = false;
-		m->seek = false;
-		m->reset_ts = false;
-		m->speed_request = 0;
-		m->step_frames = 0;
-
-		pthread_mutex_unlock(&m->mutex);
-
-		if (kill) {
-			break;
-		}
-		if (reset) {
-			mp_media_reset(m);
-			continue;
-		}
-
-		if (new_speed)
-			mp_media_apply_speed(m, new_speed);
-
-		if (seek) {
-			m->seek_next_ts = true;
-			seek_to(m, seek_pos);
-			continue;
-		}
-
-		if (reset_time) {
-			reset_ts(m);
-			mp_media_resume(m);
-			continue;
-		}
-
-		if (step && pause) {
-			mp_media_step(m, step);
-			continue;
-		}
-
-		if (pause)
-			continue;
-
-		/* see note in mp_media_prepare_frames() for context on the
-		 * pointer check */
-		if (preload_frame && m->obsframe.data[0] && !is_active) {
-			m->v_preload_cb(m->opaque, &m->obsframe);
-		}
-
-		/* frames are ready */
-		if (is_active && !timeout) {
-			if (m->has_video)
-				mp_media_next_video(m, false);
-			if (m->has_audio)
-				mp_media_next_audio(m);
-
-			if (!mp_media_prepare_frames(m))
-				return false;
-			if (mp_media_eof(m))
-				continue;
-
-			mp_media_calc_next_ns(m);
-		}
-	}
-
-	return true;
-}
-
-static void *mp_media_thread_start(void *opaque)
+static void *media_thread(void *opaque)
 {
 	mp_media_t *m = opaque;
+	uint64_t wait_ns = 0;
+	uint64_t last_publish = 0;
 
-	if (!mp_media_thread(m)) {
-		if (m->stop_cb) {
-			m->stop_cb(m->opaque);
+	os_set_thread_name("mp_media_thread");
+
+	for (;;) {
+		if (m->state == MP_STATE_PLAYING && wait_ns) {
+			unsigned long ms = (unsigned long)(wait_ns / NS_PER_MS);
+			os_event_timedwait(m->wake, ms ? ms : 1);
+		} else if (m->state != MP_STATE_PLAYING) {
+			os_event_wait(m->wake);
+		}
+
+		if (!run_commands(m))
+			break;
+
+		wait_ns = 0;
+
+		if (m->state == MP_STATE_PLAYING) {
+			wait_ns = play_due(m);
+
+			/* the position is published as it moves, but not on
+			 * every frame */
+			uint64_t now = os_gettime_ns();
+			if (now - last_publish > 20 * NS_PER_MS) {
+				publish(m);
+				last_publish = now;
+			}
 		}
 	}
 
 	return NULL;
 }
 
-static inline bool mp_media_init_internal(mp_media_t *m, const struct mp_media_info *info)
+/* ------------------------------------------------------------------------- */
+/* the callers' side */
+
+static void post(media_playback_t *mp, enum mp_cmd_type type, int64_t value, struct mp_load *load)
 {
-	if (pthread_mutex_init(&m->mutex, NULL) != 0) {
-		blog(LOG_WARNING, "MP: Failed to init mutex");
-		return false;
-	}
-	if (os_sem_init(&m->sem, 0) != 0) {
-		blog(LOG_WARNING, "MP: Failed to init semaphore");
-		return false;
-	}
+	struct mp_cmd cmd = {.type = type, .value = value, .load = load};
 
-	m->path = info->path ? bstrdup(info->path) : NULL;
-	m->format_name = info->format ? bstrdup(info->format) : NULL;
-	m->hw = info->hardware_decoding;
+	pthread_mutex_lock(&mp->mutex);
+	da_push_back(mp->cmds, &cmd);
+	if (type == MP_CMD_LOAD || type == MP_CMD_KILL)
+		os_atomic_set_bool(&mp->interrupt, true);
+	pthread_mutex_unlock(&mp->mutex);
 
-	if (info->full_decode)
-		return true;
-
-	if (pthread_create(&m->thread, NULL, mp_media_thread_start, m) != 0) {
-		blog(LOG_WARNING, "MP: Could not create media thread");
-		return false;
-	}
-
-	m->thread_valid = true;
-	return true;
+	os_event_signal(mp->wake);
 }
 
-bool mp_media_init(mp_media_t *media, const struct mp_media_info *info)
+media_playback_t *media_playback_create(const struct mp_media_info *info)
 {
-	memset(media, 0, sizeof(*media));
-	pthread_mutex_init_value(&media->mutex);
-	media->opaque = info->opaque;
-	media->v_cb = info->v_cb;
-	media->a_cb = info->a_cb;
-	media->stop_cb = info->stop_cb;
-	media->resume_cb = info->resume_cb;
-	media->ffmpeg_options = info->ffmpeg_options;
-	media->v_seek_cb = info->v_seek_cb;
-	media->v_preload_cb = info->v_preload_cb;
-	media->force_range = info->force_range;
-	media->is_linear_alpha = info->is_linear_alpha;
-	media->buffering = info->buffering;
-	media->speed = info->speed;
-	media->request_preload = info->request_preload;
-	media->is_local_file = info->is_local_file;
-	da_init(media->packet_pool);
-
-	if (!info->is_local_file || media->speed < MP_SPEED_MIN || media->speed > MP_SPEED_MAX)
-		media->speed = 100;
-
 	static bool initialized = false;
+
 	if (!initialized) {
 		avdevice_register_all();
 		avformat_network_init();
 		initialized = true;
 	}
 
-	if (!base_sys_ts)
-		base_sys_ts = (int64_t)os_gettime_ns();
+	media_playback_t *mp = bzalloc(sizeof(*mp));
 
-	if (!mp_media_init_internal(media, info)) {
-		mp_media_free(media);
-		return false;
+	mp->opaque = info->opaque;
+	mp->v_cb = info->v_cb;
+	mp->v_preload_cb = info->v_preload_cb;
+	mp->v_still_cb = info->v_still_cb;
+	mp->a_cb = info->a_cb;
+	mp->v_gpu_cb = info->v_gpu_cb;
+	mp->event_cb = info->event_cb;
+	mp->speed = 100;
+	mp->state = MP_STATE_IDLE;
+	mp->scale_src = AV_PIX_FMT_NONE;
+	mp->status.speed = 100;
+	da_init(mp->cmds);
+	da_init(mp->packet_pool);
+
+	if (pthread_mutex_init(&mp->mutex, NULL) != 0) {
+		blog(LOG_WARNING, "MP: Failed to init mutex");
+		bfree(mp);
+		return NULL;
 	}
 
-	return true;
-}
-
-static void mp_kill_thread(mp_media_t *m)
-{
-	if (m->thread_valid) {
-		pthread_mutex_lock(&m->mutex);
-		m->kill = true;
-		pthread_mutex_unlock(&m->mutex);
-		os_sem_post(m->sem);
-
-		pthread_join(m->thread, NULL);
+	if (os_event_init(&mp->wake, OS_EVENT_TYPE_AUTO) != 0) {
+		blog(LOG_WARNING, "MP: Failed to init event");
+		pthread_mutex_destroy(&mp->mutex);
+		bfree(mp);
+		return NULL;
 	}
+
+	if (pthread_create(&mp->thread, NULL, media_thread, mp) != 0) {
+		blog(LOG_WARNING, "MP: Could not create media thread");
+		os_event_destroy(mp->wake);
+		pthread_mutex_destroy(&mp->mutex);
+		bfree(mp);
+		return NULL;
+	}
+
+	mp->thread_valid = true;
+	return mp;
 }
 
-void mp_media_free(mp_media_t *media)
+void media_playback_destroy(media_playback_t *mp)
 {
-	if (!media)
+	if (!mp)
 		return;
 
-	mp_media_stop(media);
-	mp_kill_thread(media);
-	mp_media_hist_clear(media);
-	mp_decode_free(&media->v);
-	mp_decode_free(&media->a);
-	for (size_t i = 0; i < media->packet_pool.num; i++)
-		av_packet_free(&media->packet_pool.array[i]);
-	da_free(media->packet_pool);
-	avformat_close_input(&media->fmt);
-	pthread_mutex_destroy(&media->mutex);
-	os_sem_destroy(media->sem);
-	sws_freeContext(media->swscale);
-	av_freep(&media->scale_pic[0]);
-	bfree(media->path);
-	bfree(media->format_name);
-	memset(media, 0, sizeof(*media));
-	pthread_mutex_init_value(&media->mutex);
-}
-
-void mp_media_play(mp_media_t *m, bool loop, bool reconnecting)
-{
-	pthread_mutex_lock(&m->mutex);
-
-	if (m->active)
-		m->reset = true;
-
-	m->looping = loop;
-	m->active = true;
-	m->reconnecting = reconnecting;
-
-	pthread_mutex_unlock(&m->mutex);
-
-	os_sem_post(m->sem);
-}
-
-void mp_media_play_pause(mp_media_t *m, bool pause)
-{
-	pthread_mutex_lock(&m->mutex);
-	if (m->active) {
-		m->pause = pause;
-		m->reset_ts = !pause;
+	if (mp->thread_valid) {
+		post(mp, MP_CMD_KILL, 0, NULL);
+		pthread_join(mp->thread, NULL);
 	}
-	pthread_mutex_unlock(&m->mutex);
 
-	os_sem_post(m->sem);
+	for (size_t i = 0; i < mp->cmds.num; i++)
+		free_load(mp->cmds.array[i].load);
+	da_free(mp->cmds);
+
+	close_input(mp);
+	mp_stretch_free(&mp->stretch);
+	free_load(mp->cur);
+	mp_decode_free(&mp->v);
+	mp_decode_free(&mp->a);
+	av_buffer_unref(&mp->hw_device);
+
+	for (size_t i = 0; i < mp->packet_pool.num; i++)
+		av_packet_free(&mp->packet_pool.array[i]);
+	da_free(mp->packet_pool);
+
+	free_scaling(mp);
+	os_event_destroy(mp->wake);
+	pthread_mutex_destroy(&mp->mutex);
+	bfree(mp);
 }
 
-void mp_media_preload_frame(mp_media_t *m)
+uint64_t media_playback_load(media_playback_t *mp, const struct mp_load_info *info)
 {
-	if (m->request_preload && m->thread_valid && m->v_preload_cb) {
-		pthread_mutex_lock(&m->mutex);
-		m->preload_frame = true;
-		pthread_mutex_unlock(&m->mutex);
-		os_sem_post(m->sem);
-	}
-}
-
-void mp_media_stop(mp_media_t *m)
-{
-	pthread_mutex_lock(&m->mutex);
-	if (m->active) {
-		m->reset = true;
-		m->active = false;
-		m->stopping = true;
-	}
-	pthread_mutex_unlock(&m->mutex);
-
-	os_sem_post(m->sem);
-}
-
-int64_t mp_media_get_current_time(mp_media_t *m)
-{
-	return mp_media_get_base_pts(m) * (int64_t)m->speed / 100000000LL;
-}
-
-int64_t mp_media_get_frames(mp_media_t *m)
-{
-	int64_t frames = 0;
-
-	if (!m->fmt) {
+	if (!mp || !info || !info->path || !*info->path)
 		return 0;
+
+	struct mp_load *load = bzalloc(sizeof(*load));
+
+	load->path = bstrdup(info->path);
+	load->format = info->format && *info->format ? bstrdup(info->format) : NULL;
+	load->ffmpeg_options = info->ffmpeg_options && *info->ffmpeg_options ? bstrdup(info->ffmpeg_options) : NULL;
+	load->buffering = info->buffering;
+	load->speed = info->speed;
+	load->is_local_file = info->is_local_file;
+	load->looping = info->looping;
+	load->hw = info->hardware_decoding;
+	load->reconnecting = info->reconnecting;
+	load->force_range = info->force_range;
+	load->is_linear_alpha = info->is_linear_alpha;
+	load->preserve_pitch = info->preserve_pitch;
+	load->gpu_direct = info->gpu_direct;
+	load->in_ms = info->in_ms > 0 ? info->in_ms : 0;
+	load->out_ms = info->out_ms > 0 ? info->out_ms : 0;
+	load->tail_ms = info->tail_ms > 0 ? info->tail_ms : 0;
+	load->start = info->start;
+
+	pthread_mutex_lock(&mp->mutex);
+	load->seq = ++mp->next_seq;
+	mp->status.load_seq = load->seq;
+	pthread_mutex_unlock(&mp->mutex);
+
+	post(mp, MP_CMD_LOAD, 0, load);
+	return load->seq;
+}
+
+void media_playback_close(media_playback_t *mp)
+{
+	if (mp)
+		post(mp, MP_CMD_CLOSE, 0, NULL);
+}
+
+void media_playback_restart(media_playback_t *mp)
+{
+	if (mp)
+		post(mp, MP_CMD_RESTART, 0, NULL);
+}
+
+void media_playback_pause(media_playback_t *mp, bool pause)
+{
+	if (mp)
+		post(mp, MP_CMD_PAUSE, pause, NULL);
+}
+
+void media_playback_stop(media_playback_t *mp)
+{
+	if (mp)
+		post(mp, MP_CMD_STOP, 0, NULL);
+}
+
+void media_playback_seek(media_playback_t *mp, int64_t ms)
+{
+	if (mp)
+		post(mp, MP_CMD_SEEK, ms < 0 ? 0 : ms, NULL);
+}
+
+void media_playback_step_frames(media_playback_t *mp, int frames)
+{
+	if (mp && frames)
+		post(mp, MP_CMD_STEP, frames, NULL);
+}
+
+void media_playback_set_speed(media_playback_t *mp, int speed)
+{
+	if (mp)
+		post(mp, MP_CMD_SPEED, speed, NULL);
+}
+
+void media_playback_set_looping(media_playback_t *mp, bool looping)
+{
+	if (mp)
+		post(mp, MP_CMD_LOOPING, looping, NULL);
+}
+
+void media_playback_set_preserve_pitch(media_playback_t *mp, bool preserve_pitch)
+{
+	if (mp)
+		post(mp, MP_CMD_PITCH, preserve_pitch, NULL);
+}
+
+void media_playback_disable_gpu_direct(media_playback_t *mp)
+{
+	if (mp)
+		post(mp, MP_CMD_NO_GPU_DIRECT, 0, NULL);
+}
+
+void media_playback_set_is_linear_alpha(media_playback_t *mp, bool is_linear_alpha)
+{
+	if (mp)
+		os_atomic_set_bool(&mp->is_linear_alpha, is_linear_alpha);
+}
+
+void media_playback_get_status(media_playback_t *mp, struct mp_status *status)
+{
+	if (!mp) {
+		memset(status, 0, sizeof(*status));
+		status->speed = 100;
+		return;
 	}
 
-	int video_stream_index = av_find_best_stream(m->fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
-
-	if (video_stream_index < 0) {
-		blog(LOG_WARNING, "MP: Getting number of frames failed: No "
-				  "video stream in media file!");
-		return 0;
-	}
-
-	AVStream *stream = m->fmt->streams[video_stream_index];
-
-	if (stream->nb_frames > 0) {
-		frames = stream->nb_frames;
-	} else {
-		blog(LOG_DEBUG, "MP: nb_frames not set, estimating using frame "
-				"rate and duration");
-		AVRational avg_frame_rate = stream->avg_frame_rate;
-		frames = (int64_t)ceil((double)m->fmt->duration / (double)AV_TIME_BASE * (double)avg_frame_rate.num /
-				       (double)avg_frame_rate.den);
-	}
-
-	return frames;
-}
-
-int64_t mp_media_get_duration(mp_media_t *m)
-{
-	return m->fmt ? m->fmt->duration : 0;
-}
-
-void mp_media_seek(mp_media_t *m, int64_t pos)
-{
-	pthread_mutex_lock(&m->mutex);
-	if (m->active) {
-		m->seek = true;
-		m->seek_pos = pos * 1000;
-	}
-	pthread_mutex_unlock(&m->mutex);
-
-	os_sem_post(m->sem);
-}
-
-void mp_media_set_speed(mp_media_t *m, int speed)
-{
-	pthread_mutex_lock(&m->mutex);
-	m->speed_request = speed;
-	pthread_mutex_unlock(&m->mutex);
-
-	os_sem_post(m->sem);
-}
-
-int mp_media_get_speed(mp_media_t *m)
-{
-	return m->speed;
-}
-
-void mp_media_step_frames(mp_media_t *m, int frames)
-{
-	pthread_mutex_lock(&m->mutex);
-	if (m->active && m->pause)
-		m->step_frames += frames;
-	pthread_mutex_unlock(&m->mutex);
-
-	os_sem_post(m->sem);
+	pthread_mutex_lock(&mp->mutex);
+	*status = mp->status;
+	pthread_mutex_unlock(&mp->mutex);
 }

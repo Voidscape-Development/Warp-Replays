@@ -19,11 +19,11 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/finders")
 find_package(
   FFmpeg
-  REQUIRED avcodec avdevice avutil avformat swscale
+  REQUIRED avcodec avdevice avfilter avutil avformat swscale
 )
 target_link_libraries(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE FFmpeg::avcodec FFmpeg::avdevice FFmpeg::avutil FFmpeg::avformat FFmpeg::swscale
+  PRIVATE FFmpeg::avcodec FFmpeg::avdevice FFmpeg::avfilter FFmpeg::avutil FFmpeg::avformat FFmpeg::swscale
 )
 
 if(ENABLE_FRONTEND_API)
@@ -61,15 +61,22 @@ target_sources(
     src/warp-websocket.c
     src/warp-zoom.c
     src/warp-zoom-filter.c
-    src/media-playback/cache.c
+    src/warp-video.c
+    src/warp-video-gpu.c
     src/media-playback/decode.c
-    src/media-playback/media-playback.c
     src/media-playback/media.c
+    src/media-playback/stretch.c
 )
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
+# Drawing hardware-decoded video straight off the GPU shares a D3D11 texture
+# between the decoder's device and OBS's on Windows.
+if(WIN32)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE d3d11 dxgi dxguid)
+endif()
+
 if(ENABLE_FRONTEND_API)
-  target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/warp-flow.c src/warp-trim.c)
+  target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/warp-flow.c)
 endif()
 
 if(ENABLE_FRONTEND_API AND ENABLE_QT)
