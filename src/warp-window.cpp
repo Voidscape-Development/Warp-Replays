@@ -900,7 +900,9 @@ WarpWindow::WarpWindow(QWidget *parent) : QDialog(parent)
 
 	bannerRow->setContentsMargins(10, 6, 6, 6);
 	bannerRow->setSpacing(10);
-	bannerRow->addWidget(bannerIcon, 0, Qt::AlignTop);
+	/* centred down the row the way the text is, which is as tall as the
+	 * button beside it rather than as the line of text */
+	bannerRow->addWidget(bannerIcon, 0, Qt::AlignVCenter);
 	bannerRow->addWidget(bannerText, 1);
 	bannerRow->addWidget(bannerButton);
 
