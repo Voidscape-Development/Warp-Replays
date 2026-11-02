@@ -18,7 +18,6 @@
 
 #include "media-playback.h"
 #include "media.h"
-#include <libavutil/hwcontext.h>
 #include <libavutil/mastering_display_metadata.h>
 
 enum AVHWDeviceType hw_priority[] = {
@@ -43,48 +42,6 @@ static bool has_hw_type(const AVCodec *c, enum AVHWDeviceType type, enum AVPixel
 	return false;
 }
 
-/* The decoder whose frames can be drawn straight off the GPU on this platform:
- * D3D11 textures are shared into OBS's D3D11 device on Windows, and VAAPI
- * surfaces imported into OBS's EGL context as dma-bufs on Linux. */
-enum AVHWDeviceType mp_decode_gpu_direct_type(void)
-{
-#if defined(_WIN32)
-	return AV_HWDEVICE_TYPE_D3D11VA;
-#elif defined(__linux__)
-	return AV_HWDEVICE_TYPE_VAAPI;
-#else
-	return AV_HWDEVICE_TYPE_NONE;
-#endif
-}
-
-/* Makes the device frames that are to go out on the GPU are decoded on. On
- * Windows that is the adapter OBS draws with, so a texture can be shared from
- * one device to the other. */
-static bool create_gpu_direct_device(struct media_playback *m)
-{
-	enum AVHWDeviceType type = mp_decode_gpu_direct_type();
-	const char *device = NULL;
-	AVBufferRef *hw_ctx = NULL;
-
-#if defined(_WIN32)
-	char adapter[16];
-	struct obs_video_info ovi;
-
-	if (obs_get_video_info(&ovi)) {
-		snprintf(adapter, sizeof(adapter), "%u", ovi.adapter);
-		device = adapter;
-	}
-#endif
-
-	if (type == AV_HWDEVICE_TYPE_NONE || av_hwdevice_ctx_create(&hw_ctx, type, device, NULL, 0) != 0)
-		return false;
-
-	av_buffer_unref(&m->hw_device);
-	m->hw_device = hw_ctx;
-	m->hw_type = type;
-	return true;
-}
-
 /* The hardware device is the engine's rather than the decoder's: creating one
  * is the slowest part of opening a file, and a new clip is decoded on the same
  * device as the last one. */
@@ -92,18 +49,6 @@ static void init_hw_decoder(struct mp_decode *d, AVCodecContext *c)
 {
 	struct media_playback *m = d->m;
 	enum AVHWDeviceType *priority = hw_priority;
-	enum AVHWDeviceType direct = mp_decode_gpu_direct_type();
-
-	/* frames that are to be drawn off the GPU have to come from the
-	 * decoder that can share them, whatever would be tried first
-	 * otherwise */
-	if (m->gpu_direct && direct != AV_HWDEVICE_TYPE_NONE && has_hw_type(d->codec, direct, &d->hw_format) &&
-	    ((m->hw_device && m->hw_type == direct) || create_gpu_direct_device(m))) {
-		c->hw_device_ctx = av_buffer_ref(m->hw_device);
-		c->opaque = d;
-		d->hw = true;
-		return;
-	}
 
 	if (m->hw_device && has_hw_type(d->codec, m->hw_type, &d->hw_format)) {
 		c->hw_device_ctx = av_buffer_ref(m->hw_device);
@@ -152,12 +97,6 @@ static int mp_open_codec(struct mp_decode *d, bool hw)
 
 	if (hw)
 		init_hw_decoder(d, c);
-
-	/* Frames that go out on the GPU are held on to while they wait to be
-	 * drawn, and they come out of the decoder's fixed pool of surfaces:
-	 * the pool is made big enough for the decoder to carry on regardless. */
-	if (d->hw && d->m->gpu_direct)
-		c->extra_hw_frames = MP_GPU_EXTRA_SURFACES;
 
 	if (c->thread_count == 1 && c->codec_id != AV_CODEC_ID_PNG && c->codec_id != AV_CODEC_ID_TIFF &&
 	    c->codec_id != AV_CODEC_ID_JPEG2000 && c->codec_id != AV_CODEC_ID_MPEG4 && c->codec_id != AV_CODEC_ID_WEBP)
@@ -276,7 +215,7 @@ bool mp_decode_open(struct mp_decode *d, struct media_playback *m, AVStream *str
 	}
 
 	bool reuse = d->decoder && d->params && d->codec == codec && d->params_hw == hw &&
-		     d->params_gpu_direct == m->gpu_direct && same_codec_params(d->params, stream->codecpar);
+		     same_codec_params(d->params, stream->codecpar);
 
 	d->stream = stream;
 
@@ -299,7 +238,6 @@ bool mp_decode_open(struct mp_decode *d, struct media_playback *m, AVStream *str
 		if (d->params)
 			avcodec_parameters_copy(d->params, stream->codecpar);
 		d->params_hw = hw;
-		d->params_gpu_direct = m->gpu_direct;
 
 #if LIBAVCODEC_VERSION_MAJOR < 60
 		if (d->codec->capabilities & CODEC_CAP_TRUNC)
@@ -435,18 +373,6 @@ static int decode_packet(struct mp_decode *d, int *got_frame)
 		if (d->hw_frame->format != d->hw_format) {
 			d->frame = d->hw_frame;
 			return ret;
-		}
-
-		/* A frame that is to be drawn off the GPU stays there: it is
-		 * handed out as the surface it was decoded into. Only the two
-		 * layouts the drawing side imports go that way. */
-		if (d->m->gpu_direct && d->m->hw_type == mp_decode_gpu_direct_type() && d->hw_frame->hw_frames_ctx) {
-			const AVHWFramesContext *fc = (const AVHWFramesContext *)d->hw_frame->hw_frames_ctx->data;
-
-			if (fc->sw_format == AV_PIX_FMT_NV12 || fc->sw_format == AV_PIX_FMT_P010) {
-				d->frame = d->hw_frame;
-				return ret;
-			}
 		}
 
 		/* the frame history keeps references to sw_frame's buffers

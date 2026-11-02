@@ -75,6 +75,16 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  * merely running late. */
 #define WARP_PL_DECK_RESYNC_NS UINT64_C(500000000)
 
+/* How far a packet may land from where the one before it from the same source
+ * ended and still be taken as following straight on from it, in nanoseconds.
+ * A packet's timestamp is when it fell due, worked out from the file's own
+ * timestamps, which most containers keep to the millisecond: placed exactly
+ * where it says, a packet can overlap the end of the one before by a fraction
+ * of a millisecond, and the overlap was cut off as audio that had already
+ * gone out. A few samples lost every few packets is heard as crackling. This
+ * is the threshold libobs smooths a source's own audio over. */
+#define WARP_PL_DECK_SMOOTH_NS UINT64_C(70000000)
+
 /* How long the mixer will hold a sample waiting on an item that still has
  * audio to come, in nanoseconds. It only ever waits during a transition, when
  * both halves have to be in before either can be mixed; with one item playing
@@ -245,8 +255,10 @@ struct warp_pl_deck {
 	 * packet arrives, which is what libobs does with a source of its own. */
 	int64_t offset;
 	bool anchored;
-	/* just past the last sample handed over, on the system clock */
+	/* just past the last sample handed over, on the system clock, and
+	 * whether there has been one to follow on from */
 	uint64_t end_ts;
+	bool have_end;
 	/* when that arrived */
 	uint64_t arrived;
 	/* whether this source is handing audio over at all */
@@ -487,7 +499,6 @@ struct warp_playlist_source {
 	bool loop_playlist;
 	bool shuffle;
 	bool hw_decode;
-	bool gpu_direct;
 	/* sound played at another speed keeps its pitch */
 	bool preserve_pitch;
 	bool restart_on_activate;
@@ -815,6 +826,15 @@ static inline uint64_t warp_pl_ns_to_frames(size_t sample_rate, uint64_t ns)
 	return util_mul_div64(ns, sample_rate, UINT64_C(1000000000));
 }
 
+/* the same, to the nearest sample rather than the one before, for placing a
+ * packet against samples already held: a timestamp that is a few nanoseconds
+ * short of a sample boundary is on it, not a whole sample behind */
+static inline uint64_t warp_pl_ns_to_frames_nearest(size_t sample_rate, uint64_t ns)
+{
+	return util_mul_div64(ns, sample_rate, UINT64_C(1000000000)) +
+	       (util_mul_div64(ns, sample_rate * 2, UINT64_C(1000000000)) & 1);
+}
+
 /* Throws away what the mixer is holding and sets the format it works in.
  * Expects the mixer's lock to be held. */
 static void warp_pl_mix_reset(struct warp_pl_audio *a, size_t channels, size_t sample_rate)
@@ -985,15 +1005,30 @@ static void warp_pl_mix_submit(struct warp_playlist_source *s, obs_source_t *sou
 		if (!deck->anchored) {
 			deck->offset = (int64_t)arrived - raw;
 			deck->anchored = true;
+			deck->have_end = false;
 		} else {
 			uint64_t placed = (uint64_t)(raw + deck->offset);
 			uint64_t drift = placed > arrived ? placed - arrived : arrived - placed;
 
-			if (drift > WARP_PL_DECK_RESYNC_NS)
+			if (drift > WARP_PL_DECK_RESYNC_NS) {
 				deck->offset = (int64_t)arrived - raw;
+				deck->have_end = false;
+			}
 		}
 
 		uint64_t ts = (uint64_t)(raw + deck->offset);
+
+		/* A packet that lands about where the last one from this
+		 * source ended follows straight on from it, sample for
+		 * sample, whatever its timestamp says to within a rounding.
+		 * Only a real jump - a seek, a loop, a pause - is placed by
+		 * its timestamp. */
+		if (deck->have_end) {
+			uint64_t jitter = ts > deck->end_ts ? ts - deck->end_ts : deck->end_ts - ts;
+
+			if (jitter < WARP_PL_DECK_SMOOTH_NS)
+				ts = deck->end_ts;
+		}
 		size_t frames = audio->frames;
 		size_t skipped = 0;
 
@@ -1010,7 +1045,7 @@ static void warp_pl_mix_submit(struct warp_playlist_source *s, obs_source_t *sou
 		}
 
 		if (have_floor && ts < floor_ts) {
-			skipped = (size_t)warp_pl_ns_to_frames(sample_rate, floor_ts - ts);
+			skipped = (size_t)warp_pl_ns_to_frames_nearest(sample_rate, floor_ts - ts);
 
 			if (skipped >= frames) {
 				/* all of it is behind; the deck has still been
@@ -1031,7 +1066,7 @@ static void warp_pl_mix_submit(struct warp_playlist_source *s, obs_source_t *sou
 				a->have = true;
 			}
 
-			size_t offset = (size_t)warp_pl_ns_to_frames(sample_rate, ts - a->ts);
+			size_t offset = (size_t)warp_pl_ns_to_frames_nearest(sample_rate, ts - a->ts);
 
 			if (!warp_pl_mix_reserve(a, offset + frames)) {
 				/* Further ahead than the mixer will hold, which
@@ -1072,6 +1107,7 @@ static void warp_pl_mix_submit(struct warp_playlist_source *s, obs_source_t *sou
 		}
 
 		deck->end_ts = ts + warp_pl_frames_to_ns(sample_rate, frames);
+		deck->have_end = true;
 		deck->arrived = arrived;
 		deck->producing = true;
 
@@ -1440,7 +1476,6 @@ static bool warp_pl_step_pos(struct warp_playlist_source *s, int dir, size_t *ou
 struct warp_pl_item_config {
 	int speed;
 	bool hw_decode;
-	bool gpu_direct;
 	bool preserve_pitch;
 	int64_t in_ms;
 	int64_t out_ms;
@@ -1474,7 +1509,6 @@ static void warp_pl_read_item_config(struct warp_playlist_source *s, const char 
 
 	cfg->speed = warp_pl_start_speed(s, path);
 	cfg->hw_decode = s->hw_decode;
-	cfg->gpu_direct = s->gpu_direct;
 	cfg->preserve_pitch = s->preserve_pitch;
 	cfg->in_ms = clip ? clip->in_ms : 0;
 	cfg->out_ms = clip ? clip->out_ms : 0;
@@ -1496,7 +1530,6 @@ static obs_source_t *warp_pl_create_item(struct warp_playlist_source *s, const s
 	obs_data_set_bool(settings, "restart_on_activate", false);
 	obs_data_set_bool(settings, "close_when_inactive", false);
 	obs_data_set_bool(settings, "hw_decode", cfg->hw_decode);
-	obs_data_set_bool(settings, "gpu_direct", cfg->gpu_direct);
 	obs_data_set_bool(settings, "preserve_pitch", cfg->preserve_pitch);
 	obs_data_set_int(settings, "speed_percent", cfg->speed);
 	/* one settings dump per playlist item would drown the log */
@@ -2807,14 +2840,6 @@ static obs_properties_t *warp_pl_transition_properties(struct warp_playlist_sour
 	return props;
 }
 
-/* drawing off the GPU is something hardware decoding does */
-static bool warp_pl_hw_decode_modified(obs_properties_t *props, obs_property_t *prop, obs_data_t *settings)
-{
-	UNUSED_PARAMETER(prop);
-	obs_property_set_visible(obs_properties_get(props, "gpu_direct"), obs_data_get_bool(settings, "hw_decode"));
-	return true;
-}
-
 static obs_properties_t *warp_playlist_getproperties(void *data)
 {
 	struct warp_playlist_source *s = data;
@@ -2882,11 +2907,7 @@ static obs_properties_t *warp_playlist_getproperties(void *data)
 
 	obs_properties_add_bool(props, "clear_on_media_end", obs_module_text("Warp.Playlist.ClearOnEnd"));
 
-	obs_property_t *hw = obs_properties_add_bool(props, "hw_decode", obs_module_text("Warp.Video.HardwareDecode"));
-	obs_property_set_modified_callback(hw, warp_pl_hw_decode_modified);
-
-	obs_property_t *direct = obs_properties_add_bool(props, "gpu_direct", obs_module_text("Warp.Video.GpuDirect"));
-	obs_property_set_long_description(direct, obs_module_text("Warp.Video.GpuDirect.Desc"));
+	obs_properties_add_bool(props, "hw_decode", obs_module_text("Warp.Video.HardwareDecode"));
 
 	obs_property_t *pitch =
 		obs_properties_add_bool(props, "preserve_pitch", obs_module_text("Warp.Media.PreservePitch"));
@@ -3192,14 +3213,12 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 	s->restart_on_activate = obs_data_get_bool(settings, "restart_on_activate");
 	s->clear_on_media_end = obs_data_get_bool(settings, "clear_on_media_end");
 	bool hw_decode = obs_data_get_bool(settings, "hw_decode");
-	bool gpu_direct = hw_decode && obs_data_get_bool(settings, "gpu_direct");
 
 	/* kept items were made to decode the other way */
-	if (hw_decode != s->hw_decode || gpu_direct != s->gpu_direct)
+	if (hw_decode != s->hw_decode)
 		warp_pl_flush_idle(s);
 
 	s->hw_decode = hw_decode;
-	s->gpu_direct = gpu_direct;
 	s->base_speed = speed;
 
 	/* every item the playlist is holding plays at the new setting, the

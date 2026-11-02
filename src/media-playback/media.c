@@ -37,7 +37,6 @@
 #include "closest-format.h"
 
 #include <libavdevice/avdevice.h>
-#include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
 
 #define NS_PER_MS 1000000LL
@@ -363,101 +362,6 @@ static struct obs_source_frame *convert_video(mp_media_t *m, AVFrame *f)
 	}
 
 	return frame;
-}
-
-/* Describes 'f', a frame on the GPU, without touching its picture: its size, the
- * layout of its planes, its colour. False when it is not to be shown (network
- * input waiting for a frame it can decode whole) or its colour cannot be
- * worked out. */
-static bool describe_gpu_frame(mp_media_t *m, AVFrame *f, struct obs_source_frame *info)
-{
-	struct mp_decode *d = &m->v;
-	const AVHWFramesContext *fc = (const AVHWFramesContext *)f->hw_frames_ctx->data;
-
-	if (!m->is_local_file && !d->got_first_keyframe) {
-#if LIBAVUTIL_VERSION_INT < AV_VERSION_INT(58, 29, 100)
-		if (!f->key_frame)
-#else
-		if (!(f->flags & AV_FRAME_FLAG_KEY))
-#endif
-			return false;
-
-		d->got_first_keyframe = true;
-	}
-
-	memset(info, 0, sizeof(*info));
-	info->format = fc->sw_format == AV_PIX_FMT_P010 ? VIDEO_FORMAT_P010 : VIDEO_FORMAT_NV12;
-
-	enum video_colorspace space = convert_color_space(f->colorspace, f->color_trc, f->color_primaries);
-	enum video_range_type range = m->force_range == VIDEO_RANGE_DEFAULT ? convert_color_range(f->color_range)
-									    : m->force_range;
-
-	info->full_range = range == VIDEO_RANGE_FULL;
-	if (!video_format_get_parameters_for_format(space, range, info->format, info->color_matrix,
-						    info->color_range_min, info->color_range_max))
-		return false;
-
-	info->width = (uint32_t)f->width;
-	info->height = (uint32_t)f->height;
-	info->max_luminance = d->max_luminance;
-	info->flags = os_atomic_load_bool(&m->is_linear_alpha) ? OBS_SOURCE_FRAME_LINEAR_ALPHA : 0;
-
-	switch (f->color_trc) {
-	case AVCOL_TRC_SMPTE2084:
-		info->trc = VIDEO_TRC_PQ;
-		break;
-	case AVCOL_TRC_ARIB_STD_B67:
-		info->trc = VIDEO_TRC_HLG;
-		break;
-	case AVCOL_TRC_BT709:
-	case AVCOL_TRC_GAMMA22:
-	case AVCOL_TRC_GAMMA28:
-	case AVCOL_TRC_SMPTE170M:
-	case AVCOL_TRC_SMPTE240M:
-	case AVCOL_TRC_IEC61966_2_1:
-		info->trc = VIDEO_TRC_SRGB;
-		break;
-	default:
-		info->trc = VIDEO_TRC_DEFAULT;
-	}
-
-	return true;
-}
-
-/* Hands 'f' out to be shown as 'use' says, stamped 'timestamp': on the GPU, as
- * the surface it was decoded into, when it is still there, and as a copy in
- * memory otherwise. False when there was nothing to show. */
-static bool hand_out(mp_media_t *m, AVFrame *f, enum mp_frame_use use, uint64_t timestamp)
-{
-	if (!f)
-		return false;
-
-	if (f->hw_frames_ctx && f->format != AV_PIX_FMT_NONE && m->v_gpu_cb) {
-		struct mp_gpu_frame gpu;
-
-		if (!describe_gpu_frame(m, f, &gpu.info))
-			return false;
-
-		gpu.frame = av_frame_clone(f);
-		if (!gpu.frame)
-			return false;
-
-		gpu.info.timestamp = timestamp;
-		m->v_gpu_cb(m->opaque, &gpu, use);
-		return true;
-	}
-
-	mp_video_cb cb = use == MP_FRAME_TIMED ? m->v_cb : use == MP_FRAME_STILL ? m->v_still_cb : m->v_preload_cb;
-	if (!cb)
-		return false;
-
-	struct obs_source_frame *frame = convert_video(m, f);
-	if (!frame)
-		return false;
-
-	frame->timestamp = timestamp;
-	cb(m->opaque, frame);
-	return true;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -829,8 +733,12 @@ static void show_still(mp_media_t *m)
 		f = hist_at_or_before(m, m->still_target, &pts);
 	}
 
-	if (!hand_out(m, f, MP_FRAME_STILL, os_gettime_ns()))
+	struct obs_source_frame *frame = convert_video(m, f);
+	if (!frame)
 		return;
+
+	frame->timestamp = os_gettime_ns();
+	m->v_still_cb(m->opaque, frame);
 
 	m->cur_pts = pts;
 	m->have_cur = true;
@@ -844,7 +752,12 @@ static void cue_first_frame(mp_media_t *m)
 	if (!m->has_video || !m->v.frame_ready || !m->v_preload_cb)
 		return;
 
-	hand_out(m, m->v.frame, MP_FRAME_PRELOAD, os_gettime_ns());
+	struct obs_source_frame *frame = convert_video(m, m->v.frame);
+	if (!frame)
+		return;
+
+	frame->timestamp = os_gettime_ns();
+	m->v_preload_cb(m->opaque, frame);
 }
 
 static void emit_video(mp_media_t *m, uint64_t due, uint64_t now)
@@ -860,7 +773,12 @@ static void emit_video(mp_media_t *m, uint64_t due, uint64_t now)
 	if (!m->v_cb || due + LATE_DROP_NS < now)
 		return;
 
-	hand_out(m, d->frame, MP_FRAME_TIMED, due);
+	struct obs_source_frame *frame = convert_video(m, d->frame);
+	if (!frame)
+		return;
+
+	frame->timestamp = due;
+	m->v_cb(m->opaque, frame);
 }
 
 static void emit_stretched(void *param, AVFrame *f, uint64_t timestamp)
@@ -1219,10 +1137,6 @@ static void do_load(mp_media_t *m, struct mp_load *load)
 	m->force_range = load->force_range;
 	os_atomic_set_bool(&m->is_linear_alpha, load->is_linear_alpha);
 	m->preserve_pitch = load->preserve_pitch;
-	/* read by the decoder as it is opened for the file, and from then on
-	 * as each frame comes out of it */
-	m->gpu_direct = load->hw && load->gpu_direct && m->v_gpu_cb &&
-			mp_decode_gpu_direct_type() != AV_HWDEVICE_TYPE_NONE;
 	m->speed = load->is_local_file && load->speed >= MP_SPEED_MIN && load->speed <= MP_SPEED_MAX ? load->speed
 												     : 100;
 	m->state = MP_STATE_OPENING;
@@ -1406,8 +1320,14 @@ static void do_step(mp_media_t *m, int frames)
 		int64_t found_pts;
 		AVFrame *cached = hist_find(m, target, interval / 2, &found_pts);
 
-		if (cached && m->v_still_cb)
-			hand_out(m, cached, MP_FRAME_STILL, os_gettime_ns());
+		if (cached && m->v_still_cb) {
+			struct obs_source_frame *frame = convert_video(m, cached);
+
+			if (frame) {
+				frame->timestamp = os_gettime_ns();
+				m->v_still_cb(m->opaque, frame);
+			}
+		}
 
 		/* the middle of the frame, so rounding in the interval cannot
 		 * land the seek on the frame next to it */
@@ -1585,14 +1505,6 @@ static bool run_commands(mp_media_t *m)
 		case MP_CMD_PITCH:
 			m->preserve_pitch = cmd.value != 0;
 			break;
-		case MP_CMD_NO_GPU_DIRECT:
-			/* the frames still to be decoded come out as copies; the
-			 * decoder is opened afresh for the next file, without the
-			 * extra surfaces */
-			m->gpu_direct = false;
-			if (m->cur)
-				m->cur->gpu_direct = false;
-			break;
 		}
 
 		free_load(cmd.load);
@@ -1677,7 +1589,6 @@ media_playback_t *media_playback_create(const struct mp_media_info *info)
 	mp->v_preload_cb = info->v_preload_cb;
 	mp->v_still_cb = info->v_still_cb;
 	mp->a_cb = info->a_cb;
-	mp->v_gpu_cb = info->v_gpu_cb;
 	mp->event_cb = info->event_cb;
 	mp->speed = 100;
 	mp->state = MP_STATE_IDLE;
@@ -1761,7 +1672,6 @@ uint64_t media_playback_load(media_playback_t *mp, const struct mp_load_info *in
 	load->force_range = info->force_range;
 	load->is_linear_alpha = info->is_linear_alpha;
 	load->preserve_pitch = info->preserve_pitch;
-	load->gpu_direct = info->gpu_direct;
 	load->in_ms = info->in_ms > 0 ? info->in_ms : 0;
 	load->out_ms = info->out_ms > 0 ? info->out_ms : 0;
 	load->tail_ms = info->tail_ms > 0 ? info->tail_ms : 0;
@@ -1828,12 +1738,6 @@ void media_playback_set_preserve_pitch(media_playback_t *mp, bool preserve_pitch
 {
 	if (mp)
 		post(mp, MP_CMD_PITCH, preserve_pitch, NULL);
-}
-
-void media_playback_disable_gpu_direct(media_playback_t *mp)
-{
-	if (mp)
-		post(mp, MP_CMD_NO_GPU_DIRECT, 0, NULL);
 }
 
 void media_playback_set_is_linear_alpha(media_playback_t *mp, bool is_linear_alpha)

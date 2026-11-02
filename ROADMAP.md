@@ -29,25 +29,8 @@ Work that has been thought through but not built yet, with enough of the design 
 * Multiple audio tracks: which one a replay plays.
 * Interaction with OBS's own replay buffer (both can run; flows could prefer the ring when it is available).
 
-## GPU direct decoding: verification, and macOS
-
-**Where it stands:** built, experimental and off by default (*Draw decoded video straight from the GPU*, under hardware decoding, on both sources).
-
-* **Windows (D3D11):** the decoder runs on its own D3D11 device, made on the adapter OBS draws with. Each frame is copied on the GPU from the decoder's texture array into an NV12 or P010 texture OBS shares with it under a keyed mutex — the same kind of texture OBS hands its own frames to hardware encoders in — and converted with the plugin's copy of OBS's shaders. `src/warp-video-gpu.c`.
-* **Linux (VAAPI):** each frame's surface is exported as dma-bufs and its planes imported into OBS's EGL context with `gs_texture_create_from_dmabuf`.
-* **Fallback:** a frame that cannot be imported is copied back on the graphics thread and drawn from the copy, the source logs that it fell back, and the engine stops handing frames out on the GPU. Anything that goes wrong costs speed, not picture.
-
-**Still to do:**
-
-* **Verify on real hardware.** The paths compile on all three CI platforms and the fallback is tested under AddressSanitizer (with Vulkan frames from lavapipe, which the import refuses), but no import has run on a real GPU yet. Worth trying: Windows with NVIDIA, AMD and Intel, including a laptop where OBS draws on a different adapter from the default; Linux with Intel and AMD (Mesa VAAPI); 8-bit H.264 and HEVC, and 10-bit HEVC (P010). The OBS log says *drawing hardware-decoded video straight off the GPU* when it works and *copying it instead* when it does not.
-* **Measure it.** CPU use and GPU copy-engine load with it on and off, for a 4K60 clip.
-* **Once it is proven,** consider turning it on by default.
-* **macOS.** libobs only makes textures from single-plane IOSurfaces (`gs_texture_create_from_iosurface`), and VideoToolbox hands out two-plane NV12. Two ways forward: ask VideoToolbox for BGRA output (a `hw_frames_ctx` with `sw_format = AV_PIX_FMT_BGRA` from `get_format`) and draw it as a rectangle texture — at the cost of VideoToolbox doing the colour conversion rather than OBS's shaders, and of HDR; or a Metal/IOSurface import of each plane, which libobs would need to grow.
-* **NVIDIA on Linux** decodes with CUDA, not VAAPI; a CUDA→EGL interop path (`cuGraphicsEGLRegisterImage`) would be its own piece of work.
-
 ## Smaller follow-ups
 
 * **Background probing of playlist files** — duration, resolution, frame rate and a thumbnail read on a worker thread as files are added, for the total run time, flagging unplayable files early, and a playlist panel in the Warp window.
 * **A playlist panel in the Warp window** — the list, the play-next queue, and each file's in/out points and speed, edited directly rather than over obs-websocket.
-* **Deinterlacing** — the Warp Media source draws itself, so OBS's own right-click Deinterlacing no longer applies. Replay buffer recordings are progressive, but interlaced files dropped into a playlist would need a deinterlacing pass of Warp's own (FFmpeg's `yadif`/`bwdif` in the engine, or a shader).
 * **Unit tests in CI** — the engine and the sources were tested during development with a harness that runs libobs headless under Xvfb and reads the program output back. Checking it in, and running it on the Ubuntu CI job, would keep those checks.
