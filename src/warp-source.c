@@ -939,6 +939,23 @@ static void media_ready_proc(void *data, calldata_t *cd)
 	calldata_set_int(cd, "seq", (long long)seq);
 }
 
+static void media_close_proc(void *data, calldata_t *cd)
+{
+	struct warp_source *s = data;
+
+	UNUSED_PARAMETER(cd);
+
+	stop_reconnect_thread(s);
+	media_playback_close(s->media);
+	clear_video(s);
+
+	pthread_mutex_lock(&s->mutex);
+	s->load_seq = 0;
+	pthread_mutex_unlock(&s->mutex);
+
+	set_state(s, OBS_MEDIA_STATE_NONE);
+}
+
 static bool warp_source_play_hotkey(void *data, obs_hotkey_pair_id id, obs_hotkey_t *hotkey, bool pressed)
 {
 	UNUSED_PARAMETER(id);
@@ -1411,6 +1428,7 @@ static void *warp_source_create(obs_data_t *settings, obs_source_t *source)
 	proc_handler_add(ph, "void get_nb_frames(out int num_frames)", get_nb_frames, s);
 	proc_handler_add(ph, "void " WARP_MEDIA_READY_PROC "(out bool ready, out bool failed, out int seq)",
 			 media_ready_proc, s);
+	proc_handler_add(ph, "void " WARP_MEDIA_CLOSE_PROC "()", media_close_proc, s);
 	proc_handler_add(ph, "void warp_set_speed(int speed)", set_speed_proc, s);
 	proc_handler_add(ph, "void warp_adjust_speed(int delta)", adjust_speed_proc, s);
 	proc_handler_add(ph, "void warp_get_speed(out int speed)", get_speed_proc, s);

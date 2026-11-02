@@ -135,6 +135,15 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  * of the load both are about, as warp_media_load handed it back. */
 #define WARP_MEDIA_READY_PROC "warp_media_ready"
 
+/* Closes the file a Warp Media source has open and clears its picture, keeping
+ * the source itself for the next one to be loaded into:
+ *
+ *   warp_media_close()
+ *
+ * The Warp Playlist keeps the items it has played this way rather than making a
+ * new one for every file. The settings are left alone. */
+#define WARP_MEDIA_CLOSE_PROC "warp_media_close"
+
 /* what playback does with a file that has just been loaded:
  *
  *   keep - nothing beyond loading it: the source's own settings decide, the
