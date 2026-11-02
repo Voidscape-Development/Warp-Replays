@@ -63,7 +63,6 @@ enum mp_cmd_type {
 	MP_CMD_SPEED,
 	MP_CMD_LOOPING,
 	MP_CMD_PITCH,
-	MP_CMD_NO_GPU_DIRECT,
 	MP_CMD_KILL,
 };
 
@@ -78,7 +77,6 @@ struct mp_load {
 	bool is_local_file;
 	bool looping;
 	bool hw;
-	bool gpu_direct;
 	bool reconnecting;
 	enum video_range_type force_range;
 	bool is_linear_alpha;
@@ -102,7 +100,6 @@ struct media_playback {
 	mp_video_cb v_preload_cb;
 	mp_video_cb v_still_cb;
 	mp_audio_cb a_cb;
-	mp_gpu_video_cb v_gpu_cb;
 	mp_event_cb event_cb;
 
 	pthread_t thread;
@@ -135,8 +132,6 @@ struct media_playback {
 
 	AVBufferRef *hw_device;
 	enum AVHWDeviceType hw_type;
-	/* hardware frames go out on the GPU; read by the decoder */
-	bool gpu_direct;
 
 	DARRAY(AVPacket *) packet_pool;
 	struct mp_decode v;

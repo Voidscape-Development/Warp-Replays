@@ -88,51 +88,37 @@ static inline float warp_zoom_lerp(float from, float to, float t)
 	return from + (to - from) * t;
 }
 
-/* Where a shot sits in the picture, as a fraction of how far it is allowed to
- * be off centre at that zoom: 0 is against one edge, 1 against the other, and
- * 0.5 is the middle. The whole picture may not be moved at all, so it is only
- * ever the middle. */
-static inline float warp_zoom_place_of(float pos, float zoom)
-{
-	float span = 1.0f - 1.0f / zoom;
-
-	if (!(span > 0.0f))
-		return 0.5f;
-
-	pos = (pos - 0.5f / zoom) / span;
-
-	return pos < 0.0f ? 0.0f : (pos > 1.0f ? 1.0f : pos);
-}
-
-/* and back the other way, at whatever zoom the move has reached */
-static inline float warp_zoom_pos_of(float place, float zoom)
-{
-	return 0.5f / zoom + place * (1.0f - 1.0f / zoom);
-}
-
+/* A move is a straight zoom: the picture closes in on (or opens out from) the
+ * shot it is heading for, with nothing swinging out to the side on the way.
+ *
+ * The edges of what is shown move in step with how wide it is. Every edge, and
+ * the middle, covers the same share of its journey as the width of the shot
+ * has covered of its own, so each of them travels one way only, and a move that
+ * zooms in has one point in the picture that holds still on screen while
+ * everything else spreads out from it, the way a camera's zoom does. Both ends
+ * of a move are inside the picture and every step is between them, so the shot
+ * never runs off its edge and nothing has to be held back to keep it there.
+ *
+ * A move that does not change the zoom has no width to keep step with, and just
+ * pans across at an even rate. */
 static struct warp_zoom_view warp_zoom_between(const struct warp_zoom_view *from, const struct warp_zoom_view *to,
-					       float t, int path)
+					       float t)
 {
 	struct warp_zoom_view view;
+	float from_width = 1.0f / from->zoom;
+	float to_width = 1.0f / to->zoom;
 
 	view.zoom = from->zoom * expf(logf(to->zoom / from->zoom) * t);
 
-	if (path == WARP_ZOOM_PATH_ARC) {
-		/* the middle of the shot crosses the picture at a flat rate,
-		 * which throws it out to the side of the frame while the
-		 * picture is still wide: the swing that is */
-		view.x = warp_zoom_lerp(from->x, to->x, t);
-		view.y = warp_zoom_lerp(from->y, to->y, t);
-	} else {
-		/* the shot holds its place in the frame the whole way across,
-		 * so it travels evenly and lands without a swing */
-		view.x = warp_zoom_pos_of(warp_zoom_lerp(warp_zoom_place_of(from->x, from->zoom),
-							 warp_zoom_place_of(to->x, to->zoom), t),
-					  view.zoom);
-		view.y = warp_zoom_pos_of(warp_zoom_lerp(warp_zoom_place_of(from->y, from->zoom),
-							 warp_zoom_place_of(to->y, to->zoom), t),
-					  view.zoom);
-	}
+	float width = 1.0f / view.zoom;
+	float k = fabsf(to_width - from_width) > 1e-4f ? (width - from_width) / (to_width - from_width) : t;
+
+	/* the top left corner of the shot, carried along at the width's pace */
+	float left = warp_zoom_lerp(from->x - 0.5f * from_width, to->x - 0.5f * to_width, k);
+	float top = warp_zoom_lerp(from->y - 0.5f * from_width, to->y - 0.5f * to_width, k);
+
+	view.x = left + 0.5f * width;
+	view.y = top + 0.5f * width;
 
 	warp_zoom_clamp(&view);
 
@@ -312,10 +298,8 @@ static void warp_zoom_unlock(struct warp_zoom_control *ctl)
 
 static void warp_zoom_write_view(struct warp_zoom_control *ctl);
 
-/* 'path' is the route the move takes, which is a preset's to choose; everything
- * else - the pad, the hotkeys, the bar, a reset - heads straight for what it
- * was asked for. Expects ctl->mutex to be held. */
-static void warp_zoom_aim(struct warp_zoom_control *ctl, const struct warp_zoom_view *view, int glide_ms, int path)
+/* Expects ctl->mutex to be held. */
+static void warp_zoom_aim(struct warp_zoom_control *ctl, const struct warp_zoom_view *view, int glide_ms)
 {
 	struct warp_zoom_view target = *view;
 
@@ -340,7 +324,6 @@ static void warp_zoom_aim(struct warp_zoom_control *ctl, const struct warp_zoom_
 	ctl->from = ctl->view;
 	ctl->glide_elapsed = 0.0f;
 	ctl->glide_len = (float)glide_ms / 1000.0f;
-	ctl->glide_path = path;
 }
 
 /* Where a nudge works from: the shot being lined up when there is one, so that
@@ -359,9 +342,8 @@ static struct warp_zoom_view warp_zoom_base(struct warp_zoom_control *ctl)
  * not the same as how long the move that lined it up would have taken: lining
  * a shot up moves nothing, and taking it should ease the way a recall does
  * however the shot was found. Only a preset carrying a glide of its own passes
- * anything but -1 here, and 'path' - the route that move takes - is a preset's
- * in the same way. */
-static bool warp_zoom_stage(struct warp_zoom_control *ctl, const struct warp_zoom_view *view, int glide_ms, int path,
+ * anything but -1 here. */
+static bool warp_zoom_stage(struct warp_zoom_control *ctl, const struct warp_zoom_view *view, int glide_ms,
 			    const char *change, const char *preset)
 {
 	if (!ctl->confirm)
@@ -372,7 +354,6 @@ static bool warp_zoom_stage(struct warp_zoom_control *ctl, const struct warp_zoo
 
 	ctl->staged = true;
 	ctl->stage_glide = glide_ms;
-	ctl->stage_path = path;
 	ctl->stage_change = change ? change : WARP_ZOOM_CHANGE_SET;
 	ctl->revision++;
 
@@ -390,10 +371,10 @@ void warp_zoom_control_set(struct warp_zoom_control *ctl, const struct warp_zoom
 
 	pthread_mutex_lock(&ctl->mutex);
 
-	staged = warp_zoom_stage(ctl, view, -1, WARP_ZOOM_PATH_DIRECT, change ? change : WARP_ZOOM_CHANGE_SET, preset);
+	staged = warp_zoom_stage(ctl, view, -1, change ? change : WARP_ZOOM_CHANGE_SET, preset);
 
 	if (!staged) {
-		warp_zoom_aim(ctl, view, glide_ms, WARP_ZOOM_PATH_DIRECT);
+		warp_zoom_aim(ctl, view, glide_ms);
 		warp_zoom_arm_signal(ctl, &ctl->target, change ? change : WARP_ZOOM_CHANGE_SET, preset);
 	}
 
@@ -422,10 +403,10 @@ void warp_zoom_control_adjust(struct warp_zoom_control *ctl, float factor, int g
 	if (glide_ms < 0)
 		glide_ms = (int)ctl->nudge_ms;
 
-	staged = warp_zoom_stage(ctl, &view, -1, WARP_ZOOM_PATH_DIRECT, WARP_ZOOM_CHANGE_MANUAL, NULL);
+	staged = warp_zoom_stage(ctl, &view, -1, WARP_ZOOM_CHANGE_MANUAL, NULL);
 
 	if (!staged) {
-		warp_zoom_aim(ctl, &view, glide_ms, WARP_ZOOM_PATH_DIRECT);
+		warp_zoom_aim(ctl, &view, glide_ms);
 		warp_zoom_arm_signal(ctl, &ctl->target, WARP_ZOOM_CHANGE_MANUAL, NULL);
 	}
 
@@ -452,10 +433,10 @@ void warp_zoom_control_pan(struct warp_zoom_control *ctl, float dx, float dy, in
 	if (glide_ms < 0)
 		glide_ms = (int)ctl->nudge_ms;
 
-	staged = warp_zoom_stage(ctl, &view, -1, WARP_ZOOM_PATH_DIRECT, WARP_ZOOM_CHANGE_MANUAL, NULL);
+	staged = warp_zoom_stage(ctl, &view, -1, WARP_ZOOM_CHANGE_MANUAL, NULL);
 
 	if (!staged) {
-		warp_zoom_aim(ctl, &view, glide_ms, WARP_ZOOM_PATH_DIRECT);
+		warp_zoom_aim(ctl, &view, glide_ms);
 		warp_zoom_arm_signal(ctl, &ctl->target, WARP_ZOOM_CHANGE_MANUAL, NULL);
 	}
 
@@ -475,10 +456,10 @@ void warp_zoom_control_reset(struct warp_zoom_control *ctl, int glide_ms)
 
 	snprintf(name, sizeof(name), "%s", ctl->presets.num ? ctl->presets.array[0].name : "");
 
-	staged = warp_zoom_stage(ctl, &view, -1, WARP_ZOOM_PATH_DIRECT, WARP_ZOOM_CHANGE_RESET, name);
+	staged = warp_zoom_stage(ctl, &view, -1, WARP_ZOOM_CHANGE_RESET, name);
 
 	if (!staged) {
-		warp_zoom_aim(ctl, &view, glide_ms, WARP_ZOOM_PATH_DIRECT);
+		warp_zoom_aim(ctl, &view, glide_ms);
 		warp_zoom_arm_signal(ctl, &ctl->target, WARP_ZOOM_CHANGE_RESET, name);
 	}
 
@@ -515,7 +496,6 @@ bool warp_zoom_control_recall(struct warp_zoom_control *ctl, const char *id_or_n
 	char name[sizeof(ctl->signal_preset)];
 	const char *change;
 	int glide;
-	int path;
 	bool reset;
 	bool staged;
 
@@ -530,15 +510,14 @@ bool warp_zoom_control_recall(struct warp_zoom_control *ctl, const char *id_or_n
 
 	view = preset->view;
 	glide = preset->glide_ms ? (int)preset->glide_ms : -1;
-	path = preset->path;
 	reset = warp_zoom_is_default(preset);
 	snprintf(name, sizeof(name), "%s", preset->name);
 
 	change = reset ? WARP_ZOOM_CHANGE_RESET : WARP_ZOOM_CHANGE_PRESET;
-	staged = warp_zoom_stage(ctl, &view, glide, path, change, name);
+	staged = warp_zoom_stage(ctl, &view, glide, change, name);
 
 	if (!staged) {
-		warp_zoom_aim(ctl, &view, glide, path);
+		warp_zoom_aim(ctl, &view, glide);
 		warp_zoom_arm_signal(ctl, &ctl->target, change, name);
 	}
 
@@ -607,7 +586,6 @@ bool warp_zoom_control_take(struct warp_zoom_control *ctl)
 	char preset[sizeof(ctl->stage_preset)];
 	const char *change;
 	int glide;
-	int path;
 
 	pthread_mutex_lock(&ctl->mutex);
 
@@ -618,7 +596,6 @@ bool warp_zoom_control_take(struct warp_zoom_control *ctl)
 
 	view = ctl->stage;
 	glide = ctl->stage_glide;
-	path = ctl->stage_path;
 	change = ctl->stage_change;
 	snprintf(preset, sizeof(preset), "%s", ctl->stage_preset);
 
@@ -627,7 +604,7 @@ bool warp_zoom_control_take(struct warp_zoom_control *ctl)
 	/* it is going to air now, so this is a change to the picture like any
 	 * other: the same signal fires, and a Warp Detection filter reacts to
 	 * it here rather than when the shot was lined up */
-	warp_zoom_aim(ctl, &view, glide, path);
+	warp_zoom_aim(ctl, &view, glide);
 	warp_zoom_arm_signal(ctl, &ctl->target, change, preset);
 
 	warp_zoom_unlock(ctl);
@@ -696,7 +673,7 @@ bool warp_zoom_control_tick(struct warp_zoom_control *ctl, float seconds, struct
 		} else {
 			float t = warp_zoom_ease(ctl->glide_elapsed / ctl->glide_len);
 
-			ctl->view = warp_zoom_between(&ctl->from, &ctl->target, t, ctl->glide_path);
+			ctl->view = warp_zoom_between(&ctl->from, &ctl->target, t);
 		}
 	}
 
@@ -1163,10 +1140,6 @@ static void warp_zoom_load_preset(struct warp_zoom_control *ctl, obs_data_t *ite
 	preset.view.x = (float)obs_data_get_double(item, WARP_ZOOM_P_X);
 	preset.view.y = (float)obs_data_get_double(item, WARP_ZOOM_P_Y);
 	preset.glide_ms = (uint32_t)obs_data_get_int(item, WARP_ZOOM_P_GLIDE);
-	/* a preset saved before there was a choice of route carries none, and
-	 * takes the direct one */
-	preset.path = obs_data_get_int(item, WARP_ZOOM_P_PATH) == WARP_ZOOM_PATH_ARC ? WARP_ZOOM_PATH_ARC
-										     : WARP_ZOOM_PATH_DIRECT;
 	preset.hotkey = OBS_INVALID_HOTKEY_ID;
 
 	warp_zoom_clamp(&preset.view);
@@ -1253,7 +1226,7 @@ void warp_zoom_control_update(struct warp_zoom_control *ctl, obs_data_t *setting
 	/* the framing is a setting like any other on a source that keeps it, so
 	 * typing a zoom into the properties moves the picture */
 	if (ctl->persist_view && !warp_zoom_view_equal(&view, &ctl->target))
-		warp_zoom_aim(ctl, &view, 0, WARP_ZOOM_PATH_DIRECT);
+		warp_zoom_aim(ctl, &view, 0);
 
 	warp_zoom_unlock(ctl);
 
@@ -1429,7 +1402,7 @@ char *warp_zoom_control_add_preset(struct warp_zoom_control *ctl, const char *na
 }
 
 bool warp_zoom_control_update_preset(struct warp_zoom_control *ctl, const char *id, const char *name,
-				     const struct warp_zoom_view *view, int glide_ms, int path)
+				     const struct warp_zoom_view *view, int glide_ms)
 {
 	struct warp_zoom_preset *preset;
 	bool renamed = false;
@@ -1460,9 +1433,6 @@ bool warp_zoom_control_update_preset(struct warp_zoom_control *ctl, const char *
 
 	if (glide_ms >= 0)
 		preset->glide_ms = (uint32_t)(glide_ms > WARP_ZOOM_GLIDE_MAX ? WARP_ZOOM_GLIDE_MAX : glide_ms);
-
-	if (path >= 0)
-		preset->path = path == WARP_ZOOM_PATH_ARC ? WARP_ZOOM_PATH_ARC : WARP_ZOOM_PATH_DIRECT;
 
 	ctl->revision++;
 	ctl->presets_rev++;
@@ -1573,7 +1543,6 @@ obs_data_array_t *warp_zoom_control_preset_array(struct warp_zoom_control *ctl)
 		obs_data_set_double(item, WARP_ZOOM_P_X, preset->view.x);
 		obs_data_set_double(item, WARP_ZOOM_P_Y, preset->view.y);
 		obs_data_set_int(item, WARP_ZOOM_P_GLIDE, preset->glide_ms);
-		obs_data_set_int(item, WARP_ZOOM_P_PATH, preset->path);
 
 		if (i == 0)
 			obs_data_set_bool(item, WARP_ZOOM_P_FIXED, true);
@@ -1729,7 +1698,6 @@ static void warp_zoom_update_preset_proc(void *data, calldata_t *cd)
 	struct warp_zoom_view view;
 	bool has_view = false;
 	long long glide;
-	long long path;
 	double value;
 
 	warp_zoom_control_get(ctl, NULL, &view);
@@ -1750,8 +1718,7 @@ static void warp_zoom_update_preset_proc(void *data, calldata_t *cd)
 	calldata_set_bool(cd, "found",
 			  warp_zoom_control_update_preset(ctl, calldata_string(cd, "id"), calldata_string(cd, "name"),
 							  has_view ? &view : NULL,
-							  calldata_get_int(cd, "glide", &glide) ? (int)glide : -1,
-							  calldata_get_int(cd, "path", &path) ? (int)path : -1));
+							  calldata_get_int(cd, "glide", &glide) ? (int)glide : -1));
 }
 
 static void warp_zoom_remove_preset_proc(void *data, calldata_t *cd)
@@ -2091,7 +2058,7 @@ char *warp_zoom_source_save_preset(obs_source_t *source, const char *name)
 }
 
 bool warp_zoom_source_update_preset(obs_source_t *source, const char *id, const char *name,
-				    const struct warp_zoom_view *view, int glide_ms, int path)
+				    const struct warp_zoom_view *view, int glide_ms)
 {
 	/* names and ids again, so this one is allocated too */
 	calldata_t cd;
@@ -2109,9 +2076,6 @@ bool warp_zoom_source_update_preset(obs_source_t *source, const char *id, const 
 
 	if (glide_ms >= 0)
 		calldata_set_int(&cd, "glide", glide_ms);
-
-	if (path >= 0)
-		calldata_set_int(&cd, "path", path);
 
 	if (warp_zoom_call(source, WARP_ZOOM_PROC_UPDATE_PRESET, &cd))
 		calldata_get_bool(&cd, "found", &found);
