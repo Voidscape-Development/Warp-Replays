@@ -131,6 +131,9 @@ struct mp_load_info {
 
 	enum video_range_type force_range;
 	bool is_linear_alpha;
+	/* Keep the sound at its own pitch when playing at another speed,
+	 * rather than letting it go up and down with the speed. */
+	bool preserve_pitch;
 
 	/* Where the clip starts and ends, in milliseconds from the start of the
 	 * file; out_ms 0 is the end of the file. tail_ms, when it is not 0, makes
@@ -195,6 +198,7 @@ extern void media_playback_step_frames(media_playback_t *mp, int frames);
 extern void media_playback_set_speed(media_playback_t *mp, int speed);
 extern void media_playback_set_looping(media_playback_t *mp, bool looping);
 extern void media_playback_set_is_linear_alpha(media_playback_t *mp, bool is_linear_alpha);
+extern void media_playback_set_preserve_pitch(media_playback_t *mp, bool preserve_pitch);
 
 extern void media_playback_get_status(media_playback_t *mp, struct mp_status *status);
 

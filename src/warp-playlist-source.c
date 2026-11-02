@@ -426,6 +426,8 @@ struct warp_playlist_source {
 	bool loop_playlist;
 	bool shuffle;
 	bool hw_decode;
+	/* sound played at another speed keeps its pitch */
+	bool preserve_pitch;
 	bool restart_on_activate;
 	bool clear_on_media_end;
 
@@ -1375,6 +1377,7 @@ static bool warp_pl_step_pos(struct warp_playlist_source *s, int dir, size_t *ou
 struct warp_pl_item_config {
 	int speed;
 	bool hw_decode;
+	bool preserve_pitch;
 	int64_t in_ms;
 	int64_t out_ms;
 	int64_t tail_ms;
@@ -1408,6 +1411,7 @@ static void warp_pl_read_item_config(struct warp_playlist_source *s, const char 
 
 	cfg->speed = warp_pl_start_speed(s, path);
 	cfg->hw_decode = s->hw_decode;
+	cfg->preserve_pitch = s->preserve_pitch;
 	cfg->in_ms = clip ? clip->in_ms : 0;
 	cfg->out_ms = clip ? clip->out_ms : 0;
 	cfg->tail_ms = clip ? clip->tail_ms : 0;
@@ -1428,6 +1432,7 @@ static obs_source_t *warp_pl_create_item(struct warp_playlist_source *s, const s
 	obs_data_set_bool(settings, "restart_on_activate", false);
 	obs_data_set_bool(settings, "close_when_inactive", false);
 	obs_data_set_bool(settings, "hw_decode", cfg->hw_decode);
+	obs_data_set_bool(settings, "preserve_pitch", cfg->preserve_pitch);
 	obs_data_set_int(settings, "speed_percent", cfg->speed);
 	/* one settings dump per playlist item would drown the log */
 	obs_data_set_bool(settings, "log_changes", false);
@@ -1494,6 +1499,19 @@ static void warp_pl_call_item_proc(obs_source_t *item, const char *proc, const c
 	calldata_init(&cd);
 	if (arg)
 		calldata_set_int(&cd, arg, value);
+	proc_handler_call(obs_source_get_proc_handler(item), proc, &cd);
+	calldata_free(&cd);
+}
+
+static void warp_pl_call_item_bool(obs_source_t *item, const char *proc, const char *arg, bool value)
+{
+	if (!item)
+		return;
+
+	calldata_t cd = {0};
+
+	calldata_init(&cd);
+	calldata_set_bool(&cd, arg, value);
 	proc_handler_call(obs_source_get_proc_handler(item), proc, &cd);
 	calldata_free(&cd);
 }
@@ -2528,6 +2546,7 @@ static void warp_playlist_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "transition_volume_percent", 100);
 	obs_data_set_default_bool(settings, "restart_on_activate", true);
 	obs_data_set_default_bool(settings, "clear_on_media_end", true);
+	obs_data_set_default_bool(settings, "preserve_pitch", true);
 
 	/* the framing itself is not saved with the playlist: it belongs to the
 	 * file that is playing, and the next file starts from the top */
@@ -2800,6 +2819,10 @@ static obs_properties_t *warp_playlist_getproperties(void *data)
 	obs_properties_add_bool(props, "clear_on_media_end", obs_module_text("Warp.Playlist.ClearOnEnd"));
 
 	obs_properties_add_bool(props, "hw_decode", obs_module_text("Warp.Video.HardwareDecode"));
+
+	obs_property_t *pitch =
+		obs_properties_add_bool(props, "preserve_pitch", obs_module_text("Warp.Media.PreservePitch"));
+	obs_property_set_long_description(pitch, obs_module_text("Warp.Media.PreservePitch.Desc"));
 
 	obs_properties_add_editable_list(props, "playlist", obs_module_text("Warp.Playlist.Files"),
 					 OBS_EDITABLE_LIST_TYPE_FILES, filter.array, path.array);
@@ -3111,6 +3134,21 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 
 	s->hw_decode = hw_decode;
 	s->base_speed = speed;
+
+	/* every item the playlist is holding plays at the new setting, the
+	 * one on screen included */
+	bool preserve_pitch = obs_data_get_bool(settings, "preserve_pitch");
+
+	if (preserve_pitch != s->preserve_pitch) {
+		obs_source_t *items[] = {s->current, s->prev, s->pending, s->preloaded, s->back};
+
+		s->preserve_pitch = preserve_pitch;
+
+		for (size_t i = 0; i < sizeof(items) / sizeof(items[0]); i++)
+			warp_pl_call_item_bool(items[i], "warp_set_preserve_pitch", "preserve", preserve_pitch);
+		for (size_t i = 0; i < s->idle.num; i++)
+			warp_pl_call_item_bool(s->idle.array[i], "warp_set_preserve_pitch", "preserve", preserve_pitch);
+	}
 
 	size_t prev_count = s->paths.num;
 

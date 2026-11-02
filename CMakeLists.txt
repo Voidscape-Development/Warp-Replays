@@ -19,11 +19,11 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/finders")
 find_package(
   FFmpeg
-  REQUIRED avcodec avdevice avutil avformat swscale
+  REQUIRED avcodec avdevice avfilter avutil avformat swscale
 )
 target_link_libraries(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE FFmpeg::avcodec FFmpeg::avdevice FFmpeg::avutil FFmpeg::avformat FFmpeg::swscale
+  PRIVATE FFmpeg::avcodec FFmpeg::avdevice FFmpeg::avfilter FFmpeg::avutil FFmpeg::avformat FFmpeg::swscale
 )
 
 if(ENABLE_FRONTEND_API)
@@ -63,6 +63,7 @@ target_sources(
     src/warp-zoom-filter.c
     src/media-playback/decode.c
     src/media-playback/media.c
+    src/media-playback/stretch.c
 )
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 

@@ -93,6 +93,8 @@ struct warp_source {
 
 	bool is_looping;
 	bool is_linear_alpha;
+	/* sound played at another speed keeps its pitch */
+	bool preserve_pitch;
 	bool is_clear_on_media_end;
 	bool restart_on_activate;
 	bool close_when_inactive;
@@ -241,6 +243,7 @@ static void warp_source_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "reconnect_delay_sec", 10);
 	obs_data_set_default_int(settings, "buffering_mb", 2);
 	obs_data_set_default_int(settings, "speed_percent", 100);
+	obs_data_set_default_bool(settings, "preserve_pitch", true);
 	obs_data_set_default_bool(settings, "log_changes", true);
 }
 
@@ -320,6 +323,9 @@ static obs_properties_t *warp_source_getproperties(void *data)
 					     MP_SPEED_MAX, 1);
 	obs_property_int_set_suffix(prop, "%");
 
+	prop = obs_properties_add_bool(props, "preserve_pitch", obs_module_text("Warp.Media.PreservePitch"));
+	obs_property_set_long_description(prop, obs_module_text("Warp.Media.PreservePitch.Desc"));
+
 	warp_zoom_control_properties(props, false);
 
 	prop = obs_properties_add_list(props, "color_range", obs_module_text("Warp.Video.ColorRange"),
@@ -349,6 +355,7 @@ static void dump_source_info(struct warp_source *s, const struct warp_source_con
 		"\tinput_format:            %s\n"
 		"\tclip:                    %lld..%lld ms, last %lld ms\n"
 		"\tspeed:                   %d\n"
+		"\tpreserve_pitch:          %s\n"
 		"\tis_looping:              %s\n"
 		"\tis_linear_alpha:         %s\n"
 		"\tis_hw_decoding:          %s\n"
@@ -358,9 +365,10 @@ static void dump_source_info(struct warp_source *s, const struct warp_source_con
 		"\tffmpeg_options:          %s",
 		cfg->input ? cfg->input : "(null)", cfg->input_format ? cfg->input_format : "(null)",
 		(long long)cfg->in_ms, (long long)cfg->out_ms, (long long)cfg->tail_ms, get_speed(s),
-		s->is_looping ? "yes" : "no", s->is_linear_alpha ? "yes" : "no", cfg->is_hw_decoding ? "yes" : "no",
-		s->is_clear_on_media_end ? "yes" : "no", s->restart_on_activate ? "yes" : "no",
-		s->close_when_inactive ? "yes" : "no", cfg->ffmpeg_options ? cfg->ffmpeg_options : "");
+		s->preserve_pitch ? "yes" : "no", s->is_looping ? "yes" : "no", s->is_linear_alpha ? "yes" : "no",
+		cfg->is_hw_decoding ? "yes" : "no", s->is_clear_on_media_end ? "yes" : "no",
+		s->restart_on_activate ? "yes" : "no", s->close_when_inactive ? "yes" : "no",
+		cfg->ffmpeg_options ? cfg->ffmpeg_options : "");
 }
 
 /* Drops the picture the source is holding. Every place that clears the source
@@ -524,6 +532,7 @@ static uint64_t warp_source_load(struct warp_source *s, enum mp_start start)
 			.reconnecting = os_atomic_load_bool(&s->reconnecting),
 			.force_range = s->cfg.range,
 			.is_linear_alpha = s->is_linear_alpha,
+			.preserve_pitch = s->preserve_pitch,
 			.in_ms = s->cfg.in_ms,
 			.out_ms = s->cfg.out_ms,
 			.tail_ms = s->cfg.tail_ms,
@@ -815,6 +824,7 @@ static void warp_source_update(void *data, obs_data_t *settings)
 
 	s->is_looping = cfg.is_local_file && obs_data_get_bool(settings, "looping");
 	s->is_linear_alpha = obs_data_get_bool(settings, "linear_alpha");
+	s->preserve_pitch = obs_data_get_bool(settings, "preserve_pitch");
 	s->is_clear_on_media_end = obs_data_get_bool(settings, "clear_on_media_end");
 	s->close_when_inactive = obs_data_get_bool(settings, "close_when_inactive");
 	s->restart_on_activate = astrcmpi_n(cfg.input ? cfg.input : "", RIST_PROTO, sizeof(RIST_PROTO) - 1) != 0 &&
@@ -846,6 +856,7 @@ static void warp_source_update(void *data, obs_data_t *settings)
 
 	media_playback_set_looping(s->media, s->is_looping);
 	media_playback_set_is_linear_alpha(s->media, s->is_linear_alpha);
+	media_playback_set_preserve_pitch(s->media, s->preserve_pitch);
 	media_playback_set_speed(s->media, speed);
 
 	if (reload) {
@@ -1157,6 +1168,24 @@ static void adjust_speed_proc(void *data, calldata_t *cd)
 				delta > 0 ? WARP_SPEED_CHANGE_INCREASED : WARP_SPEED_CHANGE_DECREASED);
 }
 
+/* whether sound at another speed keeps its pitch; applies to playback as it
+ * runs, and is saved with the source */
+static void set_preserve_pitch_proc(void *data, calldata_t *cd)
+{
+	struct warp_source *s = data;
+	bool preserve;
+
+	if (!calldata_get_bool(cd, "preserve", &preserve))
+		return;
+
+	s->preserve_pitch = preserve;
+	media_playback_set_preserve_pitch(s->media, preserve);
+
+	obs_data_t *settings = obs_source_get_settings(s->source);
+	obs_data_set_bool(settings, "preserve_pitch", preserve);
+	obs_data_release(settings);
+}
+
 static void get_speed_proc(void *data, calldata_t *cd)
 {
 	struct warp_source *s = data;
@@ -1432,6 +1461,7 @@ static void *warp_source_create(obs_data_t *settings, obs_source_t *source)
 	proc_handler_add(ph, "void warp_set_speed(int speed)", set_speed_proc, s);
 	proc_handler_add(ph, "void warp_adjust_speed(int delta)", adjust_speed_proc, s);
 	proc_handler_add(ph, "void warp_get_speed(out int speed)", get_speed_proc, s);
+	proc_handler_add(ph, "void warp_set_preserve_pitch(bool preserve)", set_preserve_pitch_proc, s);
 	proc_handler_add(ph, "void warp_step_frames(int frames)", step_frames_proc, s);
 	proc_handler_add(ph,
 			 "void " WARP_MEDIA_LOAD_PROC

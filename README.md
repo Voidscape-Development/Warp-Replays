@@ -8,7 +8,7 @@ Warp is an OBS Studio plugin for handling replays at video game events and in an
 
 A media source based on OBS Studio's built-in Media Source, with the same properties and behavior, plus live playback control designed for replay operation:
 
-* **On-the-fly playback speed** from 10% to 400%, changed without restarting or losing the current position:
+* **On-the-fly playback speed** from 10% to 400%, changed without restarting or losing the current position. The sound keeps its pitch at any speed, so a slow-motion replay sounds slowed down rather than deeper; turn *Keep pitch at other speeds* off in the source settings for the old effect, where the pitch moves with the speed:
   * Speed Up (+10%) / Slow Down (-10%) / Reset Speed (100%) hotkeys
   * Preset speed hotkeys: 25%, 50%, 125%, 150%, 200%
   * The Speed property in the source settings also applies live
@@ -411,7 +411,7 @@ The Warp window shows an instant replay flow as *Loaded* or *Empty* rather than 
 
 This plugin is based on the [OBS plugin template](https://github.com/obsproject/obs-plugintemplate) and builds the same way. See the template's [wiki](https://github.com/obsproject/obs-plugintemplate/wiki) for build system requirements and options.
 
-In addition to the template's requirements, the plugin links against FFmpeg (`avcodec`, `avdevice`, `avformat`, `avutil`, `swscale`). On Linux, install the corresponding `-dev` packages; on Windows and macOS the obs-deps prebuilt dependencies already include FFmpeg.
+In addition to the template's requirements, the plugin links against FFmpeg (`avcodec`, `avdevice`, `avfilter`, `avformat`, `avutil`, `swscale`). On Linux, install the corresponding `-dev` packages; on Windows and macOS the obs-deps prebuilt dependencies already include FFmpeg.
 
 Quick start on Linux:
 

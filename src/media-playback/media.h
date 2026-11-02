@@ -23,6 +23,7 @@
 #include <util/darray.h>
 #include "media-playback.h"
 #include "decode.h"
+#include "stretch.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -61,6 +62,7 @@ enum mp_cmd_type {
 	MP_CMD_STEP,
 	MP_CMD_SPEED,
 	MP_CMD_LOOPING,
+	MP_CMD_PITCH,
 	MP_CMD_KILL,
 };
 
@@ -78,6 +80,7 @@ struct mp_load {
 	bool reconnecting;
 	enum video_range_type force_range;
 	bool is_linear_alpha;
+	bool preserve_pitch;
 	int64_t in_ms;
 	int64_t out_ms;
 	int64_t tail_ms;
@@ -123,6 +126,9 @@ struct media_playback {
 	bool looping;
 	int speed;
 	enum video_range_type force_range;
+	/* sound at another speed keeps its pitch, through 'stretch' */
+	bool preserve_pitch;
+	struct mp_stretch stretch;
 
 	AVBufferRef *hw_device;
 	enum AVHWDeviceType hw_type;

@@ -677,6 +677,9 @@ static void seek_exact(mp_media_t *m, int64_t target)
 	m->shown = false;
 	m->still_target = target;
 
+	/* the sound the stretcher is holding was from where the clip was */
+	mp_stretch_reset(&m->stretch);
+
 	if (!m->is_local_file)
 		return;
 
@@ -778,6 +781,28 @@ static void emit_video(mp_media_t *m, uint64_t due, uint64_t now)
 	m->v_cb(m->opaque, frame);
 }
 
+static void emit_stretched(void *param, AVFrame *f, uint64_t timestamp)
+{
+	mp_media_t *m = param;
+	struct obs_source_audio audio = {0};
+
+	for (size_t i = 0; i < MAX_AV_PLANES; i++)
+		audio.data[i] = f->data[i];
+
+#if LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(59, 19, 100)
+	audio.speakers = convert_speaker_layout((uint8_t)f->channels);
+#else
+	audio.speakers = convert_speaker_layout((uint8_t)f->ch_layout.nb_channels);
+#endif
+	audio.samples_per_sec = (uint32_t)f->sample_rate;
+	audio.format = convert_sample_format(f->format);
+	audio.frames = (uint32_t)f->nb_samples;
+	audio.timestamp = timestamp;
+
+	if (audio.format != AUDIO_FORMAT_UNKNOWN)
+		m->a_cb(m->opaque, &audio);
+}
+
 static void emit_audio(mp_media_t *m, uint64_t due)
 {
 	struct mp_decode *d = &m->a;
@@ -794,6 +819,16 @@ static void emit_audio(mp_media_t *m, uint64_t due)
 
 	if (!m->a_cb)
 		return;
+
+	/* At another speed the sound is stretched in time rather than played
+	 * at another rate, when it is to keep its pitch. Sound the stretcher
+	 * cannot take falls through to the plain way below. */
+	if (m->preserve_pitch && m->speed != 100 && m->is_local_file) {
+		if (mp_stretch_push(&m->stretch, f, m->speed, due, emit_stretched, m))
+			return;
+	} else if (m->stretch.graph) {
+		mp_stretch_reset(&m->stretch);
+	}
 
 #if LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(59, 19, 100)
 	channels = f->channels;
@@ -963,6 +998,7 @@ static void close_input(mp_media_t *m)
 
 	avformat_close_input(&m->fmt);
 	hist_clear(m);
+	mp_stretch_reset(&m->stretch);
 
 	m->has_video = false;
 	m->has_audio = false;
@@ -1100,6 +1136,7 @@ static void do_load(mp_media_t *m, struct mp_load *load)
 	m->looping = load->looping;
 	m->force_range = load->force_range;
 	os_atomic_set_bool(&m->is_linear_alpha, load->is_linear_alpha);
+	m->preserve_pitch = load->preserve_pitch;
 	m->speed = load->is_local_file && load->speed >= MP_SPEED_MIN && load->speed <= MP_SPEED_MAX ? load->speed
 												     : 100;
 	m->state = MP_STATE_OPENING;
@@ -1425,6 +1462,9 @@ static bool run_commands(mp_media_t *m)
 		case MP_CMD_LOOPING:
 			m->looping = cmd.value != 0;
 			break;
+		case MP_CMD_PITCH:
+			m->preserve_pitch = cmd.value != 0;
+			break;
 		}
 
 		free_load(cmd.load);
@@ -1557,6 +1597,7 @@ void media_playback_destroy(media_playback_t *mp)
 	da_free(mp->cmds);
 
 	close_input(mp);
+	mp_stretch_free(&mp->stretch);
 	free_load(mp->cur);
 	mp_decode_free(&mp->v);
 	mp_decode_free(&mp->a);
@@ -1590,6 +1631,7 @@ uint64_t media_playback_load(media_playback_t *mp, const struct mp_load_info *in
 	load->reconnecting = info->reconnecting;
 	load->force_range = info->force_range;
 	load->is_linear_alpha = info->is_linear_alpha;
+	load->preserve_pitch = info->preserve_pitch;
 	load->in_ms = info->in_ms > 0 ? info->in_ms : 0;
 	load->out_ms = info->out_ms > 0 ? info->out_ms : 0;
 	load->tail_ms = info->tail_ms > 0 ? info->tail_ms : 0;
@@ -1650,6 +1692,12 @@ void media_playback_set_looping(media_playback_t *mp, bool looping)
 {
 	if (mp)
 		post(mp, MP_CMD_LOOPING, looping, NULL);
+}
+
+void media_playback_set_preserve_pitch(media_playback_t *mp, bool preserve_pitch)
+{
+	if (mp)
+		post(mp, MP_CMD_PITCH, preserve_pitch, NULL);
 }
 
 void media_playback_set_is_linear_alpha(media_playback_t *mp, bool is_linear_alpha)
