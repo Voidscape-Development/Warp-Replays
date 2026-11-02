@@ -61,9 +61,7 @@ target_sources(
     src/warp-websocket.c
     src/warp-zoom.c
     src/warp-zoom-filter.c
-    src/media-playback/cache.c
     src/media-playback/decode.c
-    src/media-playback/media-playback.c
     src/media-playback/media.c
 )
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")

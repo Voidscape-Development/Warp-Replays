@@ -22,7 +22,6 @@
 #include <util/dstr.h>
 
 #include <media-playback/media-playback.h>
-#include <media-playback/media.h>
 
 #include "warp-events.h"
 #include "warp-zoom.h"
@@ -33,6 +32,16 @@
 #define FF_BLOG(level, format, ...) \
 	FF_LOG_S(s->source, level, format, ##__VA_ARGS__)
 
+/* Where a clip sits in its file, kept with the source's settings so a trimmed
+ * instant replay comes back trimmed with the scene collection. They are written
+ * by warp_media_load rather than set from the properties, and only stand for
+ * the file they were written with: clip_path is that file, and a file picked
+ * from the properties afterwards is played whole. */
+#define WARP_CLIP_PATH "warp_clip_path"
+#define WARP_CLIP_IN_MS "warp_clip_in_ms"
+#define WARP_CLIP_OUT_MS "warp_clip_out_ms"
+#define WARP_CLIP_TAIL_MS "warp_clip_tail_ms"
+
 struct warp_source;
 
 /* per-hotkey context for parametrized hotkeys: 'value' is a signed frame
@@ -42,55 +51,80 @@ struct warp_hotkey_binding {
 	int value;
 };
 
-struct warp_source {
-	media_playback_t *media;
-	bool destroy_media;
-
-	enum video_range_type range;
-	bool is_linear_alpha;
-	obs_source_t *source;
-	obs_hotkey_id hotkey;
-
+/* what a file is loaded with, read out of the settings */
+struct warp_source_config {
 	char *input;
 	char *input_format;
 	char *ffmpeg_options;
 	int buffering_mb;
-	int speed_percent;
-	bool is_looping;
 	bool is_local_file;
 	bool is_hw_decoding;
-	bool full_decode;
+	enum video_range_type range;
+	int64_t in_ms;
+	int64_t out_ms;
+	int64_t tail_ms;
+};
+
+struct warp_source {
+	obs_source_t *source;
+
+	/* The playback engine. It is made with the source and lives as long as
+	 * it does: files are loaded into it rather than an engine being made
+	 * for each one, so the media thread, the hardware decoder and - for a
+	 * file encoded the way the last one was - the decoder itself carry
+	 * over from one clip to the next. */
+	media_playback_t *media;
+
+	/* Guards 'cfg' and the load numbers below it. Settings are applied on
+	 * the graphics thread, a clip is handed over from the UI's or the
+	 * websocket's, and both end in a load. */
+	pthread_mutex_t mutex;
+	struct warp_source_config cfg;
+	/* the number of the last load asked of the engine, and whether one
+	 * has been asked at all */
+	uint64_t load_seq;
+
+	/* The load the engine is handing out frames for, set on the media
+	 * thread as each load starts, and the one the source's texture last
+	 * had a picture of that load written to. Picture is "there" for the
+	 * load that was asked for only when they agree. */
+	volatile long media_seq;
+	volatile long picture_seq;
+
+	bool is_looping;
+	bool is_linear_alpha;
 	bool is_clear_on_media_end;
 	bool restart_on_activate;
 	bool close_when_inactive;
 	bool seekable;
-	bool is_stinger;
-	bool is_track_matte;
 	bool log_changes;
+	volatile long speed_percent;
 
 	pthread_t reconnect_thread;
 	pthread_mutex_t reconnect_mutex;
 	bool reconnect_thread_valid;
 	os_event_t *reconnect_stop_event;
 	volatile bool reconnecting;
+	volatile bool reconnect_pending;
 	int reconnect_delay_sec;
 
-	/* Whether there is picture in the source's texture right now. libobs
-	 * uploads a decoded frame to the texture only while the source is being
-	 * rendered, so a source that is not on screen holds a texture that has
-	 * been allocated and never written to, however many frames it has
-	 * decoded -- and that texture renders as nothing at all. So "has
-	 * something to show" has to mean the picture is in the texture, not
-	 * that a frame has been handed over. Written from the media thread and
-	 * from the graphics thread, read by warp_media_ready. */
+	/* Whether the source holds a picture written into its texture, rather
+	 * than a frame merely handed over. libobs uploads a decoded frame only
+	 * while the source is being rendered, so a source that is not on
+	 * screen holds an allocated texture that has never been written to -
+	 * and that renders as nothing at all. Written from the media thread
+	 * and the graphics thread. */
 	volatile bool has_picture;
-	/* Whether the source is holding a frame handed to it ahead of being
-	 * shown, so that obs_source_show_preloaded_video() has one to put up.
-	 * Every call that hands one over sets this; clearing the source does not
-	 * take it back, so it stays set once a frame has been handed over. */
+	/* whether a cued first frame has been handed over for
+	 * obs_source_show_preloaded_video() to put up */
 	volatile bool preloaded_frame;
 
-	enum obs_media_state state;
+	/* The OBS media state. Set as commands are given, so the frontend sees
+	 * what it asked for straight away, and by the engine's events as
+	 * playback ends or fails. */
+	volatile long state;
+
+	obs_hotkey_id hotkey;
 	obs_hotkey_pair_id play_pause_hotkey;
 	obs_hotkey_id stop_hotkey;
 
@@ -109,36 +143,54 @@ struct warp_source {
 	/* Set while the source drives its own playback instead of carrying out
 	 * a command someone sent: restarting as it goes on screen, and the
 	 * pause a frame step does first. The media action signal is about
-	 * commands, so those are not reported as ones. Only ever set and
-	 * cleared around the synchronous call it covers. */
+	 * commands, so those are not reported as ones. */
 	bool internal_command;
-
-	/* A clip warp_media_load has handed the source and what playback still
-	 * owes it. libobs defers a video source's settings update to its next
-	 * tick, so the file is not open when the load returns: the load leaves
-	 * these behind instead, and the tick carries them out once the update
-	 * has been applied.
-	 *
-	 * start_pending is a clip that is to be played from the top rather than
-	 * left to the source's own settings; hold_clip is one that is to be
-	 * parked on its first frame, which it cannot be until it has one. Set
-	 * from whichever thread handed the clip over and read on the graphics
-	 * thread, so both are set and read atomically, and hold_clip is set
-	 * first: the tick that sees a clip to start has to see how it is to be
-	 * left as well. */
-	volatile bool start_pending;
-	volatile bool hold_clip;
 
 	struct warp_hotkey_binding speed_bindings[WARP_NUM_SPEED_PRESETS];
 	struct warp_hotkey_binding step_bindings[WARP_NUM_STEP_HOTKEYS];
 };
 
+static inline enum obs_media_state get_state(struct warp_source *s)
+{
+	return (enum obs_media_state)os_atomic_load_long(&s->state);
+}
+
+static inline void set_state(struct warp_source *s, enum obs_media_state state)
+{
+	os_atomic_set_long(&s->state, (long)state);
+}
+
+static inline int get_speed(struct warp_source *s)
+{
+	return (int)os_atomic_load_long(&s->speed_percent);
+}
+
+static void config_free(struct warp_source_config *cfg)
+{
+	bfree(cfg->input);
+	bfree(cfg->input_format);
+	bfree(cfg->ffmpeg_options);
+	memset(cfg, 0, sizeof(*cfg));
+}
+
+static inline bool str_differs(const char *a, const char *b)
+{
+	return strcmp(a ? a : "", b ? b : "") != 0;
+}
+
+/* whether a file loaded with 'a' would be loaded differently with 'b' */
+static bool config_differs(const struct warp_source_config *a, const struct warp_source_config *b)
+{
+	return a->is_local_file != b->is_local_file || a->is_hw_decoding != b->is_hw_decoding || a->range != b->range ||
+	       a->buffering_mb != b->buffering_mb || a->in_ms != b->in_ms || a->out_ms != b->out_ms ||
+	       a->tail_ms != b->tail_ms || str_differs(a->input, b->input) ||
+	       str_differs(a->input_format, b->input_format) || str_differs(a->ffmpeg_options, b->ffmpeg_options);
+}
+
 // Used to safely cancel and join any active reconnect threads
 // Use this to join any finished reconnect thread too!
 static void stop_reconnect_thread(struct warp_source *s)
 {
-	if (s->is_local_file)
-		return;
 	pthread_mutex_lock(&s->reconnect_mutex);
 	if (s->reconnect_thread_valid) {
 		os_event_signal(s->reconnect_stop_event);
@@ -148,12 +200,6 @@ static void stop_reconnect_thread(struct warp_source *s)
 		os_event_reset(s->reconnect_stop_event);
 	}
 	pthread_mutex_unlock(&s->reconnect_mutex);
-}
-
-static void set_media_state(void *data, enum obs_media_state state)
-{
-	struct warp_source *s = data;
-	s->state = state;
 }
 
 static bool is_local_file_modified(obs_properties_t *props, obs_property_t *prop, obs_data_t *settings)
@@ -228,14 +274,18 @@ static obs_properties_t *warp_source_getproperties(void *data)
 	dstr_cat(&filter, obs_module_text("Warp.FileFilter.All"));
 	dstr_cat(&filter, " (*.*)");
 
-	if (s && s->input && *s->input) {
-		const char *slash;
+	if (s) {
+		pthread_mutex_lock(&s->mutex);
+		if (s->cfg.input && *s->cfg.input) {
+			const char *slash;
 
-		dstr_copy(&path, s->input);
-		dstr_replace(&path, "\\", "/");
-		slash = strrchr(path.array, '/');
-		if (slash)
-			dstr_resize(&path, slash - path.array + 1);
+			dstr_copy(&path, s->cfg.input);
+			dstr_replace(&path, "\\", "/");
+			slash = strrchr(path.array, '/');
+			if (slash)
+				dstr_resize(&path, slash - path.array + 1);
+		}
+		pthread_mutex_unlock(&s->mutex);
 	}
 
 	obs_properties_add_path(props, "local_file", obs_module_text("Warp.Media.LocalFile"), OBS_PATH_FILE,
@@ -289,7 +339,7 @@ static obs_properties_t *warp_source_getproperties(void *data)
 	return props;
 }
 
-static void dump_source_info(struct warp_source *s, const char *input, const char *input_format)
+static void dump_source_info(struct warp_source *s, const struct warp_source_config *cfg)
 {
 	if (!s->log_changes)
 		return;
@@ -297,6 +347,7 @@ static void dump_source_info(struct warp_source *s, const char *input, const cha
 		"settings:\n"
 		"\tinput:                   %s\n"
 		"\tinput_format:            %s\n"
+		"\tclip:                    %lld..%lld ms, last %lld ms\n"
 		"\tspeed:                   %d\n"
 		"\tis_looping:              %s\n"
 		"\tis_linear_alpha:         %s\n"
@@ -304,12 +355,12 @@ static void dump_source_info(struct warp_source *s, const char *input, const cha
 		"\tis_clear_on_media_end:   %s\n"
 		"\trestart_on_activate:     %s\n"
 		"\tclose_when_inactive:     %s\n"
-		"\tfull_decode:             %s\n"
 		"\tffmpeg_options:          %s",
-		input ? input : "(null)", input_format ? input_format : "(null)", s->speed_percent,
-		s->is_looping ? "yes" : "no", s->is_linear_alpha ? "yes" : "no", s->is_hw_decoding ? "yes" : "no",
+		cfg->input ? cfg->input : "(null)", cfg->input_format ? cfg->input_format : "(null)",
+		(long long)cfg->in_ms, (long long)cfg->out_ms, (long long)cfg->tail_ms, get_speed(s),
+		s->is_looping ? "yes" : "no", s->is_linear_alpha ? "yes" : "no", cfg->is_hw_decoding ? "yes" : "no",
 		s->is_clear_on_media_end ? "yes" : "no", s->restart_on_activate ? "yes" : "no",
-		s->close_when_inactive ? "yes" : "no", s->full_decode ? "yes" : "no", s->ffmpeg_options);
+		s->close_when_inactive ? "yes" : "no", cfg->ffmpeg_options ? cfg->ffmpeg_options : "");
 }
 
 /* Drops the picture the source is holding. Every place that clears the source
@@ -321,25 +372,34 @@ static void clear_video(struct warp_source *s)
 	obs_source_output_video(s->source, NULL);
 }
 
+/* ------------------------------------------------------------------------- */
+/* what the engine hands over, on its thread */
+
+static void note_picture(struct warp_source *s)
+{
+	os_atomic_set_long(&s->picture_seq, os_atomic_load_long(&s->media_seq));
+	os_atomic_set_bool(&s->has_picture, true);
+}
+
 static void get_frame(void *opaque, struct obs_source_frame *f)
 {
 	struct warp_source *s = opaque;
 
-	/* The first frame of a run is written into the source's texture here
+	/* The first frame of a load is written into the source's texture here
 	 * rather than left to the render path. libobs uploads an async frame
-	 * only while the source is being rendered, and only on a tick that has
-	 * a frame ready for it, so a source that has decoded picture but has
-	 * not been rendered yet still has an empty texture -- and libobs draws
-	 * that texture all the same, because the source counts as having video.
-	 * The Warp Playlist opens the file it is switching to off screen and
-	 * hands it straight to its transition, so an item has to have real
-	 * picture in it before it is composited, not merely a frame that has
-	 * been handed over. Only the first frame pays for this; every one after
-	 * it is uploaded by the render path as usual. */
-	if (!os_atomic_load_bool(&s->has_picture)) {
+	 * only while the source is being rendered, so a source that has decoded
+	 * picture but has not been rendered yet still has an empty texture - or
+	 * the last clip's picture in it - and libobs draws that texture all the
+	 * same. The Warp Playlist opens the file it is switching to off screen
+	 * and hands it straight to its transition, so an item has to have its
+	 * own picture in it before it is composited. Only the first frame of a
+	 * load pays for this; every one after it is uploaded by the render path
+	 * as usual. */
+	if (!os_atomic_load_bool(&s->has_picture) ||
+	    os_atomic_load_long(&s->picture_seq) != os_atomic_load_long(&s->media_seq)) {
 		obs_source_set_video_frame(s->source, f);
 		os_atomic_set_bool(&s->preloaded_frame, true);
-		os_atomic_set_bool(&s->has_picture, true);
+		note_picture(s);
 	}
 
 	obs_source_output_video(s->source, f);
@@ -348,6 +408,7 @@ static void get_frame(void *opaque, struct obs_source_frame *f)
 static void preload_frame(void *opaque, struct obs_source_frame *f)
 {
 	struct warp_source *s = opaque;
+
 	if (s->close_when_inactive)
 		return;
 
@@ -355,116 +416,183 @@ static void preload_frame(void *opaque, struct obs_source_frame *f)
 		obs_source_preload_video(s->source, f);
 		os_atomic_set_bool(&s->preloaded_frame, true);
 	}
-
-	if (!s->is_local_file && os_atomic_set_bool(&s->reconnecting, false))
-		FF_BLOG(LOG_INFO, "Reconnected.");
 }
 
-static void seek_frame(void *opaque, struct obs_source_frame *f)
+static void still_frame(void *opaque, struct obs_source_frame *f)
 {
 	struct warp_source *s = opaque;
 
-	/* a seek puts its frame straight into the texture, and leaves it with the
-	 * source as the one to put back up when playback resumes */
+	/* A seek, a step or a held clip puts its frame straight into the
+	 * texture, so it is there whether or not the source is being rendered.
+	 * It is handed over as an ordinary frame as well: libobs only draws an
+	 * async source's texture once a frame has come in that way, and a clip
+	 * that is held from the moment it is loaded has had no other. */
 	obs_source_set_video_frame(s->source, f);
+	obs_source_output_video(s->source, f);
 	os_atomic_set_bool(&s->preloaded_frame, true);
-	os_atomic_set_bool(&s->has_picture, true);
+	note_picture(s);
 }
 
 static void get_audio(void *opaque, struct obs_source_audio *a)
 {
 	struct warp_source *s = opaque;
 	obs_source_output_audio(s->source, a);
-
-	if (!s->is_local_file && os_atomic_set_bool(&s->reconnecting, false))
-		FF_BLOG(LOG_INFO, "Reconnected.");
 }
 
-/* Playback has resumed and its timestamps have been re-anchored to the current
- * clock; the frame seek_frame() was just handed is the one the source times
- * everything that follows against. Bring the audio clock to the same anchor:
- * it is timed against the frames rather than against a sample of its own, so
- * without this the audio keeps the offset the pause introduced for the rest of
- * the file. */
-static void media_resumed(void *opaque)
+static void media_event(void *opaque, enum mp_event event, uint64_t seq)
 {
 	struct warp_source *s = opaque;
 
-	obs_source_show_preloaded_video(s->source);
-}
+	switch (event) {
+	case MP_EVENT_LOADING:
+		/* Everything handed over from here on is this load's. What is
+		 * on screen is left up until the new file has a frame to put
+		 * there, so a clip landing in a source that is on air is a cut
+		 * from one picture to the next rather than a flash of nothing. */
+		os_atomic_set_long(&s->media_seq, (long)seq);
+		break;
 
-static void media_stopped(void *opaque)
-{
-	struct warp_source *s = opaque;
-	if (s->is_clear_on_media_end && !s->is_track_matte) {
-		clear_video(s);
+	case MP_EVENT_LOADED:
+		if (os_atomic_set_bool(&s->reconnecting, false))
+			FF_BLOG(LOG_INFO, "Reconnected.");
+		break;
+
+	case MP_EVENT_LOAD_FAILED: {
+		bool is_local;
+
+		pthread_mutex_lock(&s->mutex);
+		is_local = s->cfg.is_local_file;
+		pthread_mutex_unlock(&s->mutex);
+
+		/* a stream that is not there yet is tried again; a file that
+		 * will not open is an error until something else is loaded */
+		if (!is_local)
+			os_atomic_set_bool(&s->reconnect_pending, true);
+		else
+			set_state(s, OBS_MEDIA_STATE_ERROR);
+		break;
 	}
 
-	if ((s->close_when_inactive || !s->is_local_file) && s->media)
-		s->destroy_media = true;
+	case MP_EVENT_ENDED:
+	case MP_EVENT_ERROR: {
+		bool is_local;
 
-	if (s->state != OBS_MEDIA_STATE_STOPPED) {
-		set_media_state(s, OBS_MEDIA_STATE_ENDED);
-		obs_source_media_ended(s->source);
+		pthread_mutex_lock(&s->mutex);
+		is_local = s->cfg.is_local_file;
+		pthread_mutex_unlock(&s->mutex);
+
+		if (s->is_clear_on_media_end)
+			clear_video(s);
+
+		/* a stream that has stopped coming is gone until it is
+		 * connected to again */
+		if (!is_local) {
+			os_atomic_set_bool(&s->reconnect_pending, true);
+			break;
+		}
+
+		if (get_state(s) != OBS_MEDIA_STATE_STOPPED) {
+			set_state(s, OBS_MEDIA_STATE_ENDED);
+			obs_source_media_ended(s->source);
+		}
+		break;
+	}
 	}
 }
 
-static void warp_source_open(struct warp_source *s)
+/* ------------------------------------------------------------------------- */
+/* loading */
+
+/* Hands the engine the file the settings name, to be started 'start'.
+ * Returns the number of the load, or 0 when there is no file to load. */
+static uint64_t warp_source_load(struct warp_source *s, enum mp_start start)
 {
-	if (s->input && *s->input) {
-		struct mp_media_info info = {
-			.opaque = s,
-			.v_cb = get_frame,
-			.v_preload_cb = preload_frame,
-			.v_seek_cb = seek_frame,
-			.a_cb = get_audio,
-			.stop_cb = media_stopped,
-			.resume_cb = media_resumed,
-			.path = s->input,
-			.format = s->input_format,
-			.buffering = s->buffering_mb * 1024 * 1024,
-			.speed = s->speed_percent,
-			.force_range = s->range,
+	uint64_t seq = 0;
+
+	pthread_mutex_lock(&s->mutex);
+
+	if (s->cfg.input && *s->cfg.input) {
+		struct mp_load_info info = {
+			.path = s->cfg.input,
+			.format = s->cfg.input_format,
+			.ffmpeg_options = s->cfg.ffmpeg_options,
+			.buffering = s->cfg.buffering_mb * 1024 * 1024,
+			.speed = get_speed(s),
+			.is_local_file = s->cfg.is_local_file || s->seekable,
+			.looping = s->is_looping,
+			.hardware_decoding = s->cfg.is_hw_decoding,
+			.reconnecting = os_atomic_load_bool(&s->reconnecting),
+			.force_range = s->cfg.range,
 			.is_linear_alpha = s->is_linear_alpha,
-			.hardware_decoding = s->is_hw_decoding,
-			.ffmpeg_options = s->ffmpeg_options,
-			.is_local_file = s->is_local_file || s->seekable,
-			.reconnecting = s->reconnecting,
-			.request_preload = s->is_stinger,
-			.full_decode = s->full_decode,
+			.in_ms = s->cfg.in_ms,
+			.out_ms = s->cfg.out_ms,
+			.tail_ms = s->cfg.tail_ms,
+			.start = start,
 		};
 
-		s->media = media_playback_create(&info);
+		/* the picture that is up is not this load's */
+		os_atomic_set_bool(&s->preloaded_frame, false);
+
+		seq = media_playback_load(s->media, &info);
+		s->load_seq = seq;
 	}
+
+	pthread_mutex_unlock(&s->mutex);
+
+	return seq;
+}
+
+/* whether the engine has the file the settings name open, or is opening it */
+static bool warp_source_loaded(struct warp_source *s)
+{
+	struct mp_status st;
+	uint64_t seq;
+
+	pthread_mutex_lock(&s->mutex);
+	seq = s->load_seq;
+	pthread_mutex_unlock(&s->mutex);
+
+	if (!seq)
+		return false;
+
+	media_playback_get_status(s->media, &st);
+	return st.load_seq == seq && (st.loaded_seq != seq || st.open);
 }
 
 static void warp_source_start(struct warp_source *s)
 {
-	if (!s->media)
-		warp_source_open(s);
+	bool is_local;
 
-	if (!s->media)
-		return;
+	pthread_mutex_lock(&s->mutex);
+	is_local = s->cfg.is_local_file;
+	pthread_mutex_unlock(&s->mutex);
 
-	media_playback_play(s->media, s->is_looping, s->reconnecting);
+	if (!warp_source_loaded(s)) {
+		warp_source_load(s, MP_START_PLAY);
+	} else {
+		struct mp_status st;
 
-	if (s->is_local_file && media_playback_has_video(s->media) && (s->is_clear_on_media_end || s->is_looping)) {
-		/* the frame decoded when the file was opened, so there is
-		 * picture from the moment playback starts */
-		if (os_atomic_load_bool(&s->preloaded_frame)) {
-			obs_source_show_preloaded_video(s->source);
-			os_atomic_set_bool(&s->has_picture, true);
+		media_playback_get_status(s->media, &st);
+		media_playback_restart(s->media);
+
+		if (is_local && st.has_video && (s->is_clear_on_media_end || s->is_looping)) {
+			/* the first frame was cued as the clip was opened or
+			 * last stopped, so there is picture from the moment
+			 * playback starts */
+			if (os_atomic_load_bool(&s->preloaded_frame)) {
+				obs_source_show_preloaded_video(s->source);
+				os_atomic_set_bool(&s->has_picture, true);
+			}
+		} else if (!is_local || !os_atomic_load_bool(&s->has_picture)) {
+			/* Nothing to put up yet, and nothing worth keeping. A
+			 * local file that is holding picture keeps it instead:
+			 * a source set not to clear at the end of a file has no
+			 * reason to blank while it goes back to the top. */
+			clear_video(s);
 		}
-	} else if (!s->is_local_file || !os_atomic_load_bool(&s->has_picture)) {
-		/* Nothing to put up yet, and nothing worth keeping. A local file
-		 * that is holding picture keeps it instead: a source set not to
-		 * clear at the end of a file has no reason to blank while the
-		 * file is reopened and its first frame decoded, which is what
-		 * restarting an item the playlist is showing used to do. */
-		clear_video(s);
 	}
 
-	set_media_state(s, OBS_MEDIA_STATE_PLAYING);
+	set_state(s, OBS_MEDIA_STATE_PLAYING);
 	obs_source_media_started(s->source);
 }
 
@@ -473,68 +601,56 @@ static void *warp_source_reconnect(void *data)
 	struct warp_source *s = data;
 
 	int ret = os_event_timedwait(s->reconnect_stop_event, s->reconnect_delay_sec * 1000);
-	if (ret == 0 || s->media)
+	if (ret == 0)
 		return NULL;
 
 	bool active = obs_source_active(s->source);
-	if (!s->close_when_inactive || active)
-		warp_source_open(s);
 
-	if (!s->restart_on_activate || active)
-		warp_source_start(s);
+	if (!s->close_when_inactive || active)
+		warp_source_load(s, !s->restart_on_activate || active ? MP_START_PLAY : MP_START_CUE);
 
 	return NULL;
 }
 
-/* Whether the source has something to put on screen yet. Opening a file is
- * asynchronous: the source exists as soon as it is created, but its media
- * thread still has to read the header and decode a frame before anything can
- * be rendered from it, and until then the source draws nothing at all. The
- * Warp Playlist waits for this before handing an item to its transition, so a
- * switch never starts against a source that is still empty, and a held clip
- * waits for it before being parked on its first frame. */
-static bool warp_source_ready(struct warp_source *s)
+/* Whether the source has the clip it was last asked for ready to put on
+ * screen: the file is open and, when it has video, a frame of it has been
+ * written into the source's texture. Opening is asynchronous: the source has
+ * nothing of a new file to show until its media thread has read the header and
+ * decoded a frame, and a frame of the clip before it does not count. The Warp
+ * Playlist waits for this before handing an item to its transition. */
+static bool warp_source_ready(struct warp_source *s, bool *failed)
 {
-	if (!s->media || !media_playback_is_open(s->media))
-		/* Nothing the media says about itself means anything until its
-		 * streams have been worked out. In particular it reports no
-		 * video, because it does not know yet that it has any, and a
-		 * duration, because a container gives that up as soon as its
-		 * header has been read -- which together used to read as "an
-		 * audio-only file, ready to go" for the first few frames of
-		 * every video file that was opened. */
+	struct mp_status st;
+	uint64_t seq;
+
+	pthread_mutex_lock(&s->mutex);
+	seq = s->load_seq;
+	pthread_mutex_unlock(&s->mutex);
+
+	*failed = false;
+
+	if (!seq)
 		return false;
 
-	if (!media_playback_has_video(s->media))
+	media_playback_get_status(s->media, &st);
+
+	if (st.loaded_seq != seq)
+		return false;
+
+	if (!st.open) {
+		*failed = true;
+		return false;
+	}
+
+	if (!st.has_video)
 		/* audio only: there is no picture to wait for */
 		return true;
 
-	/* The picture is there once a decoded frame has been written into the
-	 * source's texture. A non-zero width is not enough on its own: a source
-	 * that is off screen reports the size of a frame it has decoded while
-	 * its texture is still empty. */
-	return os_atomic_load_bool(&s->has_picture);
+	return os_atomic_load_bool(&s->has_picture) && os_atomic_load_long(&s->picture_seq) == (long)seq;
 }
 
-/* Parks a clip that was loaded to be held on its first frame, once the file has
- * opened far enough to have one. libobs carries the pause and the seek out on
- * the media's own thread, so this is done from the tick rather than from the
- * call that asked for the clip to be held. */
-static void warp_source_hold_tick(struct warp_source *s)
-{
-	if (!warp_source_ready(s))
-		return;
-
-	/* the source is holding the clip, not being told to pause by anyone: the
-	 * media action signal is about commands */
-	s->internal_command = true;
-	obs_source_media_play_pause(s->source, true);
-	s->internal_command = false;
-
-	media_playback_seek(s->media, 0);
-
-	os_atomic_set_bool(&s->hold_clip, false);
-}
+/* ------------------------------------------------------------------------- */
+/* zoom */
 
 /* The filter the zoom is drawn by, made the first time anything asks the source
  * to zoom rather than put on every source that is never framed. One the source
@@ -616,55 +732,65 @@ static void warp_source_tick(void *data, float seconds)
 
 	warp_source_zoom_tick(s, seconds);
 
-	/* A clip that was loaded to be played or held. libobs applies a deferred
-	 * settings update just before this tick, so the file the load asked for
-	 * is the one being started here. */
-	if (os_atomic_set_bool(&s->start_pending, false)) {
-		/* A held clip is parked on its own first frame, so the picture
-		 * of the one before it goes now: the source holds on to what it
-		 * has while a new file opens, and the hold would otherwise park
-		 * on that rather than waiting for the clip it was given. */
-		if (os_atomic_load_bool(&s->hold_clip))
-			clear_video(s);
+	/* A stream that dropped, or could not be opened, is tried again after
+	 * the reconnect delay, from a thread of its own so the wait holds
+	 * nothing up. */
+	if (os_atomic_set_bool(&s->reconnect_pending, false)) {
+		media_playback_close(s->media);
 
-		warp_source_start(s);
-	}
-
-	if (os_atomic_load_bool(&s->hold_clip))
-		warp_source_hold_tick(s);
-
-	if (s->destroy_media) {
-		if (s->media) {
-			media_playback_destroy(s->media);
-			s->media = NULL;
+		pthread_mutex_lock(&s->reconnect_mutex);
+		if (!os_atomic_set_bool(&s->reconnecting, true))
+			FF_BLOG(LOG_WARNING, "Disconnected. Reconnecting...");
+		if (s->reconnect_thread_valid) {
+			os_event_signal(s->reconnect_stop_event);
+			pthread_join(s->reconnect_thread, NULL);
+			s->reconnect_thread_valid = false;
+			os_event_reset(s->reconnect_stop_event);
 		}
-
-		s->destroy_media = false;
-
-		if (!s->is_local_file) {
-			pthread_mutex_lock(&s->reconnect_mutex);
-			if (!os_atomic_set_bool(&s->reconnecting, true))
-				FF_BLOG(LOG_WARNING, "Disconnected. "
-						     "Reconnecting...");
-			if (s->reconnect_thread_valid) {
-				os_event_signal(s->reconnect_stop_event);
-				pthread_join(s->reconnect_thread, NULL);
-				s->reconnect_thread_valid = false;
-				os_event_reset(s->reconnect_stop_event);
-			}
-			if (pthread_create(&s->reconnect_thread, NULL, warp_source_reconnect, s) != 0) {
-				FF_BLOG(LOG_WARNING, "Could not create "
-						     "reconnect thread");
-				pthread_mutex_unlock(&s->reconnect_mutex);
-				return;
-			}
+		if (pthread_create(&s->reconnect_thread, NULL, warp_source_reconnect, s) != 0)
+			FF_BLOG(LOG_WARNING, "Could not create reconnect thread");
+		else
 			s->reconnect_thread_valid = true;
-			pthread_mutex_unlock(&s->reconnect_mutex);
-		}
+		pthread_mutex_unlock(&s->reconnect_mutex);
 	}
 }
 
+/* ------------------------------------------------------------------------- */
+/* settings */
+
 #define RIST_PROTO "rist"
+
+static void read_config(obs_data_t *settings, struct warp_source_config *cfg)
+{
+	cfg->is_local_file = obs_data_get_bool(settings, "is_local_file");
+
+	if (cfg->is_local_file) {
+		const char *path = obs_data_get_string(settings, "local_file");
+
+		cfg->input = bstrdup(path);
+
+		/* a clip handed over by warp_media_load is played as it was
+		 * handed over; a file picked from the properties is played
+		 * whole */
+		if (strcmp(obs_data_get_string(settings, WARP_CLIP_PATH), path) == 0) {
+			cfg->in_ms = obs_data_get_int(settings, WARP_CLIP_IN_MS);
+			cfg->out_ms = obs_data_get_int(settings, WARP_CLIP_OUT_MS);
+			cfg->tail_ms = obs_data_get_int(settings, WARP_CLIP_TAIL_MS);
+		}
+	} else {
+		const char *format = obs_data_get_string(settings, "input_format");
+
+		cfg->input = bstrdup(obs_data_get_string(settings, "input"));
+		cfg->input_format = format && *format ? bstrdup(format) : NULL;
+	}
+
+	const char *options = obs_data_get_string(settings, "ffmpeg_options");
+
+	cfg->ffmpeg_options = options && *options ? bstrdup(options) : NULL;
+	cfg->buffering_mb = (int)obs_data_get_int(settings, "buffering_mb");
+	cfg->is_hw_decoding = obs_data_get_bool(settings, "hw_decode");
+	cfg->range = (enum video_range_type)obs_data_get_int(settings, "color_range");
+}
 
 static void warp_source_update(void *data, obs_data_t *settings)
 {
@@ -674,119 +800,80 @@ static void warp_source_update(void *data, obs_data_t *settings)
 	 * so it is brought up to date before anything else is touched */
 	warp_zoom_control_update(&s->zoom, settings);
 
+	struct warp_source_config cfg = {0};
+	read_config(settings, &cfg);
+
 	/* zero until the first update, which is the one create() makes: the
 	 * speed a source starts at is not a change anyone can react to */
-	int prev_speed = s->speed_percent;
+	int prev_speed = get_speed(s);
+	int speed = (int)obs_data_get_int(settings, "speed_percent");
 	bool active = obs_source_active(s->source);
-	bool is_local_file = obs_data_get_bool(settings, "is_local_file");
-	bool is_stinger = obs_data_get_bool(settings, "is_stinger");
-	bool is_track_matte = obs_data_get_bool(settings, "is_track_matte");
-	bool should_restart_media = (is_local_file != s->is_local_file) || (is_stinger != s->is_stinger);
+	bool was_looping = s->is_looping;
 
-	const char *input;
-	const char *input_format;
-	const char *ffmpeg_options;
+	if (speed < MP_SPEED_MIN || speed > MP_SPEED_MAX)
+		speed = 100;
 
-	bool is_hw_decoding;
-	enum video_range_type range;
-	bool is_linear_alpha;
-	int speed_percent;
-	bool is_looping;
-
-	bfree(s->input_format);
-
-	if (is_local_file) {
-		input = obs_data_get_string(settings, "local_file");
-		input_format = NULL;
-		is_looping = obs_data_get_bool(settings, "looping");
-
-		if (s->input && !should_restart_media)
-			should_restart_media |= strcmp(s->input, input) != 0;
-	} else {
-		should_restart_media = true;
-		input = obs_data_get_string(settings, "input");
-		input_format = obs_data_get_string(settings, "input_format");
-		s->reconnect_delay_sec = (int)obs_data_get_int(settings, "reconnect_delay_sec");
-		s->reconnect_delay_sec = s->reconnect_delay_sec == 0 ? 10 : s->reconnect_delay_sec;
-		is_looping = false;
-	}
+	s->is_looping = cfg.is_local_file && obs_data_get_bool(settings, "looping");
+	s->is_linear_alpha = obs_data_get_bool(settings, "linear_alpha");
+	s->is_clear_on_media_end = obs_data_get_bool(settings, "clear_on_media_end");
+	s->close_when_inactive = obs_data_get_bool(settings, "close_when_inactive");
+	s->restart_on_activate = astrcmpi_n(cfg.input ? cfg.input : "", RIST_PROTO, sizeof(RIST_PROTO) - 1) != 0 &&
+				 obs_data_get_bool(settings, "restart_on_activate");
+	s->seekable = obs_data_get_bool(settings, "seekable");
+	s->log_changes = obs_data_get_bool(settings, "log_changes");
+	s->reconnect_delay_sec = (int)obs_data_get_int(settings, "reconnect_delay_sec");
+	if (s->reconnect_delay_sec <= 0)
+		s->reconnect_delay_sec = 10;
+	os_atomic_set_long(&s->speed_percent, speed);
 
 	stop_reconnect_thread(s);
 
-	is_hw_decoding = obs_data_get_bool(settings, "hw_decode");
-	range = obs_data_get_int(settings, "color_range");
-	speed_percent = (int)obs_data_get_int(settings, "speed_percent");
-	if (speed_percent < MP_SPEED_MIN || speed_percent > MP_SPEED_MAX)
-		speed_percent = 100;
-	ffmpeg_options = obs_data_get_string(settings, "ffmpeg_options");
+	/* Only a change to what is loaded, or how, loads the file again; the
+	 * rest applies to playback as it runs. A clip handed over by
+	 * warp_media_load has already been loaded with these settings, so the
+	 * update that saves them changes nothing here. Network input is always
+	 * connected to afresh. */
+	pthread_mutex_lock(&s->mutex);
+	bool reload = !s->load_seq || !cfg.is_local_file || config_differs(&s->cfg, &cfg);
+	config_free(&s->cfg);
+	s->cfg = cfg;
+	pthread_mutex_unlock(&s->mutex);
 
-	/* Restart media source if these properties are changed (speed is
-	 * intentionally absent: it is applied to running playback below) */
-	if (s->is_hw_decoding != is_hw_decoding || s->range != range ||
-	    (s->ffmpeg_options && strcmp(s->ffmpeg_options, ffmpeg_options) != 0))
-		should_restart_media = true;
+	/* A clip that has ended and has looping switched on is expected to go
+	 * round. Only ENDED: a clip someone stopped stays stopped. */
+	if (active && get_state(s) == OBS_MEDIA_STATE_ENDED && s->is_looping && !was_looping)
+		reload = true;
 
-	/* If media has ended and user enables looping, user expects that it restarts.
-	 * Should still check if is_looping was changed, because users may stop them
-	 * intentionally, which is why we only check for ENDED and not STOPPED. */
-	if (active && s->state == OBS_MEDIA_STATE_ENDED && is_looping == true && s->is_looping == false) {
-		should_restart_media = true;
+	media_playback_set_looping(s->media, s->is_looping);
+	media_playback_set_is_linear_alpha(s->media, s->is_linear_alpha);
+	media_playback_set_speed(s->media, speed);
+
+	if (reload) {
+		if (!s->close_when_inactive || active) {
+			bool play = !s->restart_on_activate || active;
+
+			warp_source_load(s, play ? MP_START_PLAY : MP_START_CUE);
+
+			if (play) {
+				set_state(s, OBS_MEDIA_STATE_PLAYING);
+				obs_source_media_started(s->source);
+			} else {
+				set_state(s, OBS_MEDIA_STATE_STOPPED);
+			}
+		} else {
+			media_playback_close(s->media);
+			set_state(s, OBS_MEDIA_STATE_NONE);
+		}
 	}
 
-	bfree(s->input);
-	bfree(s->ffmpeg_options);
-
-	s->is_looping = is_looping;
-	s->close_when_inactive = obs_data_get_bool(settings, "close_when_inactive");
-	s->input = input ? bstrdup(input) : NULL;
-	s->input_format = input_format ? bstrdup(input_format) : NULL;
-	s->is_hw_decoding = is_hw_decoding;
-	s->full_decode = obs_data_get_bool(settings, "full_decode");
-	s->is_clear_on_media_end = obs_data_get_bool(settings, "clear_on_media_end");
-	s->restart_on_activate = !astrcmpi_n(input, RIST_PROTO, sizeof(RIST_PROTO) - 1)
-					 ? false
-					 : obs_data_get_bool(settings, "restart_on_activate");
-	s->range = range;
-	is_linear_alpha = obs_data_get_bool(settings, "linear_alpha");
-	s->is_linear_alpha = is_linear_alpha;
-	s->buffering_mb = (int)obs_data_get_int(settings, "buffering_mb");
-	s->speed_percent = speed_percent;
-	s->is_local_file = is_local_file;
-	s->seekable = obs_data_get_bool(settings, "seekable");
-	s->ffmpeg_options = ffmpeg_options ? bstrdup(ffmpeg_options) : NULL;
-	s->is_stinger = is_stinger;
-	s->is_track_matte = is_track_matte;
-	s->log_changes = obs_data_get_bool(settings, "log_changes");
-
-	if (s->speed_percent < MP_SPEED_MIN || s->speed_percent > MP_SPEED_MAX)
-		s->speed_percent = 100;
-
-	if (s->media && should_restart_media) {
-		media_playback_destroy(s->media);
-		s->media = NULL;
-	}
-
-	/* directly set options if media is playing */
-	if (s->media) {
-		media_playback_set_looping(s->media, is_looping);
-		media_playback_set_is_linear_alpha(s->media, is_linear_alpha);
-		media_playback_set_speed(s->media, speed_percent);
-	}
-	if ((!s->close_when_inactive || active) && should_restart_media)
-		warp_source_open(s);
-
-	dump_source_info(s, input, input_format);
-
-	/* A clip that was loaded to be played or held is started by the tick
-	 * this update is being applied on, from the top and whether or not the
-	 * source is on screen, so it is not started here as well. */
-	if ((!s->restart_on_activate || active) && should_restart_media && !os_atomic_load_bool(&s->start_pending))
-		warp_source_start(s);
+	pthread_mutex_lock(&s->mutex);
+	dump_source_info(s, &s->cfg);
+	pthread_mutex_unlock(&s->mutex);
 
 	/* the Speed property applies live, so it is a speed change like any
 	 * hotkey-driven one */
-	if (prev_speed && prev_speed != s->speed_percent)
-		warp_signal_speed_changed(s->source, s->speed_percent, prev_speed, WARP_SPEED_CHANGE_SET);
+	if (prev_speed && prev_speed != speed)
+		warp_signal_speed_changed(s->source, speed, prev_speed, WARP_SPEED_CHANGE_SET);
 }
 
 static const char *warp_source_getname(void *unused)
@@ -794,6 +881,9 @@ static const char *warp_source_getname(void *unused)
 	UNUSED_PARAMETER(unused);
 	return obs_module_text("Warp.MediaSource.Name");
 }
+
+/* ------------------------------------------------------------------------- */
+/* hotkeys and procs */
 
 static void restart_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
 {
@@ -814,35 +904,39 @@ static void restart_proc(void *data, calldata_t *cd)
 	UNUSED_PARAMETER(cd);
 }
 
-static void preload_first_frame_proc(void *data, calldata_t *cd)
-{
-	struct warp_source *s = data;
-	if (s->is_track_matte)
-		clear_video(s);
-	media_playback_preload_frame(s->media);
-	UNUSED_PARAMETER(cd);
-}
-
 static void get_duration(void *data, calldata_t *cd)
 {
 	struct warp_source *s = data;
-	int64_t dur = 0;
-	if (s->media)
-		dur = media_playback_get_duration(s->media);
+	struct mp_status st;
 
-	calldata_set_int(cd, "duration", dur * 1000);
+	media_playback_get_status(s->media, &st);
+	calldata_set_int(cd, "duration", st.duration_ms * 1000000);
 }
 
 static void get_nb_frames(void *data, calldata_t *cd)
 {
 	struct warp_source *s = data;
-	int64_t frames = media_playback_get_frames(s->media);
-	calldata_set_int(cd, "num_frames", frames);
+	struct mp_status st;
+
+	media_playback_get_status(s->media, &st);
+	calldata_set_int(cd, "num_frames", st.frames);
 }
 
 static void media_ready_proc(void *data, calldata_t *cd)
 {
-	calldata_set_bool(cd, "ready", warp_source_ready(data));
+	struct warp_source *s = data;
+	bool failed;
+	uint64_t seq;
+
+	bool ready = warp_source_ready(s, &failed);
+
+	pthread_mutex_lock(&s->mutex);
+	seq = s->load_seq;
+	pthread_mutex_unlock(&s->mutex);
+
+	calldata_set_bool(cd, "ready", ready);
+	calldata_set_bool(cd, "failed", failed);
+	calldata_set_int(cd, "seq", (long long)seq);
 }
 
 static bool warp_source_play_hotkey(void *data, obs_hotkey_pair_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -855,7 +949,7 @@ static bool warp_source_play_hotkey(void *data, obs_hotkey_pair_id id, obs_hotke
 
 	struct warp_source *s = data;
 
-	if (s->state == OBS_MEDIA_STATE_PLAYING || !obs_source_showing(s->source))
+	if (get_state(s) == OBS_MEDIA_STATE_PLAYING || !obs_source_showing(s->source))
 		return false;
 
 	obs_source_media_play_pause(s->source, false);
@@ -872,7 +966,7 @@ static bool warp_source_pause_hotkey(void *data, obs_hotkey_pair_id id, obs_hotk
 
 	struct warp_source *s = data;
 
-	if (s->state != OBS_MEDIA_STATE_PLAYING || !obs_source_showing(s->source))
+	if (get_state(s) != OBS_MEDIA_STATE_PLAYING || !obs_source_showing(s->source))
 		return false;
 
 	obs_source_media_play_pause(s->source, true);
@@ -893,6 +987,14 @@ static void warp_source_stop_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *
 		obs_source_media_stop(s->source);
 }
 
+static bool warp_source_is_local(struct warp_source *s)
+{
+	pthread_mutex_lock(&s->mutex);
+	bool is_local = s->cfg.is_local_file;
+	pthread_mutex_unlock(&s->mutex);
+	return is_local;
+}
+
 /* 'change' is one of the WARP_SPEED_CHANGE_* kinds, and says how the speed was
  * asked to move: a listener can tell a preset from a step that happens to land
  * on the same value */
@@ -903,15 +1005,13 @@ static void warp_source_apply_speed(struct warp_source *s, int speed, const char
 	else if (speed > MP_SPEED_MAX)
 		speed = MP_SPEED_MAX;
 
-	if (!s->is_local_file || speed == s->speed_percent)
+	int prev_speed = get_speed(s);
+
+	if (!warp_source_is_local(s) || speed == prev_speed)
 		return;
 
-	int prev_speed = s->speed_percent;
-
-	s->speed_percent = speed;
-
-	if (s->media)
-		media_playback_set_speed(s->media, speed);
+	os_atomic_set_long(&s->speed_percent, speed);
+	media_playback_set_speed(s->media, speed);
 
 	/* keep the saved settings in sync so the next update() and scene
 	 * collection saves reflect the hotkey-driven speed */
@@ -934,7 +1034,7 @@ static void warp_source_speed_up_hotkey(void *data, obs_hotkey_id id, obs_hotkey
 	if (!pressed || !obs_source_showing(s->source))
 		return;
 
-	warp_source_apply_speed(s, s->speed_percent + WARP_SPEED_STEP, WARP_SPEED_CHANGE_INCREASED);
+	warp_source_apply_speed(s, get_speed(s) + WARP_SPEED_STEP, WARP_SPEED_CHANGE_INCREASED);
 }
 
 static void warp_source_speed_down_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -947,7 +1047,7 @@ static void warp_source_speed_down_hotkey(void *data, obs_hotkey_id id, obs_hotk
 	if (!pressed || !obs_source_showing(s->source))
 		return;
 
-	warp_source_apply_speed(s, s->speed_percent - WARP_SPEED_STEP, WARP_SPEED_CHANGE_DECREASED);
+	warp_source_apply_speed(s, get_speed(s) - WARP_SPEED_STEP, WARP_SPEED_CHANGE_DECREASED);
 }
 
 static void warp_source_speed_reset_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -978,19 +1078,25 @@ static void warp_source_speed_preset_hotkey(void *data, obs_hotkey_id id, obs_ho
 
 static void warp_source_do_step(struct warp_source *s, int frames)
 {
-	if (!s->media || !s->is_local_file)
+	if (!warp_source_is_local(s) || !frames)
 		return;
 
-	/* stepping while playing pauses first, then steps */
-	if (s->state == OBS_MEDIA_STATE_PLAYING) {
+	enum obs_media_state state = get_state(s);
+
+	/* Stepping while playing pauses first, through OBS so the pause is
+	 * seen like any other. A clip that is stopped or has ended steps from
+	 * the start of the clip. */
+	if (state == OBS_MEDIA_STATE_PLAYING) {
 		s->internal_command = true;
 		obs_source_media_play_pause(s->source, true);
 		s->internal_command = false;
-	} else if (s->state != OBS_MEDIA_STATE_PAUSED) {
+	} else if (state != OBS_MEDIA_STATE_PAUSED && state != OBS_MEDIA_STATE_STOPPED &&
+		   state != OBS_MEDIA_STATE_ENDED) {
 		return;
 	}
 
 	media_playback_step_frames(s->media, frames);
+	set_state(s, OBS_MEDIA_STATE_PAUSED);
 
 	warp_signal_frames_stepped(s->source, frames);
 }
@@ -1009,9 +1115,9 @@ static void warp_source_step_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *
 	warp_source_do_step(s, b->value);
 }
 
-/* Procs used by the Warp Playlist source to drive its private media items, and
- * by the obs-websocket vendor requests to drive the source from outside OBS.
- * They apply the same changes the hotkeys do, and report them the same way. */
+/* Procs used by the Warp Playlist source to drive its media items, and by the
+ * obs-websocket vendor requests to drive the source from outside OBS. They
+ * apply the same changes the hotkeys do, and report them the same way. */
 static void set_speed_proc(void *data, calldata_t *cd)
 {
 	long long speed;
@@ -1030,7 +1136,7 @@ static void adjust_speed_proc(void *data, calldata_t *cd)
 	if (!calldata_get_int(cd, "delta", &delta) || !delta)
 		return;
 
-	warp_source_apply_speed(s, s->speed_percent + (int)delta,
+	warp_source_apply_speed(s, get_speed(s) + (int)delta,
 				delta > 0 ? WARP_SPEED_CHANGE_INCREASED : WARP_SPEED_CHANGE_DECREASED);
 }
 
@@ -1038,7 +1144,7 @@ static void get_speed_proc(void *data, calldata_t *cd)
 {
 	struct warp_source *s = data;
 
-	calldata_set_int(cd, "speed", s->speed_percent);
+	calldata_set_int(cd, "speed", get_speed(s));
 }
 
 static void step_frames_proc(void *data, calldata_t *cd)
@@ -1049,17 +1155,21 @@ static void step_frames_proc(void *data, calldata_t *cd)
 		warp_source_do_step(data, (int)frames);
 }
 
-/* Puts a file in the source and says what playback is to do with it, which is
- * what a Warp Instant Replay flow calls when a clip lands. The file goes in
- * through the source's settings, the way changing it in the properties does, so
- * it is saved with the scene collection and the source reopens it like any
- * other change of file. */
+/* Puts a clip in the source and says what playback is to do with it, which is
+ * what a Warp Instant Replay flow, and the Warp Playlist with each of its items,
+ * call. The clip is loaded into the engine there and then; the settings are
+ * brought up to date as well, so it is saved with the scene collection, but
+ * without the settings update a change of file from the properties makes - it
+ * would only load the same clip a second time. */
 static void warp_media_load_proc(void *data, calldata_t *cd)
 {
 	struct warp_source *s = data;
 	const char *path = NULL;
 	const char *playback = NULL;
 	long long speed = 0;
+	long long in_ms = 0;
+	long long out_ms = 0;
+	long long tail_ms = 0;
 
 	if (!calldata_get_string(cd, "path", &path) || !path || !*path) {
 		FF_BLOG(LOG_WARNING, "asked to load a clip without saying which");
@@ -1068,42 +1178,99 @@ static void warp_media_load_proc(void *data, calldata_t *cd)
 
 	calldata_get_string(cd, "playback", &playback);
 	calldata_get_int(cd, "speed", &speed);
+	calldata_get_int(cd, "in_ms", &in_ms);
+	calldata_get_int(cd, "out_ms", &out_ms);
+	calldata_get_int(cd, "tail_ms", &tail_ms);
 
 	if (!playback || !*playback)
 		playback = WARP_MEDIA_LOAD_KEEP;
 
 	const bool play = strcmp(playback, WARP_MEDIA_LOAD_PLAY) == 0;
 	const bool hold = strcmp(playback, WARP_MEDIA_LOAD_HOLD) == 0;
+	const bool active = obs_source_active(s->source);
+	const int prev_speed = get_speed(s);
+
+	if (in_ms < 0)
+		in_ms = 0;
+	if (out_ms < 0 || (out_ms && out_ms <= in_ms))
+		out_ms = 0;
+	if (tail_ms < 0)
+		tail_ms = 0;
 
 	obs_data_t *settings = obs_source_get_settings(s->source);
 
+	pthread_mutex_lock(&s->mutex);
+
 	/* a clip is a file on disk, whatever the source was pointed at before */
-	if (!s->is_local_file)
-		FF_BLOG(LOG_INFO, "loading a clip, so the source is no longer reading '%s'", s->input ? s->input : "");
+	if (!s->cfg.is_local_file)
+		FF_BLOG(LOG_INFO, "loading a clip, so the source is no longer reading '%s'",
+			s->cfg.input ? s->cfg.input : "");
+
+	bfree(s->cfg.input);
+	bfree(s->cfg.input_format);
+	s->cfg.input = bstrdup(path);
+	s->cfg.input_format = NULL;
+	s->cfg.is_local_file = true;
+	s->cfg.in_ms = in_ms;
+	s->cfg.out_ms = out_ms;
+	s->cfg.tail_ms = tail_ms;
 
 	obs_data_set_bool(settings, "is_local_file", true);
 	obs_data_set_string(settings, "local_file", path);
+	obs_data_set_string(settings, WARP_CLIP_PATH, path);
+	obs_data_set_int(settings, WARP_CLIP_IN_MS, in_ms);
+	obs_data_set_int(settings, WARP_CLIP_OUT_MS, out_ms);
+	obs_data_set_int(settings, WARP_CLIP_TAIL_MS, tail_ms);
 
-	if (speed >= MP_SPEED_MIN && speed <= MP_SPEED_MAX)
+	if (speed >= MP_SPEED_MIN && speed <= MP_SPEED_MAX) {
+		os_atomic_set_long(&s->speed_percent, (long)speed);
 		obs_data_set_int(settings, "speed_percent", (int)speed);
+	}
 
-	obs_source_update(s->source, settings);
+	pthread_mutex_unlock(&s->mutex);
 	obs_data_release(settings);
 
-	/* Playback is left to the update and the source's own settings unless
-	 * the clip was asked to be played or held; both of those are started by
-	 * the tick that applies the update, whether or not the source is on
-	 * screen, because a clip that is not decoding cannot play now and has no
-	 * frame to be held on. */
-	os_atomic_set_bool(&s->hold_clip, hold);
-	os_atomic_set_bool(&s->start_pending, play || hold);
+	stop_reconnect_thread(s);
+
+	/* 'keep' leaves it to the source's own settings, the way a file picked
+	 * from the properties is: played if the source is on screen or does
+	 * not wait to be, cued to start when it is brought on otherwise */
+	enum mp_start start;
+	enum obs_media_state state;
+
+	if (hold) {
+		start = MP_START_HOLD;
+		state = OBS_MEDIA_STATE_PAUSED;
+	} else if (play || active || !s->restart_on_activate) {
+		start = MP_START_PLAY;
+		state = OBS_MEDIA_STATE_PLAYING;
+	} else {
+		start = MP_START_CUE;
+		state = OBS_MEDIA_STATE_STOPPED;
+	}
+
+	uint64_t seq = warp_source_load(s, start);
+
+	set_state(s, state);
+	if (state == OBS_MEDIA_STATE_PLAYING)
+		obs_source_media_started(s->source);
+
+	calldata_set_int(cd, "seq", (long long)seq);
 
 	/* a clip that has just landed is a new video, so it arrives framed the
 	 * way every clip arrives rather than zoomed into wherever the last one
 	 * was being watched */
 	warp_zoom_control_restore_default(&s->zoom);
 
-	FF_BLOG(LOG_INFO, "loaded '%s' (%s)", path, playback);
+	if (tail_ms)
+		FF_BLOG(LOG_INFO, "loaded the last %lld ms of '%s' (%s)", tail_ms, path, playback);
+	else if (in_ms || out_ms)
+		FF_BLOG(LOG_INFO, "loaded '%s' from %lld to %lld ms (%s)", path, in_ms, out_ms, playback);
+	else
+		FF_BLOG(LOG_INFO, "loaded '%s' (%s)", path, playback);
+
+	if (prev_speed && prev_speed != get_speed(s))
+		warp_signal_speed_changed(s->source, get_speed(s), prev_speed, WARP_SPEED_CHANGE_SET);
 
 	/* Said as soon as the clip is in rather than once it has decoded, so
 	 * that a source which is only being loaded says so too: one that is off
@@ -1170,6 +1337,9 @@ static void warp_source_save(void *data, obs_data_t *settings)
 	warp_zoom_control_save(&s->zoom, settings);
 }
 
+/* ------------------------------------------------------------------------- */
+/* lifetime */
+
 static void *warp_source_create(obs_data_t *settings, obs_source_t *source)
 {
 	static const char *signals[] = {WARP_SIGNAL_DECL_SPEED_CHANGED, WARP_SIGNAL_DECL_FRAMES_STEPPED,
@@ -1195,6 +1365,33 @@ static void *warp_source_create(obs_data_t *settings, obs_source_t *source)
 		return NULL;
 	}
 
+	if (pthread_mutex_init(&s->mutex, NULL)) {
+		FF_BLOG(LOG_ERROR, "Failed to initialize mutex");
+		pthread_mutex_destroy(&s->reconnect_mutex);
+		os_event_destroy(s->reconnect_stop_event);
+		bfree(s);
+		return NULL;
+	}
+
+	struct mp_media_info info = {
+		.opaque = s,
+		.v_cb = get_frame,
+		.v_preload_cb = preload_frame,
+		.v_still_cb = still_frame,
+		.a_cb = get_audio,
+		.event_cb = media_event,
+	};
+
+	s->media = media_playback_create(&info);
+	if (!s->media) {
+		FF_BLOG(LOG_ERROR, "Failed to start the playback engine");
+		pthread_mutex_destroy(&s->mutex);
+		pthread_mutex_destroy(&s->reconnect_mutex);
+		os_event_destroy(s->reconnect_stop_event);
+		bfree(s);
+		return NULL;
+	}
+
 	s->hotkey = obs_hotkey_register_source(source, "WarpMedia.Restart", obs_module_text("Warp.Hotkey.Restart"),
 					       restart_hotkey, s);
 
@@ -1210,15 +1407,18 @@ static void *warp_source_create(obs_data_t *settings, obs_source_t *source)
 
 	proc_handler_t *ph = obs_source_get_proc_handler(source);
 	proc_handler_add(ph, "void restart()", restart_proc, s);
-	proc_handler_add(ph, "void preload_first_frame()", preload_first_frame_proc, s);
 	proc_handler_add(ph, "void get_duration(out int duration)", get_duration, s);
 	proc_handler_add(ph, "void get_nb_frames(out int num_frames)", get_nb_frames, s);
-	proc_handler_add(ph, "void warp_media_ready(out bool ready)", media_ready_proc, s);
+	proc_handler_add(ph, "void " WARP_MEDIA_READY_PROC "(out bool ready, out bool failed, out int seq)",
+			 media_ready_proc, s);
 	proc_handler_add(ph, "void warp_set_speed(int speed)", set_speed_proc, s);
 	proc_handler_add(ph, "void warp_adjust_speed(int delta)", adjust_speed_proc, s);
 	proc_handler_add(ph, "void warp_get_speed(out int speed)", get_speed_proc, s);
 	proc_handler_add(ph, "void warp_step_frames(int frames)", step_frames_proc, s);
-	proc_handler_add(ph, "void " WARP_MEDIA_LOAD_PROC "(string path, int speed, string playback)",
+	proc_handler_add(ph,
+			 "void " WARP_MEDIA_LOAD_PROC
+			 "(string path, int speed, string playback, int in_ms, int out_ms, "
+			 "int tail_ms, out int seq)",
 			 warp_media_load_proc, s);
 
 	warp_zoom_control_init(&s->zoom, source, "WarpMedia", true, false);
@@ -1234,6 +1434,9 @@ static void warp_source_destroy(void *data)
 
 	stop_reconnect_thread(s);
 
+	/* the engine goes first: its thread calls back into the source */
+	media_playback_destroy(s->media);
+
 	warp_zoom_control_free(&s->zoom);
 
 	if (s->zoom_filter)
@@ -1241,14 +1444,11 @@ static void warp_source_destroy(void *data)
 
 	if (s->hotkey)
 		obs_hotkey_unregister(s->hotkey);
-	if (s->media)
-		media_playback_destroy(s->media);
 
+	pthread_mutex_destroy(&s->mutex);
 	pthread_mutex_destroy(&s->reconnect_mutex);
 	os_event_destroy(s->reconnect_stop_event);
-	bfree(s->input);
-	bfree(s->input_format);
-	bfree(s->ffmpeg_options);
+	config_free(&s->cfg);
 	bfree(s);
 }
 
@@ -1256,8 +1456,13 @@ static void warp_source_activate(void *data)
 {
 	struct warp_source *s = data;
 
-	if (!s->restart_on_activate)
+	if (!s->restart_on_activate) {
+		/* a source that let go of its file while it was off screen
+		 * opens it again, ready to be started */
+		if (s->close_when_inactive && !warp_source_loaded(s))
+			warp_source_load(s, MP_START_CUE);
 		return;
+	}
 
 	/* going on screen restarts playback by itself; obs_source_media_restart
 	 * is still what does it, so OBS's own media_restart signal is emitted
@@ -1272,47 +1477,39 @@ static void warp_source_deactivate(void *data)
 	struct warp_source *s = data;
 
 	if (s->restart_on_activate) {
-		if (s->media) {
-			media_playback_stop(s->media);
+		media_playback_stop(s->media);
 
-			if (s->is_clear_on_media_end)
-				clear_video(s);
-		}
+		if (s->is_clear_on_media_end)
+			clear_video(s);
+	}
+
+	if (s->close_when_inactive) {
+		media_playback_close(s->media);
+		pthread_mutex_lock(&s->mutex);
+		s->load_seq = 0;
+		pthread_mutex_unlock(&s->mutex);
 	}
 }
 
-/* A clip that was loaded to be played or held is waiting on the tick, which is
- * long enough for the operator to get in first. Whatever they asked for is what
- * the source does: the load does not come back and take playback off them. */
-static void warp_source_drop_pending_load(struct warp_source *s)
-{
-	if (s->internal_command)
-		return;
-
-	os_atomic_set_bool(&s->start_pending, false);
-	os_atomic_set_bool(&s->hold_clip, false);
-}
+/* ------------------------------------------------------------------------- */
+/* media controls */
 
 static void warp_source_play_pause(void *data, bool pause)
 {
 	struct warp_source *s = data;
 
-	warp_source_drop_pending_load(s);
-
-	if (!s->media)
-		warp_source_open(s);
-
-	if (!s->media)
-		return;
-
-	media_playback_play_pause(s->media, pause);
+	if (!warp_source_loaded(s)) {
+		if (pause)
+			return;
+		warp_source_load(s, MP_START_PLAY);
+	} else {
+		media_playback_pause(s->media, pause);
+	}
 
 	if (pause) {
-
-		set_media_state(s, OBS_MEDIA_STATE_PAUSED);
+		set_state(s, OBS_MEDIA_STATE_PAUSED);
 	} else {
-
-		set_media_state(s, OBS_MEDIA_STATE_PLAYING);
+		set_state(s, OBS_MEDIA_STATE_PLAYING);
 		obs_source_media_started(s->source);
 	}
 
@@ -1324,25 +1521,19 @@ static void warp_source_stop(void *data)
 {
 	struct warp_source *s = data;
 
-	warp_source_drop_pending_load(s);
-
-	if (s->media) {
-		media_playback_stop(s->media);
-		clear_video(s);
-		set_media_state(s, OBS_MEDIA_STATE_STOPPED);
-	}
+	media_playback_stop(s->media);
+	clear_video(s);
+	set_state(s, OBS_MEDIA_STATE_STOPPED);
 }
 
 static void warp_source_restart(void *data)
 {
 	struct warp_source *s = data;
 
-	warp_source_drop_pending_load(s);
-
 	if (obs_source_showing(s->source))
 		warp_source_start(s);
 
-	set_media_state(s, OBS_MEDIA_STATE_PLAYING);
+	set_state(s, OBS_MEDIA_STATE_PLAYING);
 
 	if (!s->internal_command)
 		warp_signal_media_action(s->source, WARP_MEDIA_ACTION_RESTART);
@@ -1351,36 +1542,38 @@ static void warp_source_restart(void *data)
 static int64_t warp_source_get_duration(void *data)
 {
 	struct warp_source *s = data;
-	int64_t dur = 0;
+	struct mp_status st;
 
-	if (s->media)
-		dur = media_playback_get_duration(s->media) / INT64_C(1000);
-
-	return dur;
+	media_playback_get_status(s->media, &st);
+	return st.duration_ms;
 }
 
 static int64_t warp_source_get_time(void *data)
 {
 	struct warp_source *s = data;
+	struct mp_status st;
 
-	return media_playback_get_current_time(s->media);
+	media_playback_get_status(s->media, &st);
+	return st.time_ms;
 }
 
 static void warp_source_set_time(void *data, int64_t ms)
 {
 	struct warp_source *s = data;
 
-	if (!s->media)
-		return;
-
 	media_playback_seek(s->media, ms);
+
+	/* a clip that was not playing is left on the frame it was moved to */
+	enum obs_media_state state = get_state(s);
+	if (state == OBS_MEDIA_STATE_STOPPED || state == OBS_MEDIA_STATE_ENDED)
+		set_state(s, OBS_MEDIA_STATE_PAUSED);
 }
 
 static enum obs_media_state warp_source_get_state(void *data)
 {
 	struct warp_source *s = data;
 
-	return s->state;
+	return get_state(s);
 }
 
 static void missing_file_callback(void *src, const char *new_path, void *data)
@@ -1401,14 +1594,14 @@ static obs_missing_files_t *warp_source_missingfiles(void *data)
 	struct warp_source *s = data;
 	obs_missing_files_t *files = obs_missing_files_create();
 
-	if (s->is_local_file && strcmp(s->input, "") != 0) {
-		if (!os_file_exists(s->input)) {
-			obs_missing_file_t *file = obs_missing_file_create(s->input, missing_file_callback,
-									   OBS_MISSING_FILE_SOURCE, s->source, NULL);
+	pthread_mutex_lock(&s->mutex);
+	if (s->cfg.is_local_file && s->cfg.input && *s->cfg.input && !os_file_exists(s->cfg.input)) {
+		obs_missing_file_t *file = obs_missing_file_create(s->cfg.input, missing_file_callback,
+								   OBS_MISSING_FILE_SOURCE, s->source, NULL);
 
-			obs_missing_files_add_file(files, file);
-		}
+		obs_missing_files_add_file(files, file);
 	}
+	pthread_mutex_unlock(&s->mutex);
 
 	return files;
 }

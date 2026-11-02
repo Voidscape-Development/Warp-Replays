@@ -97,9 +97,10 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define WARP_MEDIA_ACTION_RESTART "restart"
 #define WARP_MEDIA_ACTION_LOADED "loaded"
 
-/* Puts a file in a Warp Media source, as a proc on the source itself:
+/* Puts a clip in a Warp Media source, as a proc on the source itself:
  *
- *   warp_media_load(string path, int speed, string playback)
+ *   warp_media_load(string path, int speed, string playback,
+ *                   int in_ms, int out_ms, int tail_ms, out int seq)
  *
  * The source is switched to that local file, played at 'speed' percent when
  * that is anything other than zero, and left doing whatever 'playback' says.
@@ -107,11 +108,32 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  * playback was left, so a Warp Detection filter can bring the source on screen
  * the moment a clip arrives.
  *
- * This is what a Warp Instant Replay flow calls; it is a proc rather than a
- * settings change so that holding a clip on its first frame - which has to
- * wait for the file to open and decode - is done by the source, on its own
- * tick, rather than by whoever handed the clip over. */
+ * in_ms and out_ms, when they are given, are where the clip starts and ends in
+ * the file; tail_ms makes the clip the last that many milliseconds of the file
+ * instead. The cut is frame-accurate and nothing is written to disk: the source
+ * plays that stretch of the file as though it were the whole of it, and its
+ * position and duration are those of the clip. All three are left out, or 0,
+ * to play the file whole.
+ *
+ * 'seq' comes back as the number of the load, which warp_media_ready answers
+ * for (see below).
+ *
+ * This is what a Warp Instant Replay flow calls, and what the Warp Playlist
+ * loads each of its files with. It is a proc rather than a settings change so
+ * the clip is loaded there and then, and the settings are only brought up to
+ * date to be saved. */
 #define WARP_MEDIA_LOAD_PROC "warp_media_load"
+
+/* Whether a Warp Media source has the clip it was last loaded with ready to go
+ * on screen:
+ *
+ *   warp_media_ready(out bool ready, out bool failed, out int seq)
+ *
+ * 'ready' once the file is open and, when it has video, a frame of it is in
+ * the source's texture - a frame of the clip that was in it before does not
+ * count; 'failed' once the file has turned out not to open; 'seq' is the number
+ * of the load both are about, as warp_media_load handed it back. */
+#define WARP_MEDIA_READY_PROC "warp_media_ready"
 
 /* what playback does with a file that has just been loaded:
  *

@@ -16,7 +16,12 @@
 
 #pragma once
 
+/* The engine's insides, shared by media.c and decode.c only. Everything the
+ * sources use is in media-playback.h. */
+
 #include <obs.h>
+#include <util/darray.h>
+#include "media-playback.h"
 #include "decode.h"
 
 #ifdef __cplusplus
@@ -38,105 +43,142 @@ extern "C" {
 #pragma warning(pop)
 #endif
 
-/* Warp addition: capacity of the decoded-frame history used to show
- * backward frame steps instantly. The largest step hotkey is 20 frames,
- * and rapid presses arriving while the media thread is busy coalesce
- * into one larger step, so keep room for a couple of stacked steps.
- * The byte cap keeps the history from ballooning on very large frames. */
+/* Capacity of the decoded-frame history used to show backward frame steps
+ * straight away. The largest step hotkey is 20 frames, and presses arriving
+ * while the media thread is busy are added together into one larger step, so
+ * keep room for a couple of them. The byte cap keeps the history from
+ * ballooning on very large frames. */
 #define MP_FRAME_HIST_SIZE 45
 #define MP_FRAME_HIST_MAX_BYTES (256 * 1024 * 1024)
 
-struct mp_media {
-	AVFormatContext *fmt;
+enum mp_cmd_type {
+	MP_CMD_LOAD,
+	MP_CMD_CLOSE,
+	MP_CMD_RESTART,
+	MP_CMD_PAUSE,
+	MP_CMD_STOP,
+	MP_CMD_SEEK,
+	MP_CMD_STEP,
+	MP_CMD_SPEED,
+	MP_CMD_LOOPING,
+	MP_CMD_KILL,
+};
 
-	mp_video_cb v_preload_cb;
-	mp_video_cb v_seek_cb;
-	mp_stop_cb stop_cb;
-	mp_video_cb v_cb;
-	mp_audio_cb a_cb;
-	mp_resume_cb resume_cb;
-	void *opaque;
-
+/* a load, copied out of the caller's mp_load_info and owned by the engine */
+struct mp_load {
+	uint64_t seq;
 	char *path;
-	char *format_name;
+	char *format;
 	char *ffmpeg_options;
 	int buffering;
 	int speed;
+	bool is_local_file;
+	bool looping;
+	bool hw;
+	bool reconnecting;
+	enum video_range_type force_range;
+	bool is_linear_alpha;
+	int64_t in_ms;
+	int64_t out_ms;
+	int64_t tail_ms;
+	enum mp_start start;
+};
 
-	enum AVPixelFormat scale_format;
-	struct SwsContext *swscale;
-	int scale_linesizes[4];
-	uint8_t *scale_pic[4];
+struct mp_cmd {
+	enum mp_cmd_type type;
+	int64_t value;
+	struct mp_load *load;
+};
+
+struct media_playback {
+	/* --- set when the engine is made, read-only after --------------- */
+	void *opaque;
+	mp_video_cb v_cb;
+	mp_video_cb v_preload_cb;
+	mp_video_cb v_still_cb;
+	mp_audio_cb a_cb;
+	mp_event_cb event_cb;
+
+	pthread_t thread;
+	bool thread_valid;
+
+	/* --- shared with the callers, under 'mutex' ---------------------- */
+	pthread_mutex_t mutex;
+	/* signalled whenever a command is queued */
+	os_event_t *wake;
+	DARRAY(struct mp_cmd) cmds;
+	uint64_t next_seq;
+	struct mp_status status;
+	/* Asks a read or an open that is blocked on the network to give up,
+	 * because what it is for has been superseded. Set with a load or a
+	 * kill, cleared by the media thread. */
+	volatile bool interrupt;
+	volatile bool is_linear_alpha;
+
+	/* --- the media thread's alone ------------------------------------ */
+	struct mp_load *cur;
+	enum mp_state state;
+	AVFormatContext *fmt;
+	bool is_local_file;
+	bool looping;
+	int speed;
+	enum video_range_type force_range;
+
+	AVBufferRef *hw_device;
+	enum AVHWDeviceType hw_type;
 
 	DARRAY(AVPacket *) packet_pool;
 	struct mp_decode v;
 	struct mp_decode a;
-	bool request_preload;
-	bool is_local_file;
-	bool reconnecting;
 	bool has_video;
 	bool has_audio;
-	/* Warp addition: whether the file is open and its streams have been
-	 * worked out. Opening happens on the media thread, so anything read out
-	 * of the media before this is set may be describing nothing yet: not
-	 * has_video, and not the duration either, which a container reports as
-	 * soon as its header has been read and well before its streams have been
-	 * identified. Anything that has to tell "no video" from "not open yet"
-	 * has to consult this first. */
-	volatile bool opened;
-	bool is_file;
+	/* the demuxer has nothing more to give */
 	bool eof;
-	bool hw;
+
+	/* Where the clip sits in the file, in media time. out_ns of 0 is the
+	 * end of the file; file_end_ns is that, where the file says. */
+	int64_t start_ns;
+	int64_t in_ns;
+	int64_t out_ns;
+	int64_t file_end_ns;
+
+	/* The playback clock: the media time anchor_media falls due at the
+	 * system time anchor_wall, and from there media time runs at 'speed'
+	 * percent. need_anchor puts the anchor on whatever is handed out next,
+	 * as it is handed out. */
+	uint64_t anchor_wall;
+	int64_t anchor_media;
+	bool need_anchor;
+	/* just past the last thing handed out, in media time */
+	int64_t played_end;
+
+	/* The frame on screen, in media time, and whether it is the one that
+	 * is sitting in the video decoder too - a still the playback has not
+	 * moved on from - rather than one handed out and gone. */
+	int64_t cur_pts;
+	bool have_cur;
+	/* where the last seek was aimed, so a still taken from the history when
+	 * the file ran out first is the last frame before it */
+	int64_t still_target;
+	bool shown;
+
+	enum AVPixelFormat scale_format;
+	struct SwsContext *swscale;
+	int scale_w;
+	int scale_h;
+	enum AVPixelFormat scale_src;
+	int scale_linesizes[4];
+	uint8_t *scale_pic[4];
 
 	struct obs_source_frame obsframe;
 	enum video_colorspace cur_space;
 	enum video_range_type cur_range;
-	enum video_range_type force_range;
-	bool is_linear_alpha;
-
-	int64_t play_sys_ts;
-	int64_t next_pts_ns;
-	uint64_t next_ns;
-	int64_t start_ts;
-	int64_t base_ts;
-	bool full_decode;
 
 	uint64_t interrupt_poll_ts;
 
-	pthread_mutex_t mutex;
-	os_sem_t *sem;
-	bool preload_frame;
-	bool stopping;
-	bool looping;
-	bool active;
-	bool reset;
-	bool kill;
-
-	bool thread_valid;
-	pthread_t thread;
-
-	bool pause;
-	bool reset_ts;
-	bool seek;
-	bool seek_next_ts;
-	int64_t seek_pos;
-
-	/* Warp additions: pending on-the-fly speed change (percent, 0 = none)
-	 * and pending frame step request (signed frame count), both consumed
-	 * by the media thread. v_frame_displayed tracks whether the currently
-	 * decoded (frame_ready) video frame has already been shown, so frame
-	 * stepping can stay frame-accurate from either a paused or a
-	 * seek-preview state. */
-	int speed_request;
-	int step_frames;
-	bool v_frame_displayed;
-
-	/* Warp addition: ring buffer of references to recently decoded video
-	 * frames (oldest at hist_start, newest last), used to display
-	 * backward frame steps instantly instead of stalling on the keyframe
-	 * re-decode. Timestamps are stored unscaled (real media time) so
-	 * entries stay valid across speed changes. Only touched from the
-	 * media thread. */
+	/* Ring of references to recently decoded video frames, oldest at
+	 * hist_start, in media time, so a backward step that lands inside it
+	 * is put up without waiting for the keyframe to be decoded again. */
 	AVFrame *hist_frames[MP_FRAME_HIST_SIZE];
 	int64_t hist_pts[MP_FRAME_HIST_SIZE];
 	size_t hist_start;
@@ -144,28 +186,14 @@ struct mp_media {
 	size_t hist_bytes;
 };
 
-typedef struct mp_media mp_media_t;
+typedef struct media_playback mp_media_t;
 
-extern bool mp_media_init(mp_media_t *media, const struct mp_media_info *info);
-extern void mp_media_free(mp_media_t *media);
+/* media thread only: hands a packet back to the pool */
+extern void mp_media_free_packet(mp_media_t *m, AVPacket *pkt);
 
-extern void mp_media_play(mp_media_t *media, bool loop, bool reconnecting);
-extern void mp_media_stop(mp_media_t *media);
-extern void mp_media_play_pause(mp_media_t *media, bool pause);
-extern void mp_media_preload_frame(mp_media_t *media);
-extern int64_t mp_media_get_current_time(mp_media_t *m);
-extern int64_t mp_media_get_frames(mp_media_t *m);
-extern int64_t mp_media_get_duration(mp_media_t *m);
-extern void mp_media_seek(mp_media_t *m, int64_t pos);
-extern void mp_media_set_speed(mp_media_t *m, int speed);
-extern int mp_media_get_speed(mp_media_t *m);
-extern void mp_media_step_frames(mp_media_t *m, int frames);
-
-/* media-thread only: record the decoder's current video frame in the
- * frame history (called from mp_decode_next) */
+/* media thread only: records the decoder's current video frame in the frame
+ * history (called from mp_decode_next) */
 extern void mp_media_hist_push(mp_media_t *m, struct mp_decode *d);
-
-/* #define DETAILED_DEBUG_INFO */
 
 #ifdef __cplusplus
 }
