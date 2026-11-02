@@ -408,6 +408,14 @@ An instant replay flow takes clips the same way the list kinds do — from its o
 
 The Warp window shows an instant replay flow as *Loaded* or *Empty* rather than as a count, and what it does with a clip where a list shows its order.
 
+## Roadmap
+
+Ideas that are designed but not built yet live in [ROADMAP.md](ROADMAP.md), with notes to pick them up from:
+
+* **In-memory replay buffer** — keep the last few minutes of the stream's encoded packets in memory and play replays straight out of them, with no save to wait for.
+* **Zero-copy hardware decoding** — draw hardware-decoded frames from the GPU without copying them through system memory.
+* Background probing of playlist files, a playlist panel in the Warp window, deinterlacing, and the test harness in CI.
+
 ## Building
 
 This plugin is based on the [OBS plugin template](https://github.com/obsproject/obs-plugintemplate) and builds the same way. See the template's [wiki](https://github.com/obsproject/obs-plugintemplate/wiki) for build system requirements and options.
