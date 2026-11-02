@@ -208,7 +208,7 @@ Eight more apply to a Warp Playlist source, and answer with an error when they a
 | `RestartCurrent` | Restarts the video that is playing |
 | `ClearPlaylist` | Clears the playlist, exactly as the hotkey does — the file list is emptied for good, and written to the log first |
 | `PlayNext` | Plays a file next, named by `file` (its path) or `index` (its place in the file list, from 0), ahead of whatever the playlist would have gone on to. Files asked for this way play in the order they were asked for, then the playlist picks up where it would have been. The file has to be in the list |
-| `ClearQueue` | Forgets the files asked to play next |
+| `ClearQueue` | Forgets the files asked to play next. The playlist carries on from the file that is playing |
 | `SetClip` | Sets what a file in the list, named by `file`, is played as: from `inMs` to `outMs`, or as its last `tailMs`, in milliseconds, and at `speed` percent. Fields left out are 0, which is the start and end of the file and the playlist's own speed; all of them 0 plays the file whole again. It applies the next time the file is played, and is saved with the playlist |
 
 One applies to a Warp Media source only:

@@ -1382,7 +1382,28 @@ static bool next_command(mp_media_t *m, struct mp_cmd *out)
 
 		da_erase(m->cmds, 0);
 
-		if (cmd.type == MP_CMD_LOAD || cmd.type == MP_CMD_SEEK || cmd.type == MP_CMD_SPEED) {
+		/* Steps add up: the ones queued behind this one are carried
+		 * out with it, past anything in between that does not move
+		 * the clip or set it playing - a speed change, a pause - which
+		 * still happens, after. */
+		if (cmd.type == MP_CMD_STEP) {
+			for (size_t i = 0; i < m->cmds.num;) {
+				struct mp_cmd *later = &m->cmds.array[i];
+
+				if (later->type == MP_CMD_STEP) {
+					cmd.value += later->value;
+					da_erase(m->cmds, i);
+				} else if (later->type == MP_CMD_SPEED || later->type == MP_CMD_LOOPING ||
+					   later->type == MP_CMD_PITCH ||
+					   (later->type == MP_CMD_PAUSE && later->value)) {
+					i++;
+				} else {
+					break;
+				}
+			}
+		}
+
+		if (cmd.type == MP_CMD_LOAD || cmd.type == MP_CMD_SPEED) {
 			for (size_t i = 0; i < m->cmds.num; i++) {
 				if (m->cmds.array[i].type == cmd.type ||
 				    (cmd.type != MP_CMD_LOAD && m->cmds.array[i].type == MP_CMD_LOAD)) {
@@ -1390,10 +1411,29 @@ static bool next_command(mp_media_t *m, struct mp_cmd *out)
 					break;
 				}
 			}
-		} else if (cmd.type == MP_CMD_STEP) {
-			while (m->cmds.num && m->cmds.array[0].type == MP_CMD_STEP) {
-				cmd.value += m->cmds.array[0].value;
-				da_erase(m->cmds, 0);
+		} else if (cmd.type == MP_CMD_SEEK || cmd.type == MP_CMD_STEP) {
+			/* Where a seek or a step would leave the clip does not
+			 * matter if a later command moves it again. Seeks and
+			 * steps can be asked for far faster than a backward step
+			 * can be decoded, and carrying out every one of them in
+			 * turn leaves playback behind for as long as the backlog
+			 * takes. A step pauses a clip that is playing, which a
+			 * later seek would not, so one overtaken by a seek still
+			 * pauses. */
+			for (size_t i = 0; i < m->cmds.num; i++) {
+				enum mp_cmd_type later = m->cmds.array[i].type;
+
+				if (later == MP_CMD_SEEK && cmd.type == MP_CMD_STEP) {
+					cmd.type = MP_CMD_PAUSE;
+					cmd.value = 1;
+					break;
+				}
+
+				if (later == MP_CMD_SEEK || later == MP_CMD_RESTART || later == MP_CMD_STOP ||
+				    later == MP_CMD_LOAD) {
+					superseded = true;
+					break;
+				}
 			}
 		}
 
