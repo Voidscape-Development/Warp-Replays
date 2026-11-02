@@ -66,6 +66,10 @@ enum warp_ws_action {
 	WARP_WS_FIRST,
 	WARP_WS_RESTART_CURRENT,
 	WARP_WS_CLEAR_PLAYLIST,
+	WARP_WS_PLAY_NEXT,
+	WARP_WS_CLEAR_QUEUE,
+	WARP_WS_SET_CLIP,
+	WARP_WS_LOAD_CLIP,
 	WARP_WS_SET_ZOOM,
 	WARP_WS_ZOOM_IN,
 	WARP_WS_ZOOM_OUT,
@@ -116,6 +120,10 @@ static struct warp_ws_request warp_ws_requests[] = {
 	{"First", WARP_WS_FIRST, WARP_PLAYLIST_SOURCE_ID, false},
 	{"RestartCurrent", WARP_WS_RESTART_CURRENT, WARP_PLAYLIST_SOURCE_ID, false},
 	{"ClearPlaylist", WARP_WS_CLEAR_PLAYLIST, WARP_PLAYLIST_SOURCE_ID, false},
+	{"PlayNext", WARP_WS_PLAY_NEXT, WARP_PLAYLIST_SOURCE_ID, false},
+	{"ClearQueue", WARP_WS_CLEAR_QUEUE, WARP_PLAYLIST_SOURCE_ID, false},
+	{"SetClip", WARP_WS_SET_CLIP, WARP_PLAYLIST_SOURCE_ID, false},
+	{"LoadClip", WARP_WS_LOAD_CLIP, WARP_MEDIA_SOURCE_ID, false},
 	{"SetZoom", WARP_WS_SET_ZOOM, NULL, true},
 	{"ZoomIn", WARP_WS_ZOOM_IN, NULL, true},
 	{"ZoomOut", WARP_WS_ZOOM_OUT, NULL, true},
@@ -345,6 +353,7 @@ static void warp_ws_add_status(obs_source_t *source, obs_data_t *response)
 		obs_data_set_int(response, "playlistIndex", calldata_int(&cd, "index"));
 		obs_data_set_int(response, "playlistLength", calldata_int(&cd, "count"));
 		obs_data_set_string(response, "currentFile", calldata_string(&cd, "current_file"));
+		obs_data_set_int(response, "playlistQueued", calldata_int(&cd, "queued"));
 	}
 	calldata_free(&cd);
 }
@@ -606,6 +615,79 @@ static bool warp_ws_run(const struct warp_ws_request *req, obs_source_t *source,
 	case WARP_WS_CLEAR_PLAYLIST:
 		warp_ws_call(source, "warp_playlist_clear");
 		return true;
+	case WARP_WS_PLAY_NEXT: {
+		const char *file = obs_data_get_string(request, "file");
+		long long index = warp_ws_field(request, "index", -1);
+		calldata_t cd = {0};
+		bool queued = false;
+
+		if ((!file || !*file) && index < 0) {
+			warp_ws_fail(response, "file or index is required");
+			return false;
+		}
+
+		calldata_init(&cd);
+		calldata_set_string(&cd, "path", file ? file : "");
+		calldata_set_int(&cd, "index", index);
+		proc_handler_call(obs_source_get_proc_handler(source), "warp_playlist_queue", &cd);
+		calldata_get_bool(&cd, "queued", &queued);
+		calldata_free(&cd);
+
+		if (!queued) {
+			warp_ws_fail(response, "that file is not in the playlist");
+			return false;
+		}
+		return true;
+	}
+	case WARP_WS_CLEAR_QUEUE:
+		warp_ws_call(source, "warp_playlist_clear_queue");
+		return true;
+	case WARP_WS_SET_CLIP: {
+		const char *file = obs_data_get_string(request, "file");
+		calldata_t cd = {0};
+
+		if (!file || !*file) {
+			warp_ws_fail(response, "file is required");
+			return false;
+		}
+
+		calldata_init(&cd);
+		calldata_set_string(&cd, "path", file);
+		calldata_set_int(&cd, "in_ms", warp_ws_field(request, "inMs", 0));
+		calldata_set_int(&cd, "out_ms", warp_ws_field(request, "outMs", 0));
+		calldata_set_int(&cd, "tail_ms", warp_ws_field(request, "tailMs", 0));
+		calldata_set_int(&cd, "speed", warp_ws_field(request, "speed", 0));
+		proc_handler_call(obs_source_get_proc_handler(source), "warp_playlist_set_clip", &cd);
+		calldata_free(&cd);
+		return true;
+	}
+	case WARP_WS_LOAD_CLIP: {
+		const char *file = obs_data_get_string(request, "file");
+		const char *playback = obs_data_get_string(request, "playback");
+		calldata_t cd = {0};
+
+		if (!file || !*file) {
+			warp_ws_fail(response, "file is required");
+			return false;
+		}
+
+		if (playback && *playback && strcmp(playback, WARP_MEDIA_LOAD_KEEP) != 0 &&
+		    strcmp(playback, WARP_MEDIA_LOAD_PLAY) != 0 && strcmp(playback, WARP_MEDIA_LOAD_HOLD) != 0) {
+			warp_ws_fail(response, "playback must be keep, play or hold");
+			return false;
+		}
+
+		calldata_init(&cd);
+		calldata_set_string(&cd, "path", file);
+		calldata_set_string(&cd, "playback", playback && *playback ? playback : WARP_MEDIA_LOAD_KEEP);
+		calldata_set_int(&cd, "speed", warp_ws_field(request, "speed", 0));
+		calldata_set_int(&cd, "in_ms", warp_ws_field(request, "inMs", 0));
+		calldata_set_int(&cd, "out_ms", warp_ws_field(request, "outMs", 0));
+		calldata_set_int(&cd, "tail_ms", warp_ws_field(request, "tailMs", 0));
+		proc_handler_call(obs_source_get_proc_handler(source), WARP_MEDIA_LOAD_PROC, &cd);
+		calldata_free(&cd);
+		return true;
+	}
 	case WARP_WS_SET_ZOOM:
 	case WARP_WS_ZOOM_IN:
 	case WARP_WS_ZOOM_OUT:

@@ -681,7 +681,7 @@ static void seek_exact(mp_media_t *m, int64_t target)
 		return;
 
 	struct mp_decode *d = m->has_video ? &m->v : &m->a;
-	int64_t ts = av_rescale_q(target, (AVRational){1, NS_PER_SEC}, d->stream->time_base);
+	int64_t ts = av_rescale_q(target, (AVRational){1, 1000000000}, d->stream->time_base);
 
 	int ret = av_seek_frame(m->fmt, d->stream->index, ts, AVSEEK_FLAG_BACKWARD);
 	if (ret < 0)

@@ -1432,7 +1432,7 @@ void WarpWindow::refreshFooter()
 					  .arg(dim, warp_flow_text("Warp.Window.Footer.Nobody").toHtmlEscaped())
 				: reached.join(QStringLiteral(", "));
 	} else if (landed) {
-		/* saved, and still being cut for the flows it is going to */
+		/* saved, and still on its way to the flows it is going to */
 		text += QStringLiteral(" <span style=\"color: %1\">&middot; %2</span>")
 				.arg(dim, warp_flow_text("Warp.Window.Footer.OnItsWay").toHtmlEscaped());
 	}

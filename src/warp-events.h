@@ -18,6 +18,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #pragma once
 
+#include <string.h>
+
 #include <obs-module.h>
 
 /* ids of the sources that emit the events below */
@@ -207,4 +209,97 @@ static inline void warp_signal_media_action(obs_source_t *source, const char *ac
 	calldata_set_string(&cd, "action", action);
 
 	signal_handler_signal(obs_source_get_signal_handler(source), WARP_SIGNAL_MEDIA_ACTION, &cd);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Warp Playlist clips
+ *
+ * A file in a Warp Playlist can be played as a clip of itself: from an in point
+ * to an out point, or as its last few seconds, and at a speed of its own. The
+ * file list stays a list of paths, the way OBS's editable list keeps it; what
+ * each file is cut to is kept beside it in the playlist's settings, under
+ * WARP_PL_CLIPS_KEY, as an array of objects keyed by path:
+ *
+ *   {"path": "...", "in_ms": 0, "out_ms": 0, "tail_ms": 8000, "speed": 0}
+ *
+ * A file with no entry is played whole, at the playlist's speed, and an entry
+ * for a file that is no longer in the list is ignored. A Warp Playlist flow
+ * writes one for every clip it adds with a length, which is what makes the clip
+ * that length: the replay buffer's file is played from that far before its
+ * end, rather than being cut into a file of its own first. */
+#define WARP_PL_CLIPS_KEY "clips"
+#define WARP_PL_CLIP_PATH "path"
+#define WARP_PL_CLIP_IN_MS "in_ms"
+#define WARP_PL_CLIP_OUT_MS "out_ms"
+#define WARP_PL_CLIP_TAIL_MS "tail_ms"
+#define WARP_PL_CLIP_SPEED "speed"
+
+/* Sets what 'path' is played as in a playlist's 'settings'. All four values
+ * at zero takes the entry out, so the file is played whole. */
+static inline void warp_pl_clips_set(obs_data_t *settings, const char *path, long long in_ms, long long out_ms,
+				     long long tail_ms, long long speed)
+{
+	obs_data_array_t *clips = obs_data_get_array(settings, WARP_PL_CLIPS_KEY);
+	obs_data_array_t *next = obs_data_array_create();
+	size_t count = clips ? obs_data_array_count(clips) : 0;
+
+	for (size_t i = 0; i < count; i++) {
+		obs_data_t *clip = obs_data_array_item(clips, i);
+
+		if (strcmp(obs_data_get_string(clip, WARP_PL_CLIP_PATH), path) != 0)
+			obs_data_array_push_back(next, clip);
+
+		obs_data_release(clip);
+	}
+
+	if (in_ms || out_ms || tail_ms || speed) {
+		obs_data_t *clip = obs_data_create();
+
+		obs_data_set_string(clip, WARP_PL_CLIP_PATH, path);
+		obs_data_set_int(clip, WARP_PL_CLIP_IN_MS, in_ms);
+		obs_data_set_int(clip, WARP_PL_CLIP_OUT_MS, out_ms);
+		obs_data_set_int(clip, WARP_PL_CLIP_TAIL_MS, tail_ms);
+		obs_data_set_int(clip, WARP_PL_CLIP_SPEED, speed);
+		obs_data_array_push_back(next, clip);
+		obs_data_release(clip);
+	}
+
+	obs_data_set_array(settings, WARP_PL_CLIPS_KEY, next);
+	obs_data_array_release(next);
+	obs_data_array_release(clips);
+}
+
+/* Takes the entries for files that are no longer in the playlist out of its
+ * 'settings', so clips that have dropped off the end of a list do not pile
+ * up in the scene collection. */
+static inline void warp_pl_clips_prune(obs_data_t *settings)
+{
+	obs_data_array_t *clips = obs_data_get_array(settings, WARP_PL_CLIPS_KEY);
+	obs_data_array_t *files = obs_data_get_array(settings, "playlist");
+	obs_data_array_t *next = obs_data_array_create();
+	size_t count = clips ? obs_data_array_count(clips) : 0;
+	size_t file_count = files ? obs_data_array_count(files) : 0;
+
+	for (size_t i = 0; i < count; i++) {
+		obs_data_t *clip = obs_data_array_item(clips, i);
+		const char *path = obs_data_get_string(clip, WARP_PL_CLIP_PATH);
+		bool listed = false;
+
+		for (size_t j = 0; j < file_count && !listed; j++) {
+			obs_data_t *file = obs_data_array_item(files, j);
+
+			listed = strcmp(obs_data_get_string(file, "value"), path) == 0;
+			obs_data_release(file);
+		}
+
+		if (listed)
+			obs_data_array_push_back(next, clip);
+
+		obs_data_release(clip);
+	}
+
+	obs_data_set_array(settings, WARP_PL_CLIPS_KEY, next);
+	obs_data_array_release(next);
+	obs_data_array_release(files);
+	obs_data_array_release(clips);
 }
