@@ -22,6 +22,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <util/darray.h>
 #include <util/threading.h>
 
+#include "warp-video-gpu.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -48,6 +50,18 @@ extern "C" {
  * thread. */
 
 #define WARP_VIDEO_QUEUE 8
+
+struct AVFrame;
+
+/* what a frame handed over is for */
+enum warp_video_use {
+	/* to go up when it falls due */
+	WARP_VIDEO_TIMED,
+	/* to go up now, in place of anything waiting */
+	WARP_VIDEO_STILL,
+	/* to be put aside for warp_video_show_preload() */
+	WARP_VIDEO_PRELOAD,
+};
 
 struct warp_video {
 	/* --- shared, under 'mutex' -------------------------------------- */
@@ -83,6 +97,12 @@ struct warp_video {
 	bool tex_full_range;
 	enum video_trc tex_trc;
 
+	/* frames on the GPU: where they are imported from, whether that has
+	 * stopped working, and whether the owner has been told so yet */
+	struct warp_gpu gpu;
+	bool gpu_failed;
+	volatile bool gpu_fell_back;
+
 	/* about the frame in the textures */
 	bool flip;
 	bool linear_alpha;
@@ -106,6 +126,17 @@ void warp_video_preload(struct warp_video *v, const struct obs_source_frame *fra
 bool warp_video_show_preload(struct warp_video *v);
 /* draws nothing until the next frame */
 void warp_video_clear(struct warp_video *v);
+
+/* A frame on the GPU, described by 'info', for 'use'. 'frame' is a reference to
+ * the decoder's surface, which the picture takes over. It is drawn straight off
+ * the GPU where the platform allows (see warp-video-gpu.h), and from a copy
+ * otherwise. Any thread. */
+void warp_video_gpu_frame(struct warp_video *v, struct AVFrame *frame, const struct obs_source_frame *info,
+			  enum warp_video_use use);
+
+/* True once, when frames on the GPU could not be drawn from there and are
+ * being copied instead: the owner stops asking for them. Any thread. */
+bool warp_video_gpu_fell_back(struct warp_video *v);
 
 /* graphics thread: picks out the frame due by 'time', the time of the video
  * frame being made */

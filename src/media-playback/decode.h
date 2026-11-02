@@ -63,6 +63,7 @@ struct mp_decode {
 	 * stream can be handed to it as it is */
 	AVCodecParameters *params;
 	bool params_hw;
+	bool params_gpu_direct;
 	const AVCodec *codec;
 
 	int64_t last_duration;
@@ -86,6 +87,14 @@ struct mp_decode {
 	bool packet_pending;
 	struct deque packets;
 };
+
+/* how many surfaces the decoder's pool is given on top of what it needs, for the
+ * frames held while they wait to be drawn off the GPU */
+#define MP_GPU_EXTRA_SURFACES 12
+
+/* the decoder whose frames can be drawn off the GPU on this platform, or
+ * AV_HWDEVICE_TYPE_NONE */
+extern enum AVHWDeviceType mp_decode_gpu_direct_type(void);
 
 /* Gets 'd' ready to decode 'stream' of the file that has just been opened,
  * reusing the decoder it already has when the stream's parameters match. */

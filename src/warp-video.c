@@ -25,11 +25,70 @@ Lain Bailey and the OBS Studio contributors, under the GNU GPL v2 or later.
 
 #include <math.h>
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4244)
+#endif
+
+#include <libavutil/frame.h>
+#include <libavutil/hwcontext.h>
+
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+
 #include <obs-module.h>
 #include <util/bmem.h>
 
 /* frames kept to copy the next ones into, at most */
 #define WARP_VIDEO_POOL 12
+
+/* A frame that is on the GPU travels through the queue like any other, as the
+ * description of its picture at the head of a warp_gpu_frame, with the
+ * decoder's surface beside it in place of data. It is told apart by its last
+ * plane pointing at this marker: no frame in memory has that many planes, and
+ * libobs' own frame flags are too narrow to borrow a bit of. */
+static uint8_t warp_gpu_marker;
+#define WARP_GPU_MARK_PLANE (MAX_AV_PLANES - 1)
+
+struct warp_gpu_frame {
+	struct obs_source_frame info;
+	struct AVFrame *frame;
+};
+
+static inline bool is_gpu_frame(const struct obs_source_frame *f)
+{
+	return f->data[WARP_GPU_MARK_PLANE] == &warp_gpu_marker;
+}
+
+/* a new shell for 'frame', which it takes over */
+static struct obs_source_frame *gpu_shell(struct AVFrame *frame, const struct obs_source_frame *info)
+{
+	struct warp_gpu_frame *g = bzalloc(sizeof(*g));
+
+	g->info = *info;
+	for (size_t i = 0; i < MAX_AV_PLANES; i++) {
+		g->info.data[i] = NULL;
+		g->info.linesize[i] = 0;
+	}
+	g->info.data[WARP_GPU_MARK_PLANE] = &warp_gpu_marker;
+	g->frame = frame;
+	return &g->info;
+}
+
+static void destroy_frame(struct obs_source_frame *f)
+{
+	if (!f)
+		return;
+
+	if (is_gpu_frame(f)) {
+		struct warp_gpu_frame *g = (struct warp_gpu_frame *)f;
+		av_frame_free(&g->frame);
+		bfree(g);
+	} else {
+		obs_source_frame_destroy(f);
+	}
+}
 
 /* ------------------------------------------------------------------------- */
 /* what a frame is drawn as */
@@ -302,11 +361,11 @@ void warp_video_init(struct warp_video *v)
 static void destroy_frames(struct warp_video *v)
 {
 	for (size_t i = 0; i < v->queue_num; i++)
-		obs_source_frame_destroy(v->queue[i]);
+		destroy_frame(v->queue[i]);
 	v->queue_num = 0;
 
-	obs_source_frame_destroy(v->pending);
-	obs_source_frame_destroy(v->preload);
+	destroy_frame(v->pending);
+	destroy_frame(v->preload);
 	v->pending = NULL;
 	v->preload = NULL;
 
@@ -326,6 +385,7 @@ void warp_video_free(struct warp_video *v)
 		gs_texture_destroy(v->textures[c]);
 	gs_texrender_destroy(v->texrender);
 	gs_effect_destroy(v->conversion);
+	warp_gpu_free(&v->gpu);
 	obs_leave_graphics();
 
 	pthread_mutex_destroy(&v->mutex);
@@ -336,6 +396,12 @@ static void give_back(struct warp_video *v, struct obs_source_frame *frame)
 {
 	if (!frame)
 		return;
+
+	/* a surface goes back to the decoder's pool, not this one */
+	if (is_gpu_frame(frame)) {
+		destroy_frame(frame);
+		return;
+	}
 
 	if (v->pool.num < WARP_VIDEO_POOL)
 		da_push_back(v->pool, &frame);
@@ -348,6 +414,12 @@ static void give_back(struct warp_video *v, struct obs_source_frame *frame)
 static struct obs_source_frame *copy_in(struct warp_video *v, const struct obs_source_frame *src)
 {
 	struct obs_source_frame *dst = NULL;
+
+	/* a frame on the GPU is another reference to the same surface */
+	if (is_gpu_frame(src)) {
+		struct AVFrame *ref = av_frame_clone(((const struct warp_gpu_frame *)src)->frame);
+		return ref ? gpu_shell(ref, src) : NULL;
+	}
 
 	for (size_t i = v->pool.num; i > 0; i--) {
 		struct obs_source_frame *f = v->pool.array[i - 1];
@@ -392,11 +464,10 @@ static void set_pending(struct warp_video *v, struct obs_source_frame *frame)
 	os_atomic_set_long(&v->height, (long)frame->height);
 }
 
-void warp_video_push(struct warp_video *v, const struct obs_source_frame *frame)
+/* queues 'copy', which the picture takes over; expects v->mutex to be held */
+static void queue_owned(struct warp_video *v, struct obs_source_frame *copy)
 {
-	pthread_mutex_lock(&v->mutex);
-
-	struct obs_source_frame *copy = copy_in(v, frame);
+	const struct obs_source_frame *frame = copy;
 
 	if (copy) {
 		/* a source that is not being ticked is not taking its frames
@@ -415,7 +486,12 @@ void warp_video_push(struct warp_video *v, const struct obs_source_frame *frame)
 			os_atomic_set_long(&v->height, (long)frame->height);
 		}
 	}
+}
 
+void warp_video_push(struct warp_video *v, const struct obs_source_frame *frame)
+{
+	pthread_mutex_lock(&v->mutex);
+	queue_owned(v, copy_in(v, frame));
 	pthread_mutex_unlock(&v->mutex);
 }
 
@@ -427,18 +503,27 @@ static void drop_queue(struct warp_video *v)
 	v->queue_num = 0;
 }
 
-void warp_video_set(struct warp_video *v, const struct obs_source_frame *frame)
+/* expects v->mutex to be held */
+static void set_owned(struct warp_video *v, struct obs_source_frame *copy)
 {
-	pthread_mutex_lock(&v->mutex);
-
-	struct obs_source_frame *copy = copy_in(v, frame);
-
 	if (copy) {
 		drop_queue(v);
 		set_pending(v, copy);
 	}
+}
 
+void warp_video_set(struct warp_video *v, const struct obs_source_frame *frame)
+{
+	pthread_mutex_lock(&v->mutex);
+	set_owned(v, copy_in(v, frame));
 	pthread_mutex_unlock(&v->mutex);
+}
+
+/* expects v->mutex to be held */
+static void preload_owned(struct warp_video *v, struct obs_source_frame *copy)
+{
+	give_back(v, v->preload);
+	v->preload = copy;
 }
 
 void warp_video_preload(struct warp_video *v, const struct obs_source_frame *frame)
@@ -447,12 +532,37 @@ void warp_video_preload(struct warp_video *v, const struct obs_source_frame *fra
 
 	struct obs_source_frame *copy = frame ? copy_in(v, frame) : NULL;
 
-	if (copy || !frame) {
-		give_back(v, v->preload);
-		v->preload = copy;
+	if (copy || !frame)
+		preload_owned(v, copy);
+
+	pthread_mutex_unlock(&v->mutex);
+}
+
+void warp_video_gpu_frame(struct warp_video *v, struct AVFrame *frame, const struct obs_source_frame *info,
+			  enum warp_video_use use)
+{
+	struct obs_source_frame *shell = gpu_shell(frame, info);
+
+	pthread_mutex_lock(&v->mutex);
+
+	switch (use) {
+	case WARP_VIDEO_TIMED:
+		queue_owned(v, shell);
+		break;
+	case WARP_VIDEO_STILL:
+		set_owned(v, shell);
+		break;
+	case WARP_VIDEO_PRELOAD:
+		preload_owned(v, shell);
+		break;
 	}
 
 	pthread_mutex_unlock(&v->mutex);
+}
+
+bool warp_video_gpu_fell_back(struct warp_video *v)
+{
+	return os_atomic_set_bool(&v->gpu_fell_back, false);
 }
 
 bool warp_video_show_preload(struct warp_video *v)
@@ -525,11 +635,14 @@ uint32_t warp_video_height(struct warp_video *v)
 /* ------------------------------------------------------------------------- */
 /* uploading */
 
-/* (re)makes the textures for frames shaped like 'frame'; graphics thread */
-static bool prepare_textures(struct warp_video *v, const struct obs_source_frame *frame)
+/* (Re)makes the textures for frames shaped like 'frame'; graphics thread. A
+ * frame drawn off the GPU brings its planes with it, so with 'planes' unset only
+ * what they are converted into is made. */
+static bool prepare_textures(struct warp_video *v, const struct obs_source_frame *frame, bool planes_needed)
 {
-	if (v->textures[0] && v->tex_width == frame->width && v->tex_height == frame->height &&
-	    v->tex_format == frame->format && v->tex_full_range == frame->full_range && v->tex_trc == frame->trc)
+	if (v->tex_width == frame->width && v->tex_height == frame->height && v->tex_format == frame->format &&
+	    v->tex_full_range == frame->full_range && v->tex_trc == frame->trc &&
+	    (planes_needed ? v->textures[0] != NULL : v->texrender != NULL))
 		return true;
 
 	for (size_t c = 0; c < MAX_AV_PLANES; c++) {
@@ -554,14 +667,14 @@ static bool prepare_textures(struct warp_video *v, const struct obs_source_frame
 	if (v->gpu_conversion) {
 		v->texrender = gs_texrender_create(format, GS_ZS_NONE);
 
-		for (int c = 0; c < planes.count; c++)
+		for (int c = 0; planes_needed && c < planes.count; c++)
 			v->textures[c] = gs_texture_create(planes.width[c], planes.height[c], planes.format[c], 1, NULL,
 							   GS_DYNAMIC);
-	} else {
+	} else if (planes_needed) {
 		v->textures[0] = gs_texture_create(frame->width, frame->height, format, 1, NULL, GS_DYNAMIC);
 	}
 
-	return v->textures[0] != NULL;
+	return planes_needed ? v->textures[0] != NULL : v->texrender != NULL;
 }
 
 static bool load_conversion(struct warp_video *v)
@@ -592,9 +705,9 @@ static inline void set_float(gs_effect_t *effect, const char *name, float val)
 	gs_effect_set_float(gs_effect_get_param_by_name(effect, name), val);
 }
 
-/* converts the planes just uploaded into RGB in the texrender, the way libobs
- * does an async source's; graphics thread */
-static bool convert(struct warp_video *v, const struct obs_source_frame *frame)
+/* converts 'planes' into RGB in the texrender, the way libobs does an async
+ * source's; graphics thread */
+static bool convert(struct warp_video *v, const struct obs_source_frame *frame, gs_texture_t *const planes[4])
 {
 	const char *tech_name = conversion_technique(frame->format, frame->full_range, frame->trc);
 
@@ -623,8 +736,8 @@ static bool convert(struct warp_video *v, const struct obs_source_frame *frame)
 
 	static const char *images[4] = {"image", "image1", "image2", "image3"};
 	for (size_t c = 0; c < 4; c++) {
-		if (v->textures[c])
-			gs_effect_set_texture(gs_effect_get_param_by_name(conv, images[c]), v->textures[c]);
+		if (planes[c])
+			gs_effect_set_texture(gs_effect_get_param_by_name(conv, images[c]), planes[c]);
 	}
 
 	set_float(conv, "width", (float)cx);
@@ -673,10 +786,15 @@ static bool convert(struct warp_video *v, const struct obs_source_frame *frame)
 	return true;
 }
 
+static bool upload_gpu(struct warp_video *v, struct warp_gpu_frame *g);
+
 /* puts 'frame' in the textures; graphics thread */
 static bool upload(struct warp_video *v, const struct obs_source_frame *frame)
 {
-	if (!prepare_textures(v, frame))
+	if (is_gpu_frame(frame))
+		return upload_gpu(v, (struct warp_gpu_frame *)frame);
+
+	if (!prepare_textures(v, frame, true))
 		return false;
 
 	v->flip = frame->flip;
@@ -694,7 +812,67 @@ static bool upload(struct warp_video *v, const struct obs_source_frame *frame)
 			gs_texture_set_image(v->textures[c], frame->data[c], frame->linesize[c], false);
 	}
 
-	return convert(v, frame);
+	return convert(v, frame, v->textures);
+}
+
+/* Draws a frame that is on the GPU from there: its planes are made into
+ * textures where they are and converted like any others. Should that not work,
+ * the frame is copied back and drawn from the copy, this time and every time
+ * after it, and the owner is told so it can stop sending frames this way.
+ * Graphics thread. */
+static bool upload_gpu(struct warp_video *v, struct warp_gpu_frame *g)
+{
+	const struct obs_source_frame *info = &g->info;
+
+	if (!v->gpu_failed) {
+		gs_texture_t *planes[4] = {NULL, NULL, NULL, NULL};
+		bool drawn = false;
+
+		if (prepare_textures(v, info, false) && warp_gpu_import(&v->gpu, g->frame, info, planes)) {
+			v->flip = false;
+			v->linear_alpha = (info->flags & OBS_SOURCE_FRAME_LINEAR_ALPHA) != 0;
+			v->format = info->format;
+			v->trc = info->trc;
+
+			drawn = convert(v, info, planes);
+			warp_gpu_release(&v->gpu);
+		}
+
+		if (drawn) {
+			if (!v->gpu.announced) {
+				blog(LOG_INFO, "[Warp]: drawing hardware-decoded video straight off the GPU (%s)",
+				     warp_gpu_path_name());
+				v->gpu.announced = true;
+			}
+			return true;
+		}
+
+		blog(LOG_WARNING,
+		     "[Warp]: hardware-decoded video could not be drawn straight off the GPU (%s); "
+		     "copying it instead",
+		     warp_gpu_path_name());
+		v->gpu_failed = true;
+		os_atomic_set_bool(&v->gpu_fell_back, true);
+	}
+
+	/* the copy, made here for this frame; the ones after it come copied */
+	struct AVFrame *sw = av_frame_alloc();
+	bool drawn = false;
+
+	if (sw && av_hwframe_transfer_data(sw, g->frame, 0) == 0) {
+		struct obs_source_frame copy = *info;
+
+		for (size_t c = 0; c < MAX_AV_PLANES; c++) {
+			copy.data[c] = c < AV_NUM_DATA_POINTERS ? sw->data[c] : NULL;
+			copy.linesize[c] = c < AV_NUM_DATA_POINTERS && sw->linesize[c] > 0 ? (uint32_t)sw->linesize[c]
+											   : 0;
+		}
+
+		drawn = upload(v, &copy);
+	}
+
+	av_frame_free(&sw);
+	return drawn;
 }
 
 /* ------------------------------------------------------------------------- */

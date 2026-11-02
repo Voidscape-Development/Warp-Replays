@@ -487,6 +487,7 @@ struct warp_playlist_source {
 	bool loop_playlist;
 	bool shuffle;
 	bool hw_decode;
+	bool gpu_direct;
 	/* sound played at another speed keeps its pitch */
 	bool preserve_pitch;
 	bool restart_on_activate;
@@ -1439,6 +1440,7 @@ static bool warp_pl_step_pos(struct warp_playlist_source *s, int dir, size_t *ou
 struct warp_pl_item_config {
 	int speed;
 	bool hw_decode;
+	bool gpu_direct;
 	bool preserve_pitch;
 	int64_t in_ms;
 	int64_t out_ms;
@@ -1472,6 +1474,7 @@ static void warp_pl_read_item_config(struct warp_playlist_source *s, const char 
 
 	cfg->speed = warp_pl_start_speed(s, path);
 	cfg->hw_decode = s->hw_decode;
+	cfg->gpu_direct = s->gpu_direct;
 	cfg->preserve_pitch = s->preserve_pitch;
 	cfg->in_ms = clip ? clip->in_ms : 0;
 	cfg->out_ms = clip ? clip->out_ms : 0;
@@ -1493,6 +1496,7 @@ static obs_source_t *warp_pl_create_item(struct warp_playlist_source *s, const s
 	obs_data_set_bool(settings, "restart_on_activate", false);
 	obs_data_set_bool(settings, "close_when_inactive", false);
 	obs_data_set_bool(settings, "hw_decode", cfg->hw_decode);
+	obs_data_set_bool(settings, "gpu_direct", cfg->gpu_direct);
 	obs_data_set_bool(settings, "preserve_pitch", cfg->preserve_pitch);
 	obs_data_set_int(settings, "speed_percent", cfg->speed);
 	/* one settings dump per playlist item would drown the log */
@@ -2803,6 +2807,14 @@ static obs_properties_t *warp_pl_transition_properties(struct warp_playlist_sour
 	return props;
 }
 
+/* drawing off the GPU is something hardware decoding does */
+static bool warp_pl_hw_decode_modified(obs_properties_t *props, obs_property_t *prop, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(prop);
+	obs_property_set_visible(obs_properties_get(props, "gpu_direct"), obs_data_get_bool(settings, "hw_decode"));
+	return true;
+}
+
 static obs_properties_t *warp_playlist_getproperties(void *data)
 {
 	struct warp_playlist_source *s = data;
@@ -2870,7 +2882,11 @@ static obs_properties_t *warp_playlist_getproperties(void *data)
 
 	obs_properties_add_bool(props, "clear_on_media_end", obs_module_text("Warp.Playlist.ClearOnEnd"));
 
-	obs_properties_add_bool(props, "hw_decode", obs_module_text("Warp.Video.HardwareDecode"));
+	obs_property_t *hw = obs_properties_add_bool(props, "hw_decode", obs_module_text("Warp.Video.HardwareDecode"));
+	obs_property_set_modified_callback(hw, warp_pl_hw_decode_modified);
+
+	obs_property_t *direct = obs_properties_add_bool(props, "gpu_direct", obs_module_text("Warp.Video.GpuDirect"));
+	obs_property_set_long_description(direct, obs_module_text("Warp.Video.GpuDirect.Desc"));
 
 	obs_property_t *pitch =
 		obs_properties_add_bool(props, "preserve_pitch", obs_module_text("Warp.Media.PreservePitch"));
@@ -3176,12 +3192,14 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 	s->restart_on_activate = obs_data_get_bool(settings, "restart_on_activate");
 	s->clear_on_media_end = obs_data_get_bool(settings, "clear_on_media_end");
 	bool hw_decode = obs_data_get_bool(settings, "hw_decode");
+	bool gpu_direct = hw_decode && obs_data_get_bool(settings, "gpu_direct");
 
 	/* kept items were made to decode the other way */
-	if (hw_decode != s->hw_decode)
+	if (hw_decode != s->hw_decode || gpu_direct != s->gpu_direct)
 		warp_pl_flush_idle(s);
 
 	s->hw_decode = hw_decode;
+	s->gpu_direct = gpu_direct;
 	s->base_speed = speed;
 
 	/* every item the playlist is holding plays at the new setting, the

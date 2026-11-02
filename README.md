@@ -15,6 +15,7 @@ A media source based on OBS Studio's built-in Media Source, with the same proper
 * **Frame stepping** hotkeys: step 1, 5, 10, or 20 frames forward or backward. Stepping while the video is playing pauses it first; stepping is frame-accurate, including backward steps.
 * **Clips of a file**: a clip loaded into the source can be played from an in point to an out point, or as the last so many seconds of its file. The cut is frame-accurate and nothing is written to disk — the source plays that stretch of the file as if it were the whole of it, and the media controls show the clip's own position and length. This is how an [instant replay flow](#instant-replays) keeps the last few seconds of a save, and it is open to scripts and obs-websocket through `LoadClip`.
 * **Draws its own picture**: the source picks the frame due for each video frame by its own playback clock, and uploads and converts only that one — with the same shaders, and the same handling of colour range, colour space and HDR, that OBS uses for a media source. A source that is off screen keeps its latest frame and puts it up the moment it is shown, so a clip loaded or held off air has picture from its first frame on air. OBS's right-click *Deinterlacing* option is for sources OBS draws itself, so it does not apply to a Warp Media source; replay buffer recordings are progressive and do not need it.
+* **GPU direct decoding** (experimental, off by default): with hardware decoding on, *Draw decoded video straight from the GPU* draws each frame where the GPU decoded it, instead of copying it back to memory and uploading it again — which is most of the cost of playing 1080p60 and 4K clips. Windows (D3D11) and Linux (VAAPI). If it does not work on a machine, the source says so in the OBS log and goes back to copying, so the picture is never lost. macOS keeps copying for now; see [ROADMAP.md](ROADMAP.md).
 * **Seamless reloads**: loading a new clip keeps the picture that is up on screen until the new clip has a frame to replace it with, so a clip landing in a source that is on air cuts from one picture to the next rather than flashing black. The source keeps its decoder from one clip to the next, so a clip loads in a few milliseconds.
 * **Zoom and framing** of the clip that is loaded — see [zoom](#zoom). The framing goes back to the whole picture as each clip lands, so an [instant replay](#instant-replays) arrives ready to go on screen rather than still zoomed into the last one.
 
@@ -413,7 +414,7 @@ The Warp window shows an instant replay flow as *Loaded* or *Empty* rather than 
 Ideas that are designed but not built yet live in [ROADMAP.md](ROADMAP.md), with notes to pick them up from:
 
 * **In-memory replay buffer** — keep the last few minutes of the stream's encoded packets in memory and play replays straight out of them, with no save to wait for.
-* **Zero-copy hardware decoding** — draw hardware-decoded frames from the GPU without copying them through system memory.
+* **GPU direct decoding on macOS**, and verifying the Windows and Linux paths on more hardware.
 * Background probing of playlist files, a playlist panel in the Warp window, deinterlacing, and the test harness in CI.
 
 ## Building

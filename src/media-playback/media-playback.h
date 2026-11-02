@@ -47,6 +47,33 @@ extern "C" {
 typedef struct media_playback media_playback_t;
 
 typedef void (*mp_video_cb)(void *opaque, struct obs_source_frame *frame);
+
+struct AVFrame;
+
+/* What a frame handed out is for. */
+enum mp_frame_use {
+	/* to be shown at its timestamp, during playback */
+	MP_FRAME_TIMED,
+	/* to be put on screen now: a seek, a frame step, a held clip */
+	MP_FRAME_STILL,
+	/* the first frame of a cued clip, to be shown when it is started */
+	MP_FRAME_PRELOAD,
+};
+
+/* A decoded frame that is still on the GPU, handed out instead of a copy in
+ * memory when a load asks for GPU direct decoding (mp_load_info). 'frame' is a
+ * new reference to the decoder's surface, which the receiver owns and frees
+ * with av_frame_free(); 'info' describes the picture in it - its size, its
+ * colour, its timestamp, and its format, which is the layout of the surface's
+ * planes (VIDEO_FORMAT_NV12 or VIDEO_FORMAT_P010) - and has no data. Surfaces
+ * come from a fixed pool the decoder draws on, so they are held only as long as
+ * needed. */
+struct mp_gpu_frame {
+	struct AVFrame *frame;
+	struct obs_source_frame info;
+};
+
+typedef void (*mp_gpu_video_cb)(void *opaque, struct mp_gpu_frame *frame, enum mp_frame_use use);
 typedef void (*mp_audio_cb)(void *opaque, struct obs_source_audio *audio);
 
 #define MP_SPEED_MIN 10
@@ -108,6 +135,8 @@ struct mp_media_info {
 	/* a frame to be put on screen now: a seek, a frame step, a held clip */
 	mp_video_cb v_still_cb;
 	mp_audio_cb a_cb;
+	/* frames on the GPU, for any of the three uses above; see mp_gpu_frame */
+	mp_gpu_video_cb v_gpu_cb;
 	/* called on the media thread, with nothing locked */
 	mp_event_cb event_cb;
 };
@@ -125,6 +154,12 @@ struct mp_load_info {
 	bool is_local_file;
 	bool looping;
 	bool hardware_decoding;
+	/* Hardware-decoded frames are handed to v_gpu_cb on the GPU rather than
+	 * copied into memory, where the platform's decoder can do that - D3D11
+	 * on Windows, VAAPI on Linux. Only means anything with
+	 * hardware_decoding, and falls back to copies wherever it cannot be
+	 * done. */
+	bool gpu_direct;
 	/* the load is a reconnect attempt: a failure to open is not worth a
 	 * warning every few seconds */
 	bool reconnecting;
@@ -199,6 +234,9 @@ extern void media_playback_set_speed(media_playback_t *mp, int speed);
 extern void media_playback_set_looping(media_playback_t *mp, bool looping);
 extern void media_playback_set_is_linear_alpha(media_playback_t *mp, bool is_linear_alpha);
 extern void media_playback_set_preserve_pitch(media_playback_t *mp, bool preserve_pitch);
+/* stops handing frames out on the GPU, for whoever is drawing them to fall back
+ * on when it cannot import them */
+extern void media_playback_disable_gpu_direct(media_playback_t *mp);
 
 extern void media_playback_get_status(media_playback_t *mp, struct mp_status *status);
 
