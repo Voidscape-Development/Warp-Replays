@@ -24,6 +24,7 @@
 #include <media-playback/media-playback.h>
 
 #include "warp-events.h"
+#include "warp-video.h"
 #include "warp-zoom.h"
 
 #define FF_LOG_S(source, level, format, ...)      \
@@ -110,16 +111,15 @@ struct warp_source {
 	volatile bool reconnect_pending;
 	int reconnect_delay_sec;
 
-	/* Whether the source holds a picture written into its texture, rather
-	 * than a frame merely handed over. libobs uploads a decoded frame only
-	 * while the source is being rendered, so a source that is not on
-	 * screen holds an allocated texture that has never been written to -
-	 * and that renders as nothing at all. Written from the media thread
-	 * and the graphics thread. */
+	/* The picture, which the source draws itself; see warp-video.h. */
+	struct warp_video video;
+
+	/* Whether the source has a picture to draw: a frame has been handed to
+	 * the picture since it was last cleared. The picture keeps the latest
+	 * frame whether or not the source is being drawn, and uploads it the
+	 * moment it is, so this is true of a source that is off screen too.
+	 * Written from the media thread and the graphics thread. */
 	volatile bool has_picture;
-	/* whether a cued first frame has been handed over for
-	 * obs_source_show_preloaded_video() to put up */
-	volatile bool preloaded_frame;
 
 	/* The OBS media state. Set as commands are given, so the frontend sees
 	 * what it asked for straight away, and by the engine's events as
@@ -372,12 +372,12 @@ static void dump_source_info(struct warp_source *s, const struct warp_source_con
 }
 
 /* Drops the picture the source is holding. Every place that clears the source
- * goes through here, so that s->has_picture cannot drift from what is actually
- * in the source's texture. */
+ * goes through here, so that s->has_picture cannot drift from what the source
+ * is drawing. */
 static void clear_video(struct warp_source *s)
 {
 	os_atomic_set_bool(&s->has_picture, false);
-	obs_source_output_video(s->source, NULL);
+	warp_video_clear(&s->video);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -393,24 +393,10 @@ static void get_frame(void *opaque, struct obs_source_frame *f)
 {
 	struct warp_source *s = opaque;
 
-	/* The first frame of a load is written into the source's texture here
-	 * rather than left to the render path. libobs uploads an async frame
-	 * only while the source is being rendered, so a source that has decoded
-	 * picture but has not been rendered yet still has an empty texture - or
-	 * the last clip's picture in it - and libobs draws that texture all the
-	 * same. The Warp Playlist opens the file it is switching to off screen
-	 * and hands it straight to its transition, so an item has to have its
-	 * own picture in it before it is composited. Only the first frame of a
-	 * load pays for this; every one after it is uploaded by the render path
-	 * as usual. */
-	if (!os_atomic_load_bool(&s->has_picture) ||
-	    os_atomic_load_long(&s->picture_seq) != os_atomic_load_long(&s->media_seq)) {
-		obs_source_set_video_frame(s->source, f);
-		os_atomic_set_bool(&s->preloaded_frame, true);
-		note_picture(s);
-	}
-
-	obs_source_output_video(s->source, f);
+	/* the picture puts the frame up when it falls due, on screen or not,
+	 * so the first frame of a load is picture for that load straight away */
+	warp_video_push(&s->video, f);
+	note_picture(s);
 }
 
 static void preload_frame(void *opaque, struct obs_source_frame *f)
@@ -420,24 +406,17 @@ static void preload_frame(void *opaque, struct obs_source_frame *f)
 	if (s->close_when_inactive)
 		return;
 
-	if (s->is_clear_on_media_end || s->is_looping) {
-		obs_source_preload_video(s->source, f);
-		os_atomic_set_bool(&s->preloaded_frame, true);
-	}
+	if (s->is_clear_on_media_end || s->is_looping)
+		warp_video_preload(&s->video, f);
 }
 
 static void still_frame(void *opaque, struct obs_source_frame *f)
 {
 	struct warp_source *s = opaque;
 
-	/* A seek, a step or a held clip puts its frame straight into the
-	 * texture, so it is there whether or not the source is being rendered.
-	 * It is handed over as an ordinary frame as well: libobs only draws an
-	 * async source's texture once a frame has come in that way, and a clip
-	 * that is held from the moment it is loaded has had no other. */
-	obs_source_set_video_frame(s->source, f);
-	obs_source_output_video(s->source, f);
-	os_atomic_set_bool(&s->preloaded_frame, true);
+	/* a seek, a step or a held clip goes up now, in place of anything that
+	 * was waiting to */
+	warp_video_set(&s->video, f);
 	note_picture(s);
 }
 
@@ -539,8 +518,8 @@ static uint64_t warp_source_load(struct warp_source *s, enum mp_start start)
 			.start = start,
 		};
 
-		/* the picture that is up is not this load's */
-		os_atomic_set_bool(&s->preloaded_frame, false);
+		/* a frame put aside for the last clip is not this one's */
+		warp_video_preload(&s->video, NULL);
 
 		seq = media_playback_load(s->media, &info);
 		s->load_seq = seq;
@@ -588,10 +567,8 @@ static void warp_source_start(struct warp_source *s)
 			/* the first frame was cued as the clip was opened or
 			 * last stopped, so there is picture from the moment
 			 * playback starts */
-			if (os_atomic_load_bool(&s->preloaded_frame)) {
-				obs_source_show_preloaded_video(s->source);
+			if (warp_video_show_preload(&s->video))
 				os_atomic_set_bool(&s->has_picture, true);
-			}
 		} else if (!is_local || !os_atomic_load_bool(&s->has_picture)) {
 			/* Nothing to put up yet, and nothing worth keeping. A
 			 * local file that is holding picture keeps it instead:
@@ -738,6 +715,9 @@ static void warp_source_zoom_tick(struct warp_source *s, float seconds)
 static void warp_source_tick(void *data, float seconds)
 {
 	struct warp_source *s = data;
+
+	/* the frame that is due by the time of the video frame being made */
+	warp_video_tick(&s->video, obs_get_video_frame_time());
 
 	warp_source_zoom_tick(s, seconds);
 
@@ -1428,9 +1408,12 @@ static void *warp_source_create(obs_data_t *settings, obs_source_t *source)
 		.event_cb = media_event,
 	};
 
+	warp_video_init(&s->video);
+
 	s->media = media_playback_create(&info);
 	if (!s->media) {
 		FF_BLOG(LOG_ERROR, "Failed to start the playback engine");
+		warp_video_free(&s->video);
 		pthread_mutex_destroy(&s->mutex);
 		pthread_mutex_destroy(&s->reconnect_mutex);
 		os_event_destroy(s->reconnect_stop_event);
@@ -1484,6 +1467,7 @@ static void warp_source_destroy(void *data)
 
 	/* the engine goes first: its thread calls back into the source */
 	media_playback_destroy(s->media);
+	warp_video_free(&s->video);
 
 	warp_zoom_control_free(&s->zoom);
 
@@ -1617,6 +1601,33 @@ static void warp_source_set_time(void *data, int64_t ms)
 		set_state(s, OBS_MEDIA_STATE_PAUSED);
 }
 
+static void warp_source_render(void *data, gs_effect_t *effect)
+{
+	struct warp_source *s = data;
+
+	UNUSED_PARAMETER(effect);
+	warp_video_render(&s->video);
+}
+
+static uint32_t warp_source_width(void *data)
+{
+	struct warp_source *s = data;
+	return warp_video_width(&s->video);
+}
+
+static uint32_t warp_source_height(void *data)
+{
+	struct warp_source *s = data;
+	return warp_video_height(&s->video);
+}
+
+static enum gs_color_space warp_source_color_space(void *data, size_t count,
+						   const enum gs_color_space *preferred_spaces)
+{
+	struct warp_source *s = data;
+	return warp_video_color_space(&s->video, count, preferred_spaces);
+}
+
 static enum obs_media_state warp_source_get_state(void *data)
 {
 	struct warp_source *s = data;
@@ -1657,8 +1668,11 @@ static obs_missing_files_t *warp_source_missingfiles(void *data)
 struct obs_source_info warp_media_source_info = {
 	.id = "warp_media_source",
 	.type = OBS_SOURCE_TYPE_INPUT,
-	.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO | OBS_SOURCE_DO_NOT_DUPLICATE |
-			OBS_SOURCE_CONTROLLABLE_MEDIA,
+	/* The source draws its own picture (see warp-video.h), in the colour
+	 * space of the video it is playing, rather than handing frames to libobs
+	 * to draw as an async source. */
+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_SRGB | OBS_SOURCE_AUDIO |
+			OBS_SOURCE_DO_NOT_DUPLICATE | OBS_SOURCE_CONTROLLABLE_MEDIA,
 	.get_name = warp_source_getname,
 	.create = warp_source_create,
 	.destroy = warp_source_destroy,
@@ -1668,6 +1682,10 @@ struct obs_source_info warp_media_source_info = {
 	.activate = warp_source_activate,
 	.deactivate = warp_source_deactivate,
 	.video_tick = warp_source_tick,
+	.video_render = warp_source_render,
+	.video_get_color_space = warp_source_color_space,
+	.get_width = warp_source_width,
+	.get_height = warp_source_height,
 	.missing_files = warp_source_missingfiles,
 	.update = warp_source_update,
 	.icon_type = OBS_ICON_TYPE_MEDIA,
