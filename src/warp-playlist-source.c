@@ -93,6 +93,17 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  * taking the mix down with it. */
 #define WARP_PL_MIX_HOLD_NS UINT64_C(60000000)
 
+/* How far ahead of the end of a transition its sound has finished crossing
+ * over, in milliseconds, and never more than half the transition. The two
+ * halves are set to what the transition stands at once a frame, and each new
+ * packet slides from the last level to that one, so the outgoing item is only
+ * ever as quiet as the last frame before the end left it - a twentieth of full
+ * level at 60 fps on a 300 ms fade, a tenth at 30 fps. The moment the
+ * transition ends it is taken off the mixer, and stopping the file dead at that
+ * level is a click. Finishing the crossfade this far early leaves a frame and a
+ * packet's worth of time for the last of it to slide right down to nothing. */
+#define WARP_PL_AUDIO_LEAD_MS 80
+
 /* How long an item that has stopped handing audio over is waited on before the
  * mixer writes it off, in nanoseconds. A file with no audio track never hands
  * anything over at all, and must not hold up the other half of a transition. */
@@ -910,7 +921,22 @@ static void warp_pl_mix_flush(struct warp_playlist_source *s)
 		if (!deck->source || !deck->producing)
 			continue;
 
-		if (now - deck->arrived > WARP_PL_DECK_IDLE_NS) {
+		/* Played at nothing, so nothing it hands over can be heard: the
+		 * outgoing item once its sound has crossed over, the incoming one
+		 * of a stinger before the swap. Waiting on it buys nothing, and an
+		 * outgoing item that runs out of sound as the transition ends
+		 * would otherwise hold the mix back for as long as the hold. */
+		if (deck->gain == 0.0f && deck->applied_gain == 0.0f)
+			continue;
+
+		/* Gone quiet, or fallen further behind the clock than the hold
+		 * - a file that has run out, or one that has been paused. It is
+		 * written off there and then rather than kept pinning the mix
+		 * the hold behind the clock until it has been idle a while,
+		 * which starves OBS of the playlist's sound and is heard as a
+		 * hop. It is picked up again by the next packet it hands over. */
+		if (now - deck->arrived > WARP_PL_DECK_IDLE_NS ||
+		    (now > WARP_PL_MIX_HOLD_NS && deck->end_ts < now - WARP_PL_MIX_HOLD_NS)) {
 			deck->producing = false;
 			continue;
 		}
@@ -1126,9 +1152,20 @@ static void warp_pl_audio_capture(void *param, obs_source_t *source, const struc
  * way the transition itself would have worked them out: everything crosses the
  * two files over, and a stinger set to fade out and back in instead takes the
  * outgoing file down to nothing by the point it swaps at and brings the
- * incoming one back up from there. */
+ * incoming one back up from there. The sound runs ahead of the picture by
+ * WARP_PL_AUDIO_LEAD_MS, so it has finished crossing over by the time the
+ * transition ends and the outgoing item is let go of. */
 static void warp_pl_transition_gains(const struct warp_pl_transition_audio *info, float t, float *out, float *in)
 {
+	if (info->ms) {
+		uint32_t lead = WARP_PL_AUDIO_LEAD_MS;
+
+		if (lead > info->ms / 2)
+			lead = info->ms / 2;
+
+		t = t * (float)info->ms / (float)(info->ms - lead);
+	}
+
 	if (t < 0.0f)
 		t = 0.0f;
 	else if (t > 1.0f)
