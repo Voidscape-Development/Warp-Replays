@@ -172,6 +172,19 @@ static void warp_zoom_filter_tick(void *data, float seconds)
 	warp_zoom_control_tick(&f->ctl, seconds, &f->view);
 }
 
+/* Whether the filters are standing aside, and which one when it is not all of
+ * them. Set and cleared around a single render by a caller holding the graphics
+ * context, which the render thread holds for the whole of its own pass, so the
+ * two never see each other's and this needs no lock. */
+static bool render_whole;
+static obs_source_t *render_whole_only;
+
+void warp_zoom_filter_render_whole(bool whole, obs_source_t *only)
+{
+	render_whole = whole;
+	render_whole_only = whole ? only : NULL;
+}
+
 static void warp_zoom_filter_render(void *data, gs_effect_t *effect)
 {
 	struct warp_zoom_filter *f = data;
@@ -187,6 +200,12 @@ static void warp_zoom_filter_render(void *data, gs_effect_t *effect)
 	/* the whole picture is what the source would draw anyway, so an
 	 * unzoomed filter costs nothing but the call that steps out of the way */
 	if (!f->effect || warp_zoom_view_is_default(&f->view)) {
+		obs_source_skip_video_filter(f->source);
+		return;
+	}
+
+	/* asked for the picture under the zoom, which is the same step aside */
+	if (render_whole && (!render_whole_only || render_whole_only == f->source)) {
 		obs_source_skip_video_filter(f->source);
 		return;
 	}

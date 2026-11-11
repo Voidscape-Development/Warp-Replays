@@ -12,5 +12,9 @@
     <file>icons/zoom-in.svg</file>
     <file>icons/zoom-out.svg</file>
     <file>icons/reset.svg</file>
+    <file>icons/picture.svg</file>
+    <file>icons/preset-update.svg</file>
+    <file>icons/preset-rename.svg</file>
+    <file>icons/preset-remove.svg</file>
   </qresource>
 </RCC>

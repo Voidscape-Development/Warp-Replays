@@ -458,6 +458,16 @@ bool warp_zoom_source_move_preset(obs_source_t *source, const char *id, int delt
 /* Frames a driven filter. Called from the tick of the source that owns it, so
  * the view is applied on the frame it was asked for. */
 void warp_zoom_filter_apply(obs_source_t *filter, const struct warp_zoom_view *view);
+/* Has the Warp Zoom filters draw the whole picture rather than their framing,
+ * for whatever is rendered between a call with 'whole' set and the call that
+ * clears it. 'only' names the one filter that stands aside, or is NULL for all
+ * of them. This is how the dock gets the picture from under a zoom, to line a
+ * shot up in a part of it that is not on air.
+ *
+ * Both calls and the render between them must be made with the graphics context
+ * held (obs_enter_graphics), which is what keeps the render that goes to air
+ * from ever running while it is set. */
+void warp_zoom_filter_render_whole(bool whole, obs_source_t *only);
 /* Makes a driven filter for a source to frame what it is showing with. The
  * caller owns the reference, and adds it to whatever it is framing. */
 obs_source_t *warp_zoom_filter_create_driven(const char *name);

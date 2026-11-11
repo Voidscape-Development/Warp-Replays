@@ -28,7 +28,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <util/platform.h>
 
 #include <QApplication>
-#include <QCheckBox>
+#include <QAbstractButton>
+#include <QBoxLayout>
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -37,8 +38,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QFontMetrics>
 #include <QFormLayout>
 #include <QFrame>
-#include <QGroupBox>
+#include <QGridLayout>
 #include <QHBoxLayout>
+#include <QHelpEvent>
 #include <QImage>
 #include <QInputDialog>
 #include <QLabel>
@@ -53,11 +55,15 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QPalette>
 #include <QPushButton>
 #include <QResizeEvent>
+#include <QScrollArea>
 #include <QSizePolicy>
 #include <QSlider>
 #include <QSpinBox>
+#include <QStyle>
+#include <QStyleOptionButton>
 #include <QSvgRenderer>
 #include <QTimer>
+#include <QToolTip>
 #include <QVBoxLayout>
 #include <QVector>
 #include <QWheelEvent>
@@ -102,36 +108,43 @@ constexpr float WARP_ZOOM_DOCK_PAN = WARP_ZOOM_PAN_STEP;
  * are bound to */
 const int warpZoomSpeeds[] = {25, 50, 100, 150, 200};
 
-/* How big the pad and the zoom beside it are drawn.
+/* How big the pad is drawn.
  *
- * The pad is what a hand goes to mid-show, so it takes whatever room the dock
- * has rather than sitting at one size: the buttons are square and grow with
- * the dock's width up to something worth aiming at without looking, and give
- * that back down to a still-usable minimum when the dock is squeezed into a
- * strip beside the picture.
+ * The pad is what a hand goes to mid-show, but it is not the only way to move
+ * the picture - the picture itself is dragged - so it is kept to buttons worth
+ * aiming at rather than given the dock: square, growing with the room there is
+ * up to a size a thumb lands on without looking, and coming back down to a
+ * still-usable minimum when the dock is squeezed into a strip.
  *
- * What keeps the pad from crowding out the picture is the share of the dock's
- * height it is allowed - see `fitPad' - rather than these, which are only a
- * ceiling on how big a button is worth drawing at all: past a point an arrow is
- * aimed at without looking either way, and the room is better left to the
- * picture and the presets. Up to there the pad takes the dock's width, so the
- * buttons are as big as the row they sit in and stand a hair apart rather than
- * leaving a margin down either side. */
+ * What it grows into is a share of the row it sits in and a share of the dock's
+ * height - see `fitPad' - with the zoom standing beside it in what is left, so
+ * the presets and the picture keep their room. With the picture put away the
+ * pad is let grow a little further, since it is then the only way to pan. */
 constexpr int WARP_ZOOM_PAD_MIN = 18;
-constexpr int WARP_ZOOM_PAD_MAX = 96;
-constexpr int WARP_ZOOM_PAD_MAX_MINIMAL = 128;
+constexpr int WARP_ZOOM_PAD_MAX = 48;
+constexpr int WARP_ZOOM_PAD_MAX_MINIMAL = 64;
 
-/* between the buttons, and the least that stands between the pad and the zoom
- * column, so the zoom reads as a control of its own rather than as a fourth
- * column of the pad */
+/* between the buttons */
 constexpr int WARP_ZOOM_PAD_SPACING = 3;
-constexpr int WARP_ZOOM_PAD_GAP = 6;
+
+/* how much of the row it shares with the zoom the pad may take, in hundredths */
+constexpr int WARP_ZOOM_PAD_SHARE = 45;
 
 /* What a button comes down to rather than being laid out past the bottom of the
  * pad. A pad handed less height than the width it was given asks for draws
  * smaller buttons instead of hanging its top and bottom rows outside the panel,
  * and this is the size below which it stops giving that back. */
 constexpr int WARP_ZOOM_PAD_FLOOR = 8;
+
+/* The zoom in and out buttons either side of the readout, which follow the size
+ * of the pad's buttons between these so the two read as one set of controls. */
+constexpr int WARP_ZOOM_ROCKER_MIN = 22;
+constexpr int WARP_ZOOM_ROCKER_MAX = 44;
+
+/* The width under which the pad and the zoom stop standing side by side and
+ * stack instead, so a dock narrowed to a strip keeps both rather than squeezing
+ * either out. */
+constexpr int WARP_ZOOM_STACK_BELOW = 260;
 
 /* How much of a button its drawing takes across the middle, the rest being the
  * room a button's face wants around anything on it. Half is what the arrows
@@ -168,21 +181,54 @@ constexpr int WARP_ZOOM_READOUT_MIN = 36;
 constexpr int WARP_ZOOM_PREVIEW_WANT = 180;
 constexpr int WARP_ZOOM_PREVIEW_FLOOR = 64;
 
-/* How far under the dock the presets are shaded.
+/* How finely the zoom bar is cut.
  *
- * A step of its own, so the slab is seen on the dark themes most of OBS is
- * worked in, where a share of a lightness that is already low comes to a
- * couple of values and to nothing anyone would notice; and a share of the
- * theme's lightness where that is the bigger of the two, so a light theme is
- * not given the same small step against a much brighter ground.
- *
- * A theme already as good as black has nothing left below it to take away, so
- * under the floor here the slab is lifted by the step instead - that it stands
- * out is the point, and which way round it stands out is the theme's business
- * rather than ours. */
-constexpr int WARP_ZOOM_SECTION_STEP = 14;
-constexpr int WARP_ZOOM_SECTION_SHARE = 8;
-constexpr int WARP_ZOOM_SECTION_FLOOR = 24;
+ * The bar runs along the logarithm of the zoom rather than the zoom itself:
+ * every other zoom control multiplies, so the same length of bar should be the
+ * same step on screen at 600% as at 150%. Run straight, the first doubling -
+ * where most framing is done - would be an eighth of the bar and the last one
+ * half of it. */
+constexpr int WARP_ZOOM_BAR_STEPS = 1000;
+
+/* the zooms the dock offers as buttons under the bar: each doubling there is */
+const float warpZoomStops[] = {1.0f, 2.0f, 4.0f, 8.0f};
+
+/* The narrowest a preset tile is worth drawing with its map and its name side
+ * by side, which is what says how many of them stand in a row. */
+constexpr int WARP_ZOOM_TILE_MIN = 132;
+
+/* How wide a dock has to be, and how much wider than it is tall, before it is
+ * laid out as columns side by side rather than as one column: the shape a dock
+ * has along the bottom of the OBS window. */
+constexpr int WARP_ZOOM_WIDE_MIN = 640;
+
+/* the colour of a shot that is waiting, wherever one is drawn */
+inline QColor warpZoomStageColor()
+{
+	return QColor(224, 152, 44);
+}
+
+/* how close two framings have to be to count as the same one: a preset that has
+ * been recalled is where the picture is, give or take what a float loses */
+bool warpZoomSameView(const warp_zoom_view &a, const warp_zoom_view &b)
+{
+	return std::fabs(a.zoom - b.zoom) < 0.005f && std::fabs(a.x - b.x) < 0.002f && std::fabs(a.y - b.y) < 0.002f;
+}
+
+int warpZoomToBar(float zoom)
+{
+	double span = std::log((double)WARP_ZOOM_MAX / WARP_ZOOM_MIN);
+	double at = std::log((double)qBound(WARP_ZOOM_MIN, zoom, WARP_ZOOM_MAX) / WARP_ZOOM_MIN) / span;
+
+	return qRound(at * WARP_ZOOM_BAR_STEPS);
+}
+
+float warpZoomFromBar(int value)
+{
+	double at = (double)qBound(0, value, WARP_ZOOM_BAR_STEPS) / WARP_ZOOM_BAR_STEPS;
+
+	return (float)(WARP_ZOOM_MIN * std::pow((double)WARP_ZOOM_MAX / WARP_ZOOM_MIN, at));
+}
 
 /* Puts back the whole range a widget's size can take.
  *
@@ -257,7 +303,9 @@ void warpZoomCompact(QPushButton *button)
  * button and the labels stay words rather than becoming guesswork. */
 class WarpZoomFlow : public QLayout {
 public:
-	explicit WarpZoomFlow(int gap = 4)
+	/* 'fill' hands whatever is left of each line to the last thing on it,
+	 * for a row that ends in the control it is there for */
+	explicit WarpZoomFlow(int gap = 4, bool fill = false) : filling(fill)
 	{
 		setContentsMargins(0, 0, 0, 0);
 		setSpacing(gap);
@@ -314,17 +362,41 @@ public:
 	}
 
 private:
+	struct Placed {
+		QLayoutItem *item;
+		QRect slot;
+	};
+
 	/* Walks the row, wrapping whatever does not fit onto the next line, and
-	 * answers how tall that came to. The take and cancel buttons are only
-	 * there while a shot is waiting, so anything hidden is stepped over
-	 * rather than left holding a space. */
+	 * answers how tall that came to. Some of what is in a row is only there
+	 * some of the time, so anything hidden is stepped over rather than left
+	 * holding a space. */
 	int run(const QRect &outer, bool place) const
 	{
 		QMargins margins = contentsMargins();
 		QRect rect = outer.adjusted(margins.left(), margins.top(), -margins.right(), -margins.bottom());
+		QVector<Placed> row;
 		int x = rect.x();
 		int y = rect.y();
 		int line = 0;
+
+		/* A line is placed once it is known how tall it came to, so a
+		 * label standing in a row of buttons is given the height of the
+		 * row and sits in the middle of it. */
+		auto flush = [&]() {
+			for (int i = 0; place && i < row.size(); i++) {
+				QRect slot = row[i].slot;
+
+				slot.setHeight(line);
+
+				if (filling && i == row.size() - 1)
+					slot.setRight(qMax(slot.right(), rect.right()));
+
+				row[i].item->setGeometry(slot);
+			}
+
+			row.clear();
+		};
 
 		for (QLayoutItem *item : items) {
 			if (item->isEmpty())
@@ -335,237 +407,274 @@ private:
 			QSize wanted = item->sizeHint().boundedTo(QSize(rect.width(), QWIDGETSIZE_MAX));
 
 			if (line && x + wanted.width() > rect.right() + 1) {
+				flush();
 				x = rect.x();
 				y += line + spacing();
 				line = 0;
 			}
 
-			if (place)
-				item->setGeometry(QRect(QPoint(x, y), wanted));
+			row.append({item, QRect(QPoint(x, y), wanted)});
 
 			x += wanted.width() + spacing();
 			line = qMax(line, wanted.height());
 		}
 
+		flush();
+
 		return y + line - outer.y() + margins.bottom();
 	}
 
 	QList<QLayoutItem *> items;
-};
-
-/* A checkbox that gives up its words rather than the dock's width: the label
- * is shortened to whatever room there is, with the whole of it in the tooltip.
- * A sentence on a control is otherwise the widest thing in the panel and
- * decides how narrow the panel can be. */
-class WarpZoomCheck : public QCheckBox {
-public:
-	explicit WarpZoomCheck(const QString &text, QWidget *parent = nullptr) : QCheckBox(text, parent), full(text)
-	{
-		setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
-		setToolTip(text);
-	}
-
-	/* The room the whole label would want, asked for however short the one
-	 * on screen has been cut. Answered from the label as it stands, the
-	 * control would ask for less every time it was laid out - each answer
-	 * shorter than the last - and the words would walk off it a piece at a
-	 * time until there were none left. */
-	QSize sizeHint() const override { return QSize(beside() + wordsWidth(full), QCheckBox::sizeHint().height()); }
-
-	/* the box and a word's worth beside it, which is as little as a control
-	 * that can still be read and aimed at comes down to */
-	QSize minimumSizeHint() const override
-	{
-		QSize hint = sizeHint();
-
-		return QSize(qMin(hint.width(), beside() + fontMetrics().averageCharWidth() * 4), hint.height());
-	}
-
-protected:
-	void resizeEvent(QResizeEvent *event) override
-	{
-		QCheckBox::resizeEvent(event);
-		elide();
-	}
-
-	/* What the control takes up beside its words is the style's to say, and
-	 * a theme or a font picked mid-show is it saying something else. The
-	 * whole label goes back on to be measured again, since what is on screen
-	 * has been cut to a room that no longer applies. */
-	void changeEvent(QEvent *event) override
-	{
-		QCheckBox::changeEvent(event);
-
-		if (event->type() != QEvent::StyleChange && event->type() != QEvent::FontChange)
-			return;
-
-		room = -1;
-		QCheckBox::setText(full);
-		updateGeometry();
-		elide();
-	}
-
-private:
-	/* the words as the label lays them out, which is what has to be
-	 * measured for the two answers below to agree */
-	int wordsWidth(const QString &words) const { return fontMetrics().size(Qt::TextShowMnemonic, words).width(); }
-
-	/* What the control takes up beside its words: the box, the space next to
-	 * it, and whatever else the style puts around the whole thing.
-	 *
-	 * Taken off the control's own answer with the whole label on it rather
-	 * than added up from the style's measurements by hand, because the two
-	 * have to agree exactly. A hand-summed guess that comes to a few pixels
-	 * more than the style leaves is a label cut short at the very width it
-	 * asked for - the last word going to an ellipsis in a dock with room to
-	 * spare - and one that comes to a few less is a label cut off by the
-	 * edge of the control instead.
-	 *
-	 * Measured the once, while the label is still whole: asked again from a
-	 * label already cut, the answer would be a style's minimum width shared
-	 * out differently and the control would not settle. */
-	int beside() const
-	{
-		if (room < 0 && text() == full)
-			room = QCheckBox::sizeHint().width() - wordsWidth(full);
-
-		return qMax(0, room);
-	}
-
-	void elide()
-	{
-		int words = qMax(0, width() - beside());
-		QString shown = full;
-
-		/* cut only once it will not fit as it stands, so that the last
-		 * of the label is not lost to a rounding between how the words
-		 * are measured and how the cut is made */
-		if (wordsWidth(full) > words)
-			shown = fontMetrics().elidedText(full, Qt::ElideRight, words);
-
-		/* set only when it has actually changed: a label put back the
-		 * same asks for the layout again and would not settle */
-		if (shown != text())
-			QCheckBox::setText(shown);
-	}
-
-	QString full;
-	/* what the style leaves for the words, once it has been asked for */
-	mutable int room = -1;
+	bool filling = false;
 };
 
 /* ------------------------------------------------------------------------- */
-/* a section of the dock
+/* cells of one size
  *
- * The presets are a thing of their own inside the dock - a list and the
- * buttons that work it - and standing them on a slab a
- * shade under the panel behind them says so, rather than leaving them as more
- * rows in a column of rows. */
-
-/* The slab's colour, taken from whatever the theme paints its panels rather
- * than written down here, so it follows OBS from a dark theme to a light one
- * and back without the dock having to know which one is on. */
-QColor warpZoomSectionShade(const QColor &panel)
-{
-	int hue = 0;
-	int saturation = 0;
-	int lightness = 0;
-	int alpha = 0;
-
-	panel.getHsl(&hue, &saturation, &lightness, &alpha);
-
-	int step = qMax(WARP_ZOOM_SECTION_STEP, lightness / WARP_ZOOM_SECTION_SHARE);
-	int wanted = lightness > WARP_ZOOM_SECTION_FLOOR ? lightness - step : lightness + WARP_ZOOM_SECTION_STEP;
-
-	return QColor::fromHsl(hue, saturation, qBound(0, wanted, 255), alpha);
-}
-
-class WarpZoomSection : public QFrame {
+ * The preset tiles, the preset speeds and the zoom stops are each a set of
+ * things that are the same kind of thing, and they read as a set by being the
+ * same size: as many to a line as fit at the width a cell is worth having, all
+ * of them as wide as each other, and the next line down for the rest. A dock
+ * with the room gets them in one row; a dock narrowed to a strip gets them one
+ * under another, and nothing in between has to be chosen. */
+class WarpZoomCells : public QLayout {
 public:
-	explicit WarpZoomSection(QWidget *parent = nullptr) : QFrame(parent)
+	/* 'least' is the narrowest a cell is worth, or zero for whatever the
+	 * widest thing in it asks for; 'most' is how many go on a line at the
+	 * outside, or zero for as many as fit */
+	explicit WarpZoomCells(int least = 0, int most = 0, int gap = 4) : cellLeast(least), cellMost(most)
 	{
-		setObjectName(QString::fromUtf8("warpZoomSection"));
-		setFrameShape(QFrame::NoFrame);
-		/* a plain container paints nothing of its own, and this is what
-		 * has it draw the background the stylesheet below gives it */
-		setAttribute(Qt::WA_StyledBackground, true);
-		dress();
+		setContentsMargins(0, 0, 0, 0);
+		setSpacing(gap);
 	}
 
-protected:
-	/* an operator picking another OBS theme is the palette changing under
-	 * the dock, and the shade on it was mixed from the old one */
-	void changeEvent(QEvent *event) override
+	~WarpZoomCells() override
 	{
-		QFrame::changeEvent(event);
+		while (QLayoutItem *item = takeAt(0))
+			delete item;
+	}
 
-		if (event->type() == QEvent::PaletteChange || event->type() == QEvent::StyleChange)
-			dressLater();
+	void addItem(QLayoutItem *item) override { items.append(item); }
+
+	int count() const override { return (int)items.size(); }
+
+	QLayoutItem *itemAt(int index) const override { return items.value(index); }
+
+	QLayoutItem *takeAt(int index) override
+	{
+		if (index < 0 || index >= items.size())
+			return nullptr;
+
+		return items.takeAt(index);
+	}
+
+	Qt::Orientations expandingDirections() const override { return Qt::Horizontal; }
+
+	bool hasHeightForWidth() const override { return true; }
+
+	int heightForWidth(int width) const override { return run(QRect(0, 0, width, 0), false); }
+
+	void setGeometry(const QRect &rect) override
+	{
+		QLayout::setGeometry(rect);
+		run(rect, true);
+	}
+
+	QSize sizeHint() const override
+	{
+		QSize cell = cellSize();
+		int across = qMax(1, shown());
+
+		if (cellMost > 0)
+			across = qMin(across, cellMost);
+
+		return QSize(cell.width() * across + spacing() * (across - 1), cell.height());
+	}
+
+	/* one cell, at the least it will go to, is as small as a set of them
+	 * gets */
+	QSize minimumSize() const override
+	{
+		QSize size;
+
+		for (QLayoutItem *item : items) {
+			if (!item->isEmpty())
+				size = size.expandedTo(item->minimumSize());
+		}
+
+		return QSize(size.width(), cellSize().height());
 	}
 
 private:
-	/* The ground the slab stands on, which is the panel behind it rather
-	 * than the slab itself.
-	 *
-	 * A stylesheet with a colour in it is written back into the widget's
-	 * own palette when the style dresses it, so the window colour here is
-	 * the shade this class last set rather than the theme's panel. Mixing
-	 * the next shade from that would be mixing a shade from a shade, and
-	 * since each pass takes another step away from the one before it, the
-	 * colour never lands on the one already set and the dressing never
-	 * settles. The panel behind us is the theme's own and nothing here
-	 * writes to it, so it is what the shade is taken from. */
-	QColor ground() const
+	int shown() const
 	{
-		const QWidget *behind = parentWidget();
+		int total = 0;
 
-		return behind ? behind->palette().color(QPalette::Window)
-			      : QApplication::palette().color(QPalette::Window);
+		for (QLayoutItem *item : items) {
+			if (!item->isEmpty())
+				total++;
+		}
+
+		return total;
 	}
 
-	/* Asked for after the pass that brought us here has finished.
-	 *
-	 * A theme change is a style change to every widget and a palette change
-	 * to every widget under the one that owns the palette, in whatever order
-	 * Qt walks them, so the panel behind us may not have been given the new
-	 * theme's colour at the moment we are told about it. Waiting for the
-	 * event loop asks the panel once it has been dressed itself, and asking
-	 * once for however many of those events arrive keeps a theme change to a
-	 * single mix. */
-	void dressLater()
+	/* the width a cell is worth and the height every one of them is given */
+	QSize cellSize() const
 	{
-		if (dressPending)
-			return;
+		QSize size(cellLeast, 0);
 
-		dressPending = true;
-		QMetaObject::invokeMethod(
-			this,
-			[this]() {
-				dressPending = false;
-				dress();
-			},
-			Qt::QueuedConnection);
+		for (QLayoutItem *item : items) {
+			if (item->isEmpty())
+				continue;
+
+			/* asked of the widget rather than of the slot it stands
+			 * in: a button told to take whatever width it is given
+			 * is one whose slot says it wants none, and what is
+			 * wanted here is the width its words come to */
+			QSize hint = item->widget() ? item->widget()->sizeHint() : item->sizeHint();
+
+			if (cellLeast <= 0)
+				size.setWidth(qMax(size.width(), hint.width()));
+
+			size.setHeight(qMax(size.height(), hint.height()));
+		}
+
+		return size;
 	}
 
-	/* Dressed only when the colour has actually moved. Setting a stylesheet
-	 * is itself a style change, which is one of the things that brings us
-	 * here, so dressing on every pass would never settle. */
-	void dress()
+	int run(const QRect &outer, bool place) const
 	{
-		QColor wanted = warpZoomSectionShade(ground());
+		int total = shown();
 
-		if (wanted == shade)
-			return;
+		if (!total)
+			return 0;
 
-		shade = wanted;
-		setStyleSheet(QString::fromUtf8("QFrame#warpZoomSection { background-color: %1;"
-						" border-radius: 4px; }")
-				      .arg(shade.name(QColor::HexRgb)));
+		QSize cell = cellSize();
+		int gap = spacing();
+		int across = qMax(1, (outer.width() + gap) / (qMax(1, cell.width()) + gap));
+
+		across = qMin(across, total);
+
+		if (cellMost > 0)
+			across = qMin(across, cellMost);
+
+		int rows = (total + across - 1) / across;
+
+		if (place) {
+			int index = 0;
+
+			for (QLayoutItem *item : items) {
+				if (item->isEmpty())
+					continue;
+
+				int column = index % across;
+				int row = index / across;
+				/* worked out from the edges rather than from one
+				 * width added up, so the last cell ends where
+				 * the row does instead of a pixel or two short */
+				int left = outer.x() + (outer.width() + gap) * column / across;
+				int right = outer.x() + (outer.width() + gap) * (column + 1) / across - gap;
+
+				item->setGeometry(QRect(left, outer.y() + row * (cell.height() + gap),
+							qMax(1, right - left), cell.height()));
+				index++;
+			}
+		}
+
+		return rows * cell.height() + (rows - 1) * gap;
 	}
 
-	QColor shade;
-	bool dressPending = false;
+	QList<QLayoutItem *> items;
+	int cellLeast = 0;
+	int cellMost = 0;
 };
+
+/* A line of words that says what it can in the room it has: cut to an ellipsis
+ * rather than off at the edge, and asking for no width of its own, so a remark
+ * in a row of controls is never the thing that holds the dock open. */
+class WarpZoomHint : public QLabel {
+public:
+	explicit WarpZoomHint(const QString &text, QWidget *parent = nullptr) : QLabel(text, parent)
+	{
+		setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+		setToolTip(text);
+	}
+
+protected:
+	void paintEvent(QPaintEvent *) override
+	{
+		QPainter painter(this);
+
+		painter.setPen(palette().color(QPalette::Disabled, QPalette::WindowText));
+		painter.drawText(rect(), (int)alignment(), fontMetrics().elidedText(text(), Qt::ElideRight, width()));
+	}
+};
+
+/* The name a part of the dock goes under. Said in capitals and in bold so it
+ * reads as a heading rather than as one more control, and given up to an
+ * ellipsis rather than holding the dock open. */
+QLabel *warpZoomCaption(const char *key, QWidget *parent)
+{
+	auto *label = new QLabel(QString::fromUtf8(obs_module_text(key)).toUpper(), parent);
+
+	label->setStyleSheet(QString::fromUtf8("font-weight: bold;"));
+	label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+
+	return label;
+}
+
+/* A button that is one of a set where one is picked - the preset speeds, the
+ * zoom stops, direct or confirm. It says which by staying down, takes no
+ * keyboard focus mid-show, and gives up its padding rather than the dock's
+ * width.
+ *
+ * It also works out how big it would like to be every time it is asked, rather
+ * than once. A push button keeps the answer it gave last, and what it gives
+ * while a stylesheet is in the middle of dressing some other widget is the
+ * answer of a button with no theme on it at all - the style declines to be asked
+ * a second question while it is busy with the first - which is then the answer
+ * it goes on giving. The rows these stand in measure them whenever the dock is
+ * laid out, which is exactly when a theme is being put on something, so a kept
+ * answer is one that is wrong until the theme next changes. */
+class WarpZoomChoice : public QPushButton {
+public:
+	explicit WarpZoomChoice(const QString &text, QWidget *parent = nullptr) : QPushButton(text, parent)
+	{
+		setCheckable(true);
+		setFocusPolicy(Qt::NoFocus);
+		setStyleSheet(QString::fromUtf8("padding-left: 8px; padding-right: 8px; min-width: 0px;"));
+	}
+
+	QSize sizeHint() const override
+	{
+		QStyleOptionButton option;
+
+		ensurePolished();
+		initStyleOption(&option);
+
+		return style()->sizeFromContents(QStyle::CT_PushButton, &option,
+						 fontMetrics().size(Qt::TextShowMnemonic, text()), this);
+	}
+
+	QSize minimumSizeHint() const override { return sizeHint(); }
+};
+
+QPushButton *warpZoomChoice(const QString &text, QWidget *parent)
+{
+	return new WarpZoomChoice(text, parent);
+}
+
+/* the same, for a set that stands in cells of one size and so is as narrow as
+ * the cell it is handed */
+QPushButton *warpZoomChip(const QString &text, QWidget *parent)
+{
+	QPushButton *button = warpZoomChoice(text, parent);
+
+	button->setStyleSheet(QString::fromUtf8("padding-left: 4px; padding-right: 4px; min-width: 0px;"));
+	button->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+
+	return button;
+}
 
 /* Where the dock remembers how it was left. This is how an operator likes to
  * work rather than anything about the show, so it lives in the user's own
@@ -820,7 +929,21 @@ public:
 
 	/* sixteen by nine of the height it wants, so the room it asks for is the
 	 * shape of what goes in it */
-	QSize sizeHint() const override { return QSize(WARP_ZOOM_PREVIEW_WANT * 16 / 9, WARP_ZOOM_PREVIEW_WANT); }
+	QSize sizeHint() const override { return QSize(wanted * 16 / 9, wanted); }
+
+	/* The height the picture is worth at the width it has, which the dock
+	 * works out and says here: asked for in the hint, so the rows under the
+	 * picture start where it ends rather than where a guess at its height
+	 * would have put them, and still only a hint, so a dock dragged short
+	 * takes it back. */
+	void setWanted(int height)
+	{
+		if (wanted == height)
+			return;
+
+		wanted = height;
+		updateGeometry();
+	}
 
 	/* Called as the picture is dragged, in fractions of what is on screen,
 	 * and as the wheel is turned, as what to multiply the zoom by. */
@@ -830,9 +953,14 @@ public:
 	 * drag while there is one */
 	std::function<void(bool)> onHold;
 
-	void setImage(const QImage &image)
+	/* The picture, and how it was taken: through the zoom, as it goes to
+	 * air, or from under it, in which case 'window' is the part of the whole
+	 * picture it holds. */
+	void setImage(const QImage &image, bool whole, const warp_zoom_view &window)
 	{
 		picture = image;
+		pictureWhole = whole;
+		pictureWindow = window;
 		update();
 	}
 
@@ -860,6 +988,10 @@ public:
 		update();
 	}
 
+	/* the shape of what is being drawn, which says how tall the picture is
+	 * worth making at the width it has; sixteen by nine until there is one */
+	QSize shape() const { return picture.isNull() ? QSize(16, 9) : picture.size(); }
+
 protected:
 	void paintEvent(QPaintEvent *) override
 	{
@@ -883,8 +1015,11 @@ protected:
 				     area.y() + (area.height() - scaled.height()) / 2),
 			      scaled);
 
-		if (staged)
-			drawStaged(painter);
+		/* A picture taken off the source as it goes to air is the framing
+		 * on air and is drawn as it is. Anything else is a window being
+		 * drawn out of a picture taken through another one. */
+		if (staged || pictureWhole)
+			drawFramed(painter);
 		else
 			painter.drawImage(shown, picture);
 
@@ -892,58 +1027,118 @@ protected:
 		drawBadge(painter);
 	}
 
-	/* Draws the staged shot out of the picture that is on air.
+	/* Draws the framing being looked at out of the picture there is.
 	 *
-	 * The only pixels anyone has are the ones the source is putting out,
-	 * framed as it is now, so a shot lined up inside that - which is what
-	 * tightening in from a wider shot always is - is exact. A shot that
-	 * reaches outside it cannot be drawn from what we have, and those parts
-	 * are left as hatching rather than invented. */
-	void drawStaged(QPainter &painter)
+	 * While the source is on confirm the picture is taken from under the
+	 * zoom rather than through it - the whole of what the source has, with
+	 * the window being looked at drawn straight out of it - so a shot can be
+	 * lined up anywhere in the picture and seen, wherever the one on air
+	 * happens to be. Lined up from a picture that had already been zoomed,
+	 * a shot outside the one on air had nothing to be drawn from.
+	 *
+	 * The picture on screen is the one grabbed a moment ago, through the
+	 * window that was wanted then, and the window wanted now has moved on if
+	 * a hand is on it. So it is drawn where it belongs in the window wanted
+	 * now, which keeps the picture under a drag rather than a grab behind
+	 * it. Whatever that leaves uncovered - a sliver at the edge for a frame
+	 * of a fast drag, or everything outside the shot on air for a picture
+	 * that was taken through the zoom - is hatched rather than invented. */
+	void drawFramed(QPainter &painter)
 	{
-		float live_window = 1.0f / framing.zoom;
-		float stage_window = 1.0f / stage.zoom;
+		const warp_zoom_view &from = pictureWhole ? pictureWindow : framing;
+		const warp_zoom_view &to = staged ? stage : framing;
+		float from_window = 1.0f / from.zoom;
+		float to_window = 1.0f / to.zoom;
 
-		/* the staged window, in fractions of the picture on screen */
-		double u0 = ((stage.x - stage_window * 0.5f) - (framing.x - live_window * 0.5f)) / live_window;
-		double v0 = ((stage.y - stage_window * 0.5f) - (framing.y - live_window * 0.5f)) / live_window;
-		double du = stage_window / live_window;
+		/* the window wanted, in fractions of the picture there is */
+		double u0 = ((to.x - to_window * 0.5f) - (from.x - from_window * 0.5f)) / from_window;
+		double v0 = ((to.y - to_window * 0.5f) - (from.y - from_window * 0.5f)) / from_window;
+		double du = to_window / from_window;
 
 		QRectF source(u0 * picture.width(), v0 * picture.height(), du * picture.width(), du * picture.height());
 		QRectF have = source.intersected(QRectF(0, 0, picture.width(), picture.height()));
 
 		painter.fillRect(shown, QBrush(QColor(70, 70, 74), Qt::BDiagPattern));
 
-		if (have.isEmpty() || source.width() <= 0.0 || source.height() <= 0.0)
-			return;
+		if (!have.isEmpty() && source.width() > 0.0 && source.height() > 0.0) {
+			/* whatever part of the shot we do have goes in the
+			 * matching part of the frame, so it stays where it
+			 * belongs in the composition */
+			QRectF target(shown.x() + (have.left() - source.left()) / source.width() * shown.width(),
+				      shown.y() + (have.top() - source.top()) / source.height() * shown.height(),
+				      have.width() / source.width() * shown.width(),
+				      have.height() / source.height() * shown.height());
 
-		/* whatever part of the shot we do have goes in the matching part
-		 * of the frame, so it stays where it belongs in the composition */
-		QRectF target(shown.x() + (have.left() - source.left()) / source.width() * shown.width(),
-			      shown.y() + (have.top() - source.top()) / source.height() * shown.height(),
-			      have.width() / source.width() * shown.width(),
-			      have.height() / source.height() * shown.height());
-
-		painter.drawImage(target, picture, have);
-
-		painter.setPen(QPen(QColor(224, 152, 44), 2));
-		painter.drawRect(QRectF(shown).adjusted(1, 1, -1, -1));
-	}
-
-	void drawBadge(QPainter &painter)
-	{
-		QRect box = shown.adjusted(6, 4, -6, -4);
-
-		painter.setPen(QColor(255, 255, 255));
-		painter.drawText(box, Qt::AlignLeft | Qt::AlignTop, QString("%1%").arg(qRound(framing.zoom * 100.0f)));
+			painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+			painter.drawImage(target, picture, have);
+			painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
+		}
 
 		if (!staged)
 			return;
 
-		painter.setPen(QColor(224, 152, 44));
-		painter.drawText(
-			box, Qt::AlignRight | Qt::AlignTop,
-			QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Staged")).arg(qRound(stage.zoom * 100.0f)));
+		painter.setPen(QPen(warpZoomStageColor(), 2));
+		painter.setBrush(Qt::NoBrush);
+		painter.drawRect(QRectF(shown).adjusted(1, 1, -1, -1));
+	}
+
+	/* What the picture is, said on it: what is on air and how far in, and
+	 * the shot waiting behind it when there is one. Each stands on a ground
+	 * of its own, since words drawn straight onto video are only as easy to
+	 * read as whatever happens to be behind them. */
+	void drawBadge(QPainter &painter)
+	{
+		QFont small = font();
+
+		small.setBold(true);
+		painter.setFont(small);
+
+		int x = shown.x() + 6;
+		int y = shown.y() + 6;
+
+		if (staged)
+			x = drawChip(painter, x, y,
+				     QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Staged"))
+					     .arg(qRound(stage.zoom * 100.0f)),
+				     warpZoomStageColor(), QColor(26, 18, 5), false);
+
+		drawChip(painter, x, y,
+			 QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.OnAir")).arg(qRound(framing.zoom * 100.0f)),
+			 QColor(0, 0, 0, 200), QColor(255, 255, 255), true);
+
+		painter.setFont(font());
+	}
+
+	/* One label on the picture, and where the next one starts. A label that
+	 * would run off the picture is left off rather than cut: the first one
+	 * drawn is the one that matters most. */
+	int drawChip(QPainter &painter, int x, int y, const QString &words, const QColor &ground, const QColor &ink,
+		     bool tally)
+	{
+		QFontMetrics metrics = painter.fontMetrics();
+		int dot = tally ? metrics.ascent() / 2 + 5 : 0;
+		QRect chip(x, y, metrics.horizontalAdvance(words) + dot + 12, metrics.height() + 6);
+
+		if (chip.right() > shown.right() - 4 || chip.bottom() > shown.bottom() - 4)
+			return x;
+
+		painter.setRenderHint(QPainter::Antialiasing, true);
+		painter.setPen(Qt::NoPen);
+		painter.setBrush(ground);
+		painter.drawRoundedRect(chip, 3, 3);
+
+		if (tally) {
+			int size = metrics.ascent() / 2;
+
+			painter.setBrush(QColor(255, 90, 95));
+			painter.drawEllipse(QRectF(chip.x() + 6, chip.center().y() - size / 2.0 + 0.5, size, size));
+		}
+
+		painter.setRenderHint(QPainter::Antialiasing, false);
+		painter.setPen(ink);
+		painter.drawText(chip.adjusted(6 + dot, 0, -6, 0), Qt::AlignLeft | Qt::AlignVCenter, words);
+
+		return chip.right() + 5;
 	}
 
 	void mousePressEvent(QMouseEvent *event) override
@@ -1015,22 +1210,27 @@ private:
 		if (framing.zoom <= WARP_ZOOM_MIN && !staged)
 			return;
 
-		const int size = 56;
+		/* big enough to read where there is a picture to spare for it,
+		 * and no more of a small one than it was */
+		const int size = shown.width() >= 260 ? 72 : 56;
 		QRect box(shown.right() - size - 8, shown.bottom() - (size * 9 / 16) - 8, size, size * 9 / 16);
 
-		painter.setPen(QColor(255, 255, 255, 140));
-		painter.setBrush(QColor(0, 0, 0, 110));
+		painter.setPen(QColor(255, 255, 255, 150));
+		painter.setBrush(QColor(0, 0, 0, 180));
 		painter.drawRect(box);
 
 		/* what is on air, and the shot waiting behind it: with a stage up
-		 * the two boxes are what say where the move is going */
-		drawWindow(painter, box, framing, QColor(255, 255, 255, 150), QColor(255, 255, 255, 60));
+		 * the two boxes are what say where the move is going. The waiting
+		 * one is dashed as well as amber, so the two are told apart by
+		 * more than their colour. */
+		drawWindow(painter, box, framing, QPen(QColor(255, 255, 255, 220)), QColor(255, 255, 255, 70));
 
 		if (staged)
-			drawWindow(painter, box, stage, QColor(224, 152, 44), QColor(224, 152, 44, 70));
+			drawWindow(painter, box, stage, QPen(warpZoomStageColor(), 1, Qt::DashLine),
+				   QColor(224, 152, 44, 100));
 	}
 
-	void drawWindow(QPainter &painter, const QRect &box, const warp_zoom_view &view, const QColor &pen,
+	void drawWindow(QPainter &painter, const QRect &box, const warp_zoom_view &view, const QPen &pen,
 			const QColor &fill)
 	{
 		float window = 1.0f / view.zoom;
@@ -1048,13 +1248,25 @@ private:
 	QPointF last;
 	warp_zoom_view framing = warp_zoom_default_view();
 	warp_zoom_view stage = warp_zoom_default_view();
+	warp_zoom_view pictureWindow = warp_zoom_default_view();
+	bool pictureWhole = false;
 	bool staged = false;
 	bool dragging = false;
 	bool live = false;
+	int wanted = WARP_ZOOM_PREVIEW_WANT;
 };
 
 /* ------------------------------------------------------------------------- */
 /* grabbing the picture */
+
+/* a picture off a source, and how it was taken */
+struct WarpZoomFrame {
+	QImage image;
+	/* taken from under the zoom rather than through it, in which case
+	 * 'window' is the part of the whole picture the image holds */
+	bool whole = false;
+	warp_zoom_view window = warp_zoom_default_view();
+};
 
 class WarpZoomGrabber {
 public:
@@ -1072,14 +1284,25 @@ public:
 	 * before, which the GPU has long since finished: the picture runs a
 	 * grab behind, and nothing waits. Only the first grab after the
 	 * surfaces are made reads its own frame, so the dock never opens on
-	 * nothing. */
-	QImage grab(obs_source_t *source)
+	 * nothing.
+	 *
+	 * With a 'window' the picture is taken from under the zoom instead of
+	 * through it: the Warp Zoom filters in what is being drawn are told to
+	 * stand aside for this one render - only the filter 'only' names, when
+	 * it names one, so a scene framed through a filter of its own keeps the
+	 * zooms of whatever is inside it - and the window is drawn straight out
+	 * of the whole picture at the size of the grab. That is the shot as it
+	 * would look on air, at the detail a shot on air has, without anything
+	 * on air having moved. Each surface is kept with how its frame was
+	 * taken, since the frame handed back is the one from the grab before. */
+	WarpZoomFrame grab(obs_source_t *source, const warp_zoom_view *window = nullptr, obs_source_t *only = nullptr)
 	{
+		WarpZoomFrame frame;
 		uint32_t source_cx = obs_source_get_width(source);
 		uint32_t source_cy = obs_source_get_height(source);
 
 		if (!source_cx || !source_cy)
-			return QImage();
+			return frame;
 
 		uint32_t grab_cx = source_cx;
 		uint32_t grab_cy = source_cy;
@@ -1090,9 +1313,7 @@ public:
 		}
 
 		if (!grab_cx || !grab_cy)
-			return QImage();
-
-		QImage image;
+			return frame;
 
 		/* An async source only uploads its frames while it is being
 		 * shown, so a source that is not on air anywhere would be
@@ -1133,19 +1354,45 @@ public:
 		if (texrender && stages[0] && stages[1] && gs_texrender_begin(texrender, cx, cy)) {
 			struct vec4 clear;
 
+			float left = 0.0f;
+			float top = 0.0f;
+			float right = (float)source_cx;
+			float bottom = (float)source_cy;
+
+			if (window) {
+				float span = 1.0f / window->zoom;
+
+				left = (window->x - span * 0.5f) * (float)source_cx;
+				top = (window->y - span * 0.5f) * (float)source_cy;
+				right = left + span * (float)source_cx;
+				bottom = top + span * (float)source_cy;
+			}
+
 			vec4_zero(&clear);
 			gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
-			gs_ortho(0.0f, (float)source_cx, 0.0f, (float)source_cy, -100.0f, 100.0f);
+			gs_ortho(left, right, top, bottom, -100.0f, 100.0f);
 
 			gs_blend_state_push();
 			gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
 
+			/* asked for and taken back either side of the one render,
+			 * with the graphics context held throughout, so nothing
+			 * that goes to air is ever drawn while it is set */
+			if (window)
+				warp_zoom_filter_render_whole(true, only);
+
 			obs_source_video_render(source);
+
+			if (window)
+				warp_zoom_filter_render_whole(false, nullptr);
 
 			gs_blend_state_pop();
 			gs_texrender_end(texrender);
 
 			gs_stage_texture(stages[written], gs_texrender_get_texture(texrender));
+
+			taken[written].whole = window != nullptr;
+			taken[written].window = window ? *window : warp_zoom_default_view();
 
 			/* the frame staged on the grab before, or this one when
 			 * there has not been one since the surfaces were made */
@@ -1154,7 +1401,10 @@ public:
 			uint32_t linesize = 0;
 
 			if (gs_stagesurface_map(stages[read], &data, &linesize)) {
-				image = QImage(data, (int)cx, (int)cy, (int)linesize, QImage::Format_RGBA8888).copy();
+				frame.image =
+					QImage(data, (int)cx, (int)cy, (int)linesize, QImage::Format_RGBA8888).copy();
+				frame.whole = taken[read].whole;
+				frame.window = taken[read].window;
 				gs_stagesurface_unmap(stages[read]);
 			}
 
@@ -1166,7 +1416,7 @@ public:
 
 		obs_source_dec_showing(source);
 
-		return image;
+		return frame;
 	}
 
 	void release()
@@ -1200,6 +1450,8 @@ private:
 
 	gs_texrender_t *texrender = nullptr;
 	gs_stagesurf_t *stages[2] = {nullptr, nullptr};
+	/* how the frame in each surface was taken; the image is left empty */
+	WarpZoomFrame taken[2];
 	/* the surface the next frame is copied into, and whether the other
 	 * one holds a frame copied out on an earlier grab */
 	size_t written = 0;
@@ -1291,9 +1543,32 @@ void warpZoomSavePreset(QWidget *parent, obs_source_t *source)
 	bfree(id);
 }
 
-/* The reset position, drawn as what it is on a PTZ desk: the dot in the middle
- * of the pad. A word does not fit in a button this small, and the dot is read
- * at a glance by anyone who has worked a camera desk. */
+/* A drawing in the theme's colour, at the size it is asked for.
+ *
+ * The drawings say only a shape. What is kept of one is where it put ink, and
+ * the ink itself is thrown away for whatever colour the theme gives the words
+ * on a button, so a drawing is as legible on a light theme as on a dark one
+ * without there being two of it. Asked for in the screen's own pixels and told
+ * what they are worth, so it is sharp on a display that has more of them than
+ * it has points. */
+QPixmap warpZoomTinted(QSvgRenderer &glyph, int side, const QColor &ink, qreal ratio)
+{
+	QPixmap sheet(QSize(side, side) * ratio);
+	QPainter painter;
+
+	sheet.setDevicePixelRatio(ratio);
+	sheet.fill(Qt::transparent);
+
+	painter.begin(&sheet);
+	painter.setRenderHint(QPainter::Antialiasing, true);
+	glyph.render(&painter, QRectF(0, 0, side, side));
+	painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
+	painter.fillRect(QRectF(0, 0, side, side), ink);
+	painter.end();
+
+	return sheet;
+}
+
 /* A pad button, which is a drawing on a button rather than a letter on one.
  *
  * The arrows were characters typed into the buttons - the same ones a document
@@ -1342,25 +1617,7 @@ private:
 		if (!sheet.isNull() && room == sheetSide && ink == sheetInk && qFuzzyCompare(ratio, sheetRatio))
 			return sheet;
 
-		QPainter painter;
-
-		/* asked for in the screen's own pixels and told what they are
-		 * worth, so the drawing is sharp on a display that has more of
-		 * them than it has points */
-		sheet = QPixmap(QSize(room, room) * ratio);
-		sheet.setDevicePixelRatio(ratio);
-		sheet.fill(Qt::transparent);
-
-		painter.begin(&sheet);
-		painter.setRenderHint(QPainter::Antialiasing, true);
-		glyph.render(&painter, QRectF(0, 0, room, room));
-
-		/* the shape is kept and the colour thrown away: what is left
-		 * where the drawing put ink is the theme's colour instead */
-		painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
-		painter.fillRect(QRectF(0, 0, room, room), ink);
-		painter.end();
-
+		sheet = warpZoomTinted(glyph, room, ink, ratio);
 		sheetSide = room;
 		sheetInk = ink;
 		sheetRatio = ratio;
@@ -1375,19 +1632,20 @@ private:
 	qreal sheetRatio = 0.0;
 };
 
-/* The pad itself: eight directions around the reset dot, with the zoom
- * standing beside it as its own column.
+/* The pad itself: eight directions around the reset dot.
  *
  * The buttons are placed by hand rather than by a grid, because what matters
- * is that they stay square and as big as the dock's width allows: a grid would
- * hand out whatever space there was and leave the arrows in letterboxes. The
- * pad works out the biggest square that four columns of them fit into, lays
- * itself out at that size, and sits in the middle of whatever it was given. */
+ * is that they stay square: a grid would hand out whatever space there was and
+ * leave the arrows in letterboxes. The pad works out the biggest square that
+ * three columns of them fit into, lays itself out at that size, and sits in
+ * the middle of whatever it was given. */
 class WarpZoomPad : public QWidget {
 public:
 	explicit WarpZoomPad(QWidget *parent = nullptr) : QWidget(parent)
 	{
-		QSizePolicy policy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+		/* as wide as its buttons come to and no wider: what is left of
+		 * the row is the zoom's */
+		QSizePolicy policy(QSizePolicy::Maximum, QSizePolicy::Preferred);
 
 		/* the buttons are square, so the row the pad sits in takes only
 		 * the height the width it was given works out to */
@@ -1395,7 +1653,6 @@ public:
 		setSizePolicy(policy);
 	}
 
-	/* Columns 0 to 2 are the pad; column 3 is the zoom beside it. */
 	void place(QWidget *widget, int row, int column)
 	{
 		Cell cell;
@@ -1409,8 +1666,8 @@ public:
 		cells.append(cell);
 	}
 
-	/* How big a button is allowed to get, which is the whole difference
-	 * between the pad beside a picture and the pad on its own. */
+	/* how big a button is allowed to get, which the dock works out from
+	 * the room it has */
 	void setLargest(int size)
 	{
 		if (largest == size)
@@ -1455,58 +1712,437 @@ private:
 		int column;
 	};
 
-	/* the gap grows with the buttons, so the zoom keeps standing apart
-	 * rather than crowding the pad as both get bigger */
-	static int gapFor(int size) { return qMax(WARP_ZOOM_PAD_GAP, size / 3); }
-
 	static int down(int size) { return size * 3 + WARP_ZOOM_PAD_SPACING * 2; }
 
-	static int across(int size) { return size * 4 + WARP_ZOOM_PAD_SPACING * 2 + gapFor(size); }
+	static int across(int size) { return size * 3 + WARP_ZOOM_PAD_SPACING * 2; }
 
-	/* The biggest square three rows of them fit down into - `down' asked the
-	 * other way round.
+	/* The biggest square three rows of them fit down into, and three
+	 * columns across - `down' asked the other way round.
 	 *
 	 * The pad asks for the height the width it was given works out to, and
-	 * in a dock with a picture, a preset list and the rows under them all
+	 * in a dock with a picture, the presets and the rows under them all
 	 * wanting height at once it can be handed less than it asked for. What
 	 * it is given is the answer, not what it asked for. */
-	static int downTo(int height) { return (height - WARP_ZOOM_PAD_SPACING * 2) / 3; }
+	static int fitInto(int length) { return (length - WARP_ZOOM_PAD_SPACING * 2) / 3; }
 
-	/* The biggest square four columns of them fit into: worked out once
-	 * against the smallest gap there can be, and again against the gap that
-	 * size asks for. */
-	int sizeFor(int width) const
-	{
-		int size =
-			qBound(WARP_ZOOM_PAD_MIN, (width - WARP_ZOOM_PAD_SPACING * 2 - WARP_ZOOM_PAD_GAP) / 4, largest);
-
-		return qBound(WARP_ZOOM_PAD_MIN, (width - WARP_ZOOM_PAD_SPACING * 2 - gapFor(size)) / 4, largest);
-	}
+	int sizeFor(int width) const { return qBound(WARP_ZOOM_PAD_MIN, fitInto(width), largest); }
 
 	void arrange()
 	{
 		/* square: the size the width allows, or the height, whichever
 		 * there is less room for */
-		int size = qMax(WARP_ZOOM_PAD_FLOOR, qMin(sizeFor(width()), downTo(height())));
-		int gap = gapFor(size);
+		int size = qMax(WARP_ZOOM_PAD_FLOOR, qMin(sizeFor(width()), fitInto(height())));
 		int left = (width() - across(size)) / 2;
 		int top = (height() - down(size)) / 2;
 
 		for (const Cell &cell : cells) {
-			int x = cell.column < 3 ? left + cell.column * (size + WARP_ZOOM_PAD_SPACING)
-						: left + size * 3 + WARP_ZOOM_PAD_SPACING * 2 + gap;
-
 			/* the square is only handed out if the widget will take
 			 * one: whatever the theme has capped it at is put back
 			 * first */
 			warpZoomFreeSize(cell.widget);
 
-			cell.widget->setGeometry(x, top + cell.row * (size + WARP_ZOOM_PAD_SPACING), size, size);
+			cell.widget->setGeometry(left + cell.column * (size + WARP_ZOOM_PAD_SPACING),
+						 top + cell.row * (size + WARP_ZOOM_PAD_SPACING), size, size);
 		}
 	}
 
 	QVector<Cell> cells;
 	int largest = WARP_ZOOM_PAD_MAX;
+};
+
+/* The zoom, as the rocker beside the stick: out on the left, in on the right,
+ * and how far in the picture is between them in figures big enough to read
+ * from where the operator is actually looking.
+ *
+ * Laid out by hand for the same reason the pad is - the two buttons are square
+ * and a theme has opinions about how big a button may be - with the readout
+ * taking whatever the buttons leave. */
+class WarpZoomRocker : public QWidget {
+public:
+	WarpZoomRocker(QPushButton *out, QLabel *readout, QPushButton *in, QWidget *parent = nullptr)
+		: QWidget(parent),
+		  outButton(out),
+		  inButton(in),
+		  figures(readout)
+	{
+		out->setParent(this);
+		in->setParent(this);
+		readout->setParent(this);
+
+		setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+	}
+
+	/* how big the two buttons are, which follows the pad's */
+	void setSide(int size)
+	{
+		if (side == size)
+			return;
+
+		side = size;
+		updateGeometry();
+		arrange();
+	}
+
+	QSize sizeHint() const override { return QSize(side * 2 + figuresWidth() + 16, side); }
+
+	QSize minimumSizeHint() const override { return QSize(WARP_ZOOM_ROCKER_MIN * 2 + figuresWidth(), side); }
+
+protected:
+	void resizeEvent(QResizeEvent *event) override
+	{
+		QWidget::resizeEvent(event);
+		arrange();
+	}
+
+	void changeEvent(QEvent *event) override
+	{
+		QWidget::changeEvent(event);
+
+		if (event->type() == QEvent::StyleChange)
+			arrange();
+	}
+
+private:
+	void arrange()
+	{
+		/* square, and never so big that the figures are squeezed out
+		 * from between them */
+		int size = qMax(WARP_ZOOM_PAD_FLOOR, qMin(qMin(side, height()), (width() - figuresWidth()) / 2));
+		int top = (height() - size) / 2;
+
+		warpZoomFreeSize(outButton);
+		warpZoomFreeSize(inButton);
+
+		outButton->setGeometry(0, top, size, size);
+		inButton->setGeometry(width() - size, top, size, size);
+		figures->setGeometry(size, 0, qMax(0, width() - size * 2), height());
+	}
+
+	/* what the readout needs to say the most it ever says */
+	int figuresWidth() const
+	{
+		QString most = QString("%1%").arg(qRound(WARP_ZOOM_MAX * 100.0f));
+
+		return qMax(WARP_ZOOM_READOUT_MIN, figures->fontMetrics().horizontalAdvance(most) + 4);
+	}
+
+	QPushButton *outButton;
+	QPushButton *inButton;
+	QLabel *figures;
+	int side = WARP_ZOOM_ROCKER_MAX;
+};
+
+/* ------------------------------------------------------------------------- */
+/* a preset, as a tile
+ *
+ * A preset is recalled far more often than it is renamed, so what the dock
+ * shows of one is a thing to press rather than a line to pick and a button to
+ * press afterwards: one click and the picture is on its way there. The tile
+ * says what a list row did - the name, how far in, and the number of the slot
+ * hotkey that fires it - and draws where in the picture the framing sits, which
+ * a list never could, so two presets at the same zoom are told apart at a
+ * glance.
+ *
+ * Changing a preset is the rare thing and the one that does damage if it is
+ * done by accident, so it is not on the tile while the tile recalls. With the
+ * dock set to edit the tiles stop recalling and carry the three things that
+ * change one instead. */
+class WarpZoomTile : public QAbstractButton {
+public:
+	enum Action { None = -1, Update = 0, Rename = 1, Remove = 2 };
+
+	WarpZoomTile(const WarpZoomPresetRow &row, int index, QWidget *parent = nullptr)
+		: QAbstractButton(parent),
+		  preset(row),
+		  slot(!row.fixed && index >= 1 && index <= WARP_ZOOM_SLOTS ? index : 0),
+		  glyphs{QSvgRenderer(warpZoomDrawing("preset-update")), QSvgRenderer(warpZoomDrawing("preset-rename")),
+			 QSvgRenderer(warpZoomDrawing("preset-remove"))}
+	{
+		/* the framing the preset comes out as, which is the one to draw
+		 * and the one to compare the picture against */
+		warp_zoom_clamp(&preset.view);
+
+		setFocusPolicy(Qt::NoFocus);
+		setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+		/* repainted as the cursor comes and goes, so it answers a hover
+		 * the way a button does */
+		setAttribute(Qt::WA_Hover, true);
+		setAccessibleName(row.name);
+
+		QString tip = row.fixed ? QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Reset.Desc"))
+					: QString("%1  (%2%)").arg(row.name).arg(qRound(row.view.zoom * 100.0f));
+
+		if (slot)
+			tip += QString::fromUtf8("\n") +
+			       QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Preset.Slot")).arg(slot);
+
+		setToolTip(tip);
+
+		connect(this, &QAbstractButton::clicked, this, [this]() {
+			if (!editing) {
+				if (onRecall)
+					onRecall();
+				return;
+			}
+
+			Action action = actionAt(pressed);
+
+			if (action != None && onAction)
+				onAction(action);
+		});
+	}
+
+	std::function<void()> onRecall;
+	std::function<void(Action)> onAction;
+
+	const WarpZoomPresetRow &row() const { return preset; }
+
+	/* whether this is where the picture is, and whether it is the shot
+	 * waiting to go there */
+	void setState(bool on_air, bool is_staged)
+	{
+		if (onAir == on_air && staged == is_staged)
+			return;
+
+		onAir = on_air;
+		staged = is_staged;
+		update();
+	}
+
+	void setEditing(bool value)
+	{
+		if (editing == value)
+			return;
+
+		editing = value;
+		update();
+	}
+
+	QSize sizeHint() const override { return QSize(WARP_ZOOM_TILE_MIN, tall()); }
+
+	/* a few letters of the name is as little as a tile is worth */
+	QSize minimumSizeHint() const override
+	{
+		return QSize(EDGE * 2 + fontMetrics().averageCharWidth() * 6, tall());
+	}
+
+protected:
+	void mousePressEvent(QMouseEvent *event) override
+	{
+		pressed = event->position().toPoint();
+		QAbstractButton::mousePressEvent(event);
+	}
+
+	/* what each of the three says it is, since a drawing this small says
+	 * it to nobody who does not already know */
+	bool event(QEvent *event) override
+	{
+		if (event->type() == QEvent::ToolTip && editing && !preset.fixed) {
+			auto *help = static_cast<QHelpEvent *>(event);
+			static const char *const names[] = {"Warp.Zoom.Dock.Update.Desc", "Warp.Zoom.Dock.Rename",
+							    "Warp.Zoom.Dock.Remove"};
+			Action action = actionAt(help->pos());
+
+			if (action == None)
+				QToolTip::hideText();
+			else
+				QToolTip::showText(help->globalPos(), QString::fromUtf8(obs_module_text(names[action])),
+						   this, actionRect(action));
+
+			return true;
+		}
+
+		return QAbstractButton::event(event);
+	}
+
+	void paintEvent(QPaintEvent *) override
+	{
+		QPainter painter(this);
+		const QPalette &colours = palette();
+		QRectF face = QRectF(rect()).adjusted(1, 1, -1, -1);
+		QFont strong = font();
+
+		strong.setBold(true);
+
+		QFontMetrics plain(font());
+		QFontMetrics heavy(strong);
+
+		/* On air is the theme's own colour for the thing that is picked,
+		 * so it reads the way a selection does everywhere else in OBS;
+		 * a tile being edited is set back into the panel, since it is
+		 * not a button while it is. */
+		QColor ground = colours.color(QPalette::Button);
+		QColor ink = colours.color(QPalette::ButtonText);
+
+		if (editing) {
+			ground = colours.color(QPalette::Base);
+			ink = colours.color(QPalette::Text);
+		} else if (onAir) {
+			ground = colours.color(QPalette::Highlight);
+			ink = colours.color(QPalette::HighlightedText);
+		}
+
+		if (!editing && isDown())
+			ground = ground.darker(120);
+		else if (!editing && underMouse())
+			ground = ground.lighter(118);
+
+		painter.setRenderHint(QPainter::Antialiasing, true);
+		painter.setPen(editing ? QPen(colours.color(QPalette::Button), 1) : QPen(Qt::NoPen));
+		painter.setBrush(ground);
+		painter.drawRoundedRect(face, 5, 5);
+
+		/* the shot that is waiting: dashed as well as amber, so it is
+		 * told from the one on air by more than its colour */
+		if (staged && !editing) {
+			painter.setPen(QPen(warpZoomStageColor(), 2, Qt::DashLine));
+			painter.setBrush(Qt::NoBrush);
+			painter.drawRoundedRect(face.adjusted(0.5, 0.5, -0.5, -0.5), 5, 5);
+		}
+
+		int x = EDGE;
+
+		/* the map goes before the name does: a tile too narrow for both
+		 * keeps the words */
+		if (!editing && width() >= EDGE * 2 + MAP_W + GAP + plain.averageCharWidth() * 8) {
+			drawMap(painter);
+			x += MAP_W + GAP;
+		}
+
+		int room = qMax(0, width() - EDGE - x);
+		int top = editing ? EDGE : (height() - (heavy.height() + LEAD + plain.height())) / 2;
+		int under = top + heavy.height() + LEAD;
+
+		painter.setFont(strong);
+		painter.setPen(ink);
+		painter.drawText(QRect(x, top, room, heavy.height()), Qt::AlignLeft | Qt::AlignVCenter,
+				 heavy.elidedText(preset.name, Qt::ElideRight, room));
+		painter.setFont(font());
+
+		if (editing && !preset.fixed) {
+			drawActions(painter);
+			return;
+		}
+
+		/* the number of the slot hotkey that fires it, on a key of its
+		 * own so it is not read as part of the zoom */
+		if (slot && !editing) {
+			QString key = QString::number(slot);
+			QRectF cap(x, under, qMax(plain.height(), plain.horizontalAdvance(key) + 6), plain.height());
+
+			painter.setPen(Qt::NoPen);
+			painter.setBrush(QColor(0, 0, 0, 90));
+			painter.drawRoundedRect(cap, 3, 3);
+			painter.setPen(ink);
+			painter.drawText(cap, Qt::AlignCenter, key);
+
+			x += (int)cap.width() + 6;
+			room = qMax(0, width() - EDGE - x);
+		}
+
+		QString said = QString("%1%").arg(qRound(preset.view.zoom * 100.0f));
+
+		if (editing)
+			said = QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Preset.Fixed"));
+		else if (staged)
+			said = QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Preset.Staged"));
+		else if (preset.fixed)
+			said = QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Preset.Whole"));
+
+		painter.setPen(ink);
+		painter.drawText(QRect(x, under, room, plain.height()), Qt::AlignLeft | Qt::AlignVCenter,
+				 plain.elidedText(said, Qt::ElideRight, room));
+	}
+
+private:
+	static constexpr int EDGE = 8;
+	static constexpr int GAP = 8;
+	static constexpr int LEAD = 5;
+	static constexpr int MAP_W = 48;
+	static constexpr int MAP_H = 27;
+
+	/* two lines and the room around them, or the buttons a tile carries
+	 * while it is being edited, whichever is the taller - worked out the
+	 * once so a tile is the same height whichever it is showing */
+	int tall() const
+	{
+		int line = fontMetrics().height();
+
+		return qMax(MAP_H, line + LEAD + line + ACTION_PAD) + EDGE * 2;
+	}
+
+	static constexpr int ACTION_PAD = 6;
+
+	QRect actionRect(int which) const
+	{
+		int high = fontMetrics().height() + ACTION_PAD;
+		int wide = qMax(8, qMin(high * 3 / 2, (width() - EDGE * 2 - 8) / 3));
+
+		return QRect(EDGE + which * (wide + 4), height() - EDGE - high, wide, high);
+	}
+
+	Action actionAt(const QPoint &point) const
+	{
+		if (preset.fixed)
+			return None;
+
+		for (int which = Update; which <= Remove; which++) {
+			if (actionRect(which).contains(point))
+				return (Action)which;
+		}
+
+		return None;
+	}
+
+	void drawActions(QPainter &painter)
+	{
+		const QPalette &colours = palette();
+		QColor ink = colours.color(QPalette::ButtonText);
+		QPoint cursor = mapFromGlobal(QCursor::pos());
+
+		for (int which = Update; which <= Remove; which++) {
+			QRect box = actionRect(which);
+			QColor ground = colours.color(QPalette::Button);
+			int side = qMax(1, qRound(box.height() * 0.62));
+
+			if (underMouse() && box.contains(cursor))
+				ground = isDown() ? ground.darker(120) : ground.lighter(118);
+
+			painter.setPen(Qt::NoPen);
+			painter.setBrush(ground);
+			painter.drawRoundedRect(box, 3, 3);
+			painter.drawPixmap(QPointF(box.x() + (box.width() - side) / 2.0,
+						   box.y() + (box.height() - side) / 2.0),
+					   warpZoomTinted(glyphs[which], side, ink, devicePixelRatioF()));
+		}
+	}
+
+	/* where in the picture the framing sits: the whole of it as a box, and
+	 * the part the preset keeps as a block inside */
+	void drawMap(QPainter &painter)
+	{
+		QRectF box(EDGE, (height() - MAP_H) / 2.0, MAP_W, MAP_H);
+		float window = 1.0f / preset.view.zoom;
+		QRectF inner(box.x() + (preset.view.x - window * 0.5f) * box.width(),
+			     box.y() + (preset.view.y - window * 0.5f) * box.height(), window * box.width(),
+			     window * box.height());
+
+		painter.setPen(QPen(QColor(138, 144, 160), 1));
+		painter.setBrush(QColor(22, 24, 29));
+		painter.drawRect(box);
+
+		painter.setPen(Qt::NoPen);
+		painter.setBrush(QColor(254, 254, 254, 235));
+		painter.drawRect(inner.intersected(box.adjusted(0.5, 0.5, -0.5, -0.5)));
+	}
+
+	WarpZoomPresetRow preset;
+	int slot;
+	QSvgRenderer glyphs[3];
+	QPoint pressed;
+	bool onAir = false;
+	bool staged = false;
+	bool editing = false;
 };
 
 /* ------------------------------------------------------------------------- */
@@ -1533,16 +2169,53 @@ public:
 	~WarpZoomDock() override { grabber.release(); }
 
 protected:
-	/* Full or Minimal, and whether the source is framed on the spot or the
-	 * shot is lined up first: settings chosen once a show, which do not
-	 * deserve rows of their own in a panel meant to be small. Confirm is
-	 * still a per-source setting - it is the source the dock is pointed at
-	 * that is put on confirm, the same one the source properties set - so it
-	 * is read back every time the menu is opened rather than remembered
+	/* What the dock does with the buttons on it, for a hand already on the
+	 * mouse: the picture on or off, direct or confirm, and - over a preset -
+	 * everything that can be done to that preset, including the two that
+	 * have no button because they are about its place in the list.
+	 *
+	 * Confirm is a per-source setting - it is the source the dock is pointed
+	 * at that is put on confirm, the same one the source properties set - so
+	 * it is read back every time the menu is opened rather than remembered
 	 * here. */
 	void contextMenuEvent(QContextMenuEvent *event) override
 	{
 		QMenu menu(this);
+		WarpZoomTile *tile = tileUnder(event->pos());
+		/* taken now rather than read off the tile afterwards: the menu
+		 * runs the event loop, and the tiles are remade whenever the
+		 * presets change under it */
+		QString id = tile ? tile->row().id : QString();
+		QString name = tile ? tile->row().name : QString();
+		QAction *recallAction = nullptr;
+		QAction *updateAction = nullptr;
+		QAction *renameAction = nullptr;
+		QAction *removeAction = nullptr;
+		QAction *upAction = nullptr;
+		QAction *downAction = nullptr;
+
+		if (tile) {
+			recallAction = menu.addAction(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Recall")));
+
+			if (!tile->row().fixed) {
+				updateAction =
+					menu.addAction(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Update")));
+				renameAction =
+					menu.addAction(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Rename")));
+				removeAction =
+					menu.addAction(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Remove")));
+				menu.addSeparator();
+				upAction = menu.addAction(QString::fromUtf8(obs_module_text("Warp.Zoom.Presets.Up")));
+				downAction =
+					menu.addAction(QString::fromUtf8(obs_module_text("Warp.Zoom.Presets.Down")));
+
+				updateAction->setToolTip(
+					QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Update.Desc")));
+			}
+
+			menu.addSeparator();
+		}
+
 		QAction *full = menu.addAction(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Mode.Full")));
 		QAction *small = menu.addAction(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Mode.Minimal")));
 
@@ -1568,23 +2241,32 @@ protected:
 		if (!picked)
 			return;
 
-		if (picked == confirmAction) {
+		if (picked == recallAction) {
+			recall(id);
+		} else if (picked == updateAction) {
+			presetAction(WarpZoomTile::Update, id, name);
+		} else if (picked == renameAction) {
+			presetAction(WarpZoomTile::Rename, id, name);
+		} else if (picked == removeAction) {
+			presetAction(WarpZoomTile::Remove, id, name);
+		} else if (picked == upAction || picked == downAction) {
 			OBSSourceAutoRelease source = zoomSource();
 
 			if (source)
-				warp_zoom_source_set_confirm(source, confirmAction->isChecked());
+				warp_zoom_source_move_preset(source, WARP_UTF8(id), picked == upAction ? -1 : 1);
 
-			refreshView();
-			return;
+			refreshLists();
+		} else if (picked == confirmAction) {
+			setConfirm(confirmAction->isChecked());
+		} else {
+			bool wanted = picked == small;
+
+			if (wanted == minimal)
+				return;
+
+			setMinimal(wanted);
+			warpZoomSetMinimalSetting(minimal);
 		}
-
-		bool wanted = picked == small;
-
-		if (wanted == minimal)
-			return;
-
-		setMinimal(wanted);
-		warpZoomSetMinimalSetting(minimal);
 	}
 
 	void resizeEvent(QResizeEvent *event) override
@@ -1604,13 +2286,83 @@ protected:
 	}
 
 private:
-	/* What the dock's height is shared out to, worked out from the top down:
-	 * whether there is room for the picture at all, and then how big the pad
-	 * may grow in what is left. */
+	/* What the dock's room is shared out to: which way round its parts
+	 * stand, whether there is room for the picture at all, and then how big
+	 * the pad may grow in what is left. */
 	void fitParts()
 	{
+		if (!grid)
+			return;
+
+		fitShape();
 		fitPreview();
 		fitPad();
+	}
+
+	/* Whether the parts stand in one column or side by side.
+	 *
+	 * A dock down the side of the window is a column, and that is how the
+	 * parts are stacked: the picture and what is done about a waiting shot,
+	 * the framing controls, the presets, the speed. A dock along the bottom
+	 * of the window has the width of the window and the height of a strip,
+	 * and stacked the same way it has room for the first of those and none
+	 * of the rest. So there the parts stand side by side instead - the
+	 * picture, then the controls, then the presets - each with the dock's
+	 * whole height to itself. */
+	void fitShape()
+	{
+		bool wanted = width() >= WARP_ZOOM_WIDE_MIN && width() * 10 >= height() * 16;
+
+		if (wanted == wide && placed)
+			return;
+
+		wide = wanted;
+		placed = true;
+
+		for (QWidget *block : {blockTop, blockFrame, blockPresets, blockSpeed})
+			grid->removeWidget(block);
+
+		if (wide) {
+			grid->addWidget(blockTop, 0, 0, 2, 1);
+			grid->addWidget(blockFrame, 0, 1);
+			grid->addWidget(blockSpeed, 1, 1, Qt::AlignTop);
+			grid->addWidget(blockPresets, 0, 2, 2, 1);
+		} else {
+			grid->addWidget(blockTop, 0, 0);
+			grid->addWidget(blockFrame, 1, 0);
+			grid->addWidget(blockPresets, 2, 0);
+			grid->addWidget(blockSpeed, 3, 0);
+		}
+
+		grid->setColumnStretch(0, wide ? 4 : 1);
+		grid->setColumnStretch(1, wide ? 3 : 0);
+		grid->setColumnStretch(2, wide ? 4 : 0);
+		grid->setRowStretch(1, wide ? 1 : 0);
+		grid->setRowStretch(2, wide ? 0 : 1);
+		grid->setRowStretch(3, 0);
+	}
+
+	/* the height a column of rows holds at a width, leaving out whatever is
+	 * hidden and, when it is named, the one thing being placed */
+	static int heightOf(QLayout *box, int across, const QWidget *without)
+	{
+		int total = 0;
+		int rows = 0;
+
+		for (int i = 0; i < box->count(); i++) {
+			QLayoutItem *item = box->itemAt(i);
+
+			if (item->isEmpty() || (without && item->widget() == without))
+				continue;
+
+			total += item->hasHeightForWidth() ? item->minimumHeightForWidth(across)
+							   : item->minimumSize().height();
+			rows++;
+		}
+
+		/* the gaps between them, and the one the thing left out would
+		 * stand above if it were put back */
+		return total + box->spacing() * (without ? rows : qMax(0, rows - 1));
 	}
 
 	/* The height the rest of the dock holds, which is what says whether the
@@ -1621,33 +2373,37 @@ private:
 	 * stands rather than against a number written down when this was
 	 * written. The picture is left out of it - it is the one being placed -
 	 * and so is anything hidden, since a row that is not there holds
-	 * nothing. */
+	 * nothing. Side by side, the picture only shares its height with the
+	 * rows of its own column. */
 	int restHeight() const
 	{
-		QLayout *box = layout();
-		QMargins margins = box->contentsMargins();
+		QMargins margins = grid->contentsMargins();
+		int across = width() - margins.left() - margins.right();
 		int total = margins.top() + margins.bottom();
-		int rows = 0;
 
-		for (int i = 0; i < box->count(); i++) {
-			QLayoutItem *item = box->itemAt(i);
+		if (wide)
+			return total + heightOf(topBox, blockTop->width() > 0 ? blockTop->width() : across, preview);
 
-			if (item->widget() == preview || item->isEmpty())
-				continue;
+		total += heightOf(topBox, across, preview);
 
-			total += item->minimumSize().height();
-			rows++;
-		}
+		for (QWidget *block : {blockFrame, blockPresets, blockSpeed})
+			total += heightOf(block->layout(), across, nullptr) + grid->verticalSpacing();
 
-		/* the gaps between them, and the one the picture would stand
-		 * above if it were put back */
-		return total + box->spacing() * rows;
+		/* a row of presets is worth more than a sliver of picture */
+		if (!tiles.isEmpty())
+			total += tiles.first()->sizeHint().height();
+
+		return total;
 	}
 
 	/* Whether the picture is worth the room it would take. Below the floor
 	 * it is a strip too thin to frame a shot in, and the pad, the presets
 	 * and the speed are what an operator can still work in a dock that
-	 * short, so it is put away rather than laid out under them. */
+	 * short, so it is put away rather than laid out under them.
+	 *
+	 * With the room, it is given the height its own shape comes to at the
+	 * width it has and no more: a picture handed more than that only draws
+	 * bars above and below itself, and that height is the presets'. */
 	void fitPreview()
 	{
 		bool room = !minimal && height() - restHeight() >= WARP_ZOOM_PREVIEW_FLOOR;
@@ -1657,61 +2413,139 @@ private:
 		 * visible whatever the dock has decided about it */
 		if (room == preview->isHidden())
 			preview->setVisible(room);
+
+		QSize shape = preview->shape();
+		int across = blockTop->width() > 0 ? blockTop->width() : width();
+		int most = qMax(WARP_ZOOM_PREVIEW_FLOOR, across * shape.height() / qMax(1, shape.width()));
+
+		if (preview->maximumHeight() != most)
+			preview->setMaximumHeight(most);
+
+		preview->setWanted(most);
+
+		pictureShape = shape;
 	}
 
 	/* How big the pad is let grow, which is a question about the dock's
-	 * height rather than its width.
+	 * height as much as its width.
 	 *
-	 * The pad takes its size from the width it is given, and a dock kept
-	 * short and wide - one along the bottom of the window - would hand it
-	 * a pad taller than the panel it is in, with the picture and the
-	 * presets squeezed out behind it. So the width it works from is
-	 * capped by the share of the height the pad can have: a third of the
-	 * dock beside a picture, half of it with the picture put away. */
+	 * Across, it may have its share of the row it stands in with the zoom.
+	 * Down, it may have a share of the dock: a fifth of a column that also
+	 * holds a picture, a quarter of one that does not, and half of a dock
+	 * laid out side by side, where the column it is in is its own. A dock
+	 * kept short would otherwise be handed a pad taller than the panel it
+	 * is in, with the presets squeezed out behind it.
+	 *
+	 * Narrow enough, and the pad and the zoom stop sharing a row at all. */
 	void fitPad()
 	{
-		int share = minimal ? height() / 2 : height() / 3;
-		int room = (share - WARP_ZOOM_PAD_SPACING * 2) / 3;
+		bool away = minimal || preview->isHidden();
+		int across = blockFrame->width() > 0 ? blockFrame->width() : width();
+		bool stacked = across < WARP_ZOOM_STACK_BELOW;
+		int share = wide ? height() / 2 : away ? height() / 4 : height() / 5;
+		int byHeight = (share - WARP_ZOOM_PAD_SPACING * 2) / 3;
+		int byWidth = ((stacked ? across : across * WARP_ZOOM_PAD_SHARE / 100) - WARP_ZOOM_PAD_SPACING * 2) / 3;
+		int size = qBound(WARP_ZOOM_PAD_MIN, qMin(byHeight, byWidth),
+				  away ? WARP_ZOOM_PAD_MAX_MINIMAL : WARP_ZOOM_PAD_MAX);
 
-		pad->setLargest(
-			qBound(WARP_ZOOM_PAD_MIN, room, minimal ? WARP_ZOOM_PAD_MAX_MINIMAL : WARP_ZOOM_PAD_MAX));
+		pad->setLargest(size);
+		rocker->setSide(qBound(WARP_ZOOM_ROCKER_MIN, size, WARP_ZOOM_ROCKER_MAX));
+
+		QBoxLayout::Direction wanted = stacked ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight;
+
+		if (frameRow->direction() != wanted) {
+			frameRow->setDirection(wanted);
+			frameRow->setAlignment(pad, stacked ? Qt::AlignHCenter : Qt::Alignment());
+		}
 	}
 
 	/* Minimal drops the picture and nothing else: the pad, the presets and
 	 * the speed are what an operator works, and without the picture there
-	 * is no per-frame grab to pay for either.
-	 *
-	 * With the picture gone the pad is what the panel is for, so it is let
-	 * grow past what it stops at while it is sharing the dock with one. */
+	 * is no per-frame grab to pay for either. The button in the corner of
+	 * the dock and the right-click menu are two ways of saying the same
+	 * thing, so each is kept in step with the other here. */
 	void setMinimal(bool value)
 	{
 		minimal = value;
+		pictureButton->setChecked(!minimal);
 		fitParts();
+	}
+
+	/* Direct or confirm, which is the source's setting rather than the
+	 * dock's: it is asked of the source and read back from it, so the dock
+	 * says what is so rather than what it last asked for. */
+	void setConfirm(bool confirm)
+	{
+		OBSSourceAutoRelease source = zoomSource();
+
+		if (source)
+			warp_zoom_source_set_confirm(source, confirm);
+
+		refreshView();
 	}
 
 	void build()
 	{
-		auto *layout = new QVBoxLayout(this);
+		grid = new QGridLayout(this);
 
 		/* the dock is meant to go down to a strip beside the picture,
 		 * and margins are width like anything else */
-		layout->setContentsMargins(4, 4, 4, 4);
+		grid->setContentsMargins(4, 4, 4, 4);
+		grid->setSpacing(8);
+
+		buildTop();
+		buildFrame();
+		buildPresets();
+		buildSpeed();
+
+		fitParts();
+	}
+
+	/* The source, the picture, and what is done about the shot on it. */
+	void buildTop()
+	{
+		blockTop = new QWidget(this);
+		topBox = new QVBoxLayout(blockTop);
+		topBox->setContentsMargins(0, 0, 0, 0);
+		topBox->setSpacing(4);
 
 		/* which source is being framed; the name of a source is longer
 		 * than a narrow dock, so the list is let shrink past it and
 		 * says the whole of it in the tooltip instead */
-		targets = new QComboBox(this);
+		targets = new QComboBox(blockTop);
 		targets->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
-		targets->setMinimumContentsLength(8);
+		targets->setMinimumContentsLength(4);
 		targets->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
 
-		/* what the dropdown is set from when it is left to itself, so it
-		 * reads as the setting on the control above it rather than as
-		 * something competing with it for the same row */
-		follow = new WarpZoomCheck(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Follow")), this);
+		/* What the list is set from when it is left to itself. It is a
+		 * setting on the control beside it, so it stands beside it as a
+		 * button that stays down rather than as a sentence on a row of
+		 * its own; the sentence is what it says when it is asked. */
+		follow = warpZoomChoice(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Follow.Short")), blockTop);
 		follow->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Follow.Desc")));
+		follow->setAccessibleName(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Follow")));
 
-		preview = new WarpZoomPreview(this);
+		/* the picture, on or off: what the right-click menu calls Full
+		 * and Minimal, where it can be seen and reached */
+		pictureButton = new WarpZoomPadButton(warpZoomDrawing("picture"), blockTop);
+		pictureButton->setCheckable(true);
+		pictureButton->setChecked(true);
+		pictureButton->setFocusPolicy(Qt::NoFocus);
+		pictureButton->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+		/* a drawing wants a face about as wide as it is tall, not the
+		 * width a theme leaves either side of a word */
+		pictureButton->setStyleSheet(
+			QString::fromUtf8("padding-left: 8px; padding-right: 8px; min-width: 16px;"));
+		warpZoomName(pictureButton, "Warp.Zoom.Dock.Picture");
+
+		auto *sourceRow = new QHBoxLayout();
+
+		sourceRow->setSpacing(4);
+		sourceRow->addWidget(targets, 1);
+		sourceRow->addWidget(follow);
+		sourceRow->addWidget(pictureButton);
+
+		preview = new WarpZoomPreview(blockTop);
 		preview->onPan = [this](float dx, float dy) {
 			pan(dx, dy, 0);
 		};
@@ -1722,119 +2556,73 @@ private:
 			setRiding(holding);
 		};
 
-		/* zoom */
-		zoomSlider = new QSlider(Qt::Horizontal, this);
-		zoomSlider->setRange((int)(WARP_ZOOM_MIN * 100), (int)(WARP_ZOOM_MAX * 100));
-		zoomSlider->setValue((int)(WARP_ZOOM_MIN * 100));
-		/* a bar has a length it would rather be; in a dock narrowed to a
-		 * strip it takes what is left over instead */
-		zoomSlider->setMinimumWidth(WARP_ZOOM_SLIDER_MIN);
+		/* Lining a shot up before it goes to air.
+		 *
+		 * Whether a move goes to air or waits to be taken is the first
+		 * thing an operator needs to know before touching anything, so
+		 * it is said on the dock rather than left in a menu: the pair of
+		 * buttons under the picture is the setting and the sign of it.
+		 *
+		 * Take and Cancel stand in the same row for as long as the
+		 * source is on confirm, whether or not a shot is waiting - they
+		 * are greyed until one is. Appearing only when a shot was lined
+		 * up, they pushed everything under them down a row at the moment
+		 * the operator was reaching for it. */
+		directButton = warpZoomChoice(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Direct")), blockTop);
+		confirmButton =
+			warpZoomChoice(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Confirm.Short")), blockTop);
 
-		zoomLabel = new QLabel(this);
-		zoomLabel->setMinimumWidth(WARP_ZOOM_READOUT_MIN);
-		zoomLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+		directButton->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Direct.Desc")));
+		confirmButton->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Confirm.Desc")));
+		directButton->setChecked(true);
 
-		auto *zoomRow = new QHBoxLayout();
+		directHint =
+			new WarpZoomHint(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Direct.Hint")), blockTop);
+		directHint->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
 
-		zoomRow->addWidget(new QLabel(QString::fromUtf8(obs_module_text("Warp.Zoom.Zoom")), this));
-		zoomRow->addWidget(zoomSlider, 1);
-		zoomRow->addWidget(zoomLabel);
-
-		/* The pad: eight directions around the reset dot, laid out the
-		 * way a PTZ desk is, with the zoom standing beside it as its
-		 * own column - in on top, out below - the way the rocker on a
-		 * camera desk sits to the right of the stick. A corner moves a
-		 * full step on both axes, the way a joystick held into its
-		 * corner covers more ground than one pushed straight. */
-		pad = new WarpZoomPad(this);
-
-		auto *up = new WarpZoomPadButton(warpZoomDrawing("pan-up"), pad);
-		auto *down = new WarpZoomPadButton(warpZoomDrawing("pan-down"), pad);
-		auto *left = new WarpZoomPadButton(warpZoomDrawing("pan-left"), pad);
-		auto *right = new WarpZoomPadButton(warpZoomDrawing("pan-right"), pad);
-		auto *upLeft = new WarpZoomPadButton(warpZoomDrawing("pan-up-left"), pad);
-		auto *upRight = new WarpZoomPadButton(warpZoomDrawing("pan-up-right"), pad);
-		auto *downLeft = new WarpZoomPadButton(warpZoomDrawing("pan-down-left"), pad);
-		auto *downRight = new WarpZoomPadButton(warpZoomDrawing("pan-down-right"), pad);
-		auto *in = new WarpZoomPadButton(warpZoomDrawing("zoom-in"), pad);
-		auto *out = new WarpZoomPadButton(warpZoomDrawing("zoom-out"), pad);
-
-		resetButton = new WarpZoomPadButton(warpZoomDrawing("reset"), pad);
-		resetButton->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Reset.Desc")));
-		resetButton->setAccessibleName(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Reset")));
-
-		in->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.In")));
-		out->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Out")));
-
-		/* A drawing says which way a button goes to anyone looking at it
-		 * and nothing at all to anyone who is not, which the arrows it
-		 * replaced at least did by being letters. Every one of them says
-		 * what it is in words, for the tooltip and for a reader. */
-		warpZoomName(up, "Warp.Zoom.Dock.Pan.Up");
-		warpZoomName(down, "Warp.Zoom.Dock.Pan.Down");
-		warpZoomName(left, "Warp.Zoom.Dock.Pan.Left");
-		warpZoomName(right, "Warp.Zoom.Dock.Pan.Right");
-		warpZoomName(upLeft, "Warp.Zoom.Dock.Pan.UpLeft");
-		warpZoomName(upRight, "Warp.Zoom.Dock.Pan.UpRight");
-		warpZoomName(downLeft, "Warp.Zoom.Dock.Pan.DownLeft");
-		warpZoomName(downRight, "Warp.Zoom.Dock.Pan.DownRight");
-		in->setAccessibleName(in->toolTip());
-		out->setAccessibleName(out->toolTip());
-
-		pad->place(upLeft, 0, 0);
-		pad->place(up, 0, 1);
-		pad->place(upRight, 0, 2);
-		pad->place(left, 1, 0);
-		pad->place(resetButton, 1, 1);
-		pad->place(right, 1, 2);
-		pad->place(downLeft, 2, 0);
-		pad->place(down, 2, 1);
-		pad->place(downRight, 2, 2);
-		pad->place(in, 0, 3);
-		pad->place(out, 2, 3);
-
-		for (WarpZoomPadButton *button :
-		     {up, down, left, right, upLeft, upRight, downLeft, downRight, in, out, resetButton})
-			warpZoomCompact(button);
-
-		connect(up, &QPushButton::clicked, this, [this]() { pan(0.0f, -WARP_ZOOM_DOCK_PAN, -1); });
-		connect(down, &QPushButton::clicked, this, [this]() { pan(0.0f, WARP_ZOOM_DOCK_PAN, -1); });
-		connect(left, &QPushButton::clicked, this, [this]() { pan(-WARP_ZOOM_DOCK_PAN, 0.0f, -1); });
-		connect(right, &QPushButton::clicked, this, [this]() { pan(WARP_ZOOM_DOCK_PAN, 0.0f, -1); });
-		connect(upLeft, &QPushButton::clicked, this,
-			[this]() { pan(-WARP_ZOOM_DOCK_PAN, -WARP_ZOOM_DOCK_PAN, -1); });
-		connect(upRight, &QPushButton::clicked, this,
-			[this]() { pan(WARP_ZOOM_DOCK_PAN, -WARP_ZOOM_DOCK_PAN, -1); });
-		connect(downLeft, &QPushButton::clicked, this,
-			[this]() { pan(-WARP_ZOOM_DOCK_PAN, WARP_ZOOM_DOCK_PAN, -1); });
-		connect(downRight, &QPushButton::clicked, this,
-			[this]() { pan(WARP_ZOOM_DOCK_PAN, WARP_ZOOM_DOCK_PAN, -1); });
-		connect(in, &QPushButton::clicked, this, [this]() { adjust(WARP_ZOOM_STEP, -1); });
-		connect(out, &QPushButton::clicked, this, [this]() { adjust(1.0f / WARP_ZOOM_STEP, -1); });
-		connect(resetButton, &QPushButton::clicked, this, [this]() {
-			OBSSourceAutoRelease source = zoomSource();
-
-			if (source)
-				warp_zoom_source_reset(source, -1);
-		});
-
-		/* Lining a shot up before it goes to air. Confirm itself is set
-		 * from the dock's right-click menu, since it is chosen once and
-		 * a row spent saying so is a row the picture does not get; what
-		 * stands in the dock is the pair of buttons a waiting shot is
-		 * answered with, and they are only there while one is waiting,
-		 * so the row takes no height at all the rest of the time. */
-		takeButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Take")), this);
-		dropButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Drop")), this);
+		takeButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Take")), blockTop);
+		dropButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Drop")), blockTop);
 
 		takeButton->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Take.Desc")));
 		takeButton->setVisible(false);
 		dropButton->setVisible(false);
+		takeButton->setEnabled(false);
+		dropButton->setEnabled(false);
 
-		auto *stageRow = new WarpZoomFlow();
+		/* Take is what the row is there for, so it has whatever of the
+		 * row the rest leaves */
+		auto *stageRow = new WarpZoomFlow(4, true);
 
-		stageRow->addWidget(takeButton);
+		stageRow->addWidget(directButton);
+		stageRow->addWidget(confirmButton);
+		stageRow->addWidget(directHint);
 		stageRow->addWidget(dropButton);
+		stageRow->addWidget(takeButton);
+
+		topBox->addLayout(sourceRow);
+		topBox->addWidget(preview, 1);
+		topBox->addLayout(stageRow);
+		/* takes up what the picture will not once it is as tall as its
+		 * shape allows, so the rows stay together at the top */
+		topBox->addStretch(0);
+
+		connect(targets, &QComboBox::currentIndexChanged, this, [this](int index) {
+			if (loading || index < 0 || index >= chosen.size())
+				return;
+
+			target = chosen[index];
+			refreshLists();
+		});
+
+		connect(follow, &QPushButton::toggled, this, [this](bool) { refreshLists(); });
+
+		connect(pictureButton, &QPushButton::clicked, this, [this](bool checked) {
+			setMinimal(!checked);
+			warpZoomSetMinimalSetting(minimal);
+		});
+
+		connect(directButton, &QPushButton::clicked, this, [this]() { setConfirm(false); });
+		connect(confirmButton, &QPushButton::clicked, this, [this]() { setConfirm(true); });
 
 		connect(takeButton, &QPushButton::clicked, this, [this]() {
 			OBSSourceAutoRelease source = zoomSource();
@@ -1853,134 +2641,135 @@ private:
 
 			refreshView();
 		});
+	}
 
-		/* presets */
-		presets = new QListWidget(this);
-		presets->setSelectionMode(QAbstractItemView::SingleSelection);
-		/* a preset reads as much of its name as there is room for, which
-		 * is not a reason to hold the dock open */
-		presets->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
-		presets->setTextElideMode(Qt::ElideRight);
+	/* The framing controls: the pad, and the zoom beside it. */
+	void buildFrame()
+	{
+		blockFrame = new QWidget(this);
 
-		auto *saveButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Save")), this);
-		auto *recallButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Recall")), this);
+		auto *box = new QVBoxLayout(blockFrame);
 
-		updateButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Update")), this);
-		renameButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Rename")), this);
-		removeButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Remove")), this);
+		box->setContentsMargins(0, 0, 0, 0);
+		box->setSpacing(4);
+		box->addWidget(warpZoomCaption("Warp.Zoom.Dock.Frame", blockFrame));
 
-		saveButton->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Save.Desc")));
-		updateButton->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Update.Desc")));
+		/* The pad: eight directions around the reset dot, laid out the
+		 * way a PTZ desk is. A corner moves a full step on both axes,
+		 * the way a joystick held into its corner covers more ground
+		 * than one pushed straight. */
+		pad = new WarpZoomPad(blockFrame);
 
-		auto *presetButtons = new WarpZoomFlow();
+		struct Direction {
+			const char *drawing;
+			const char *name;
+			int column;
+			int row;
+		};
 
-		presetButtons->addWidget(recallButton);
-		presetButtons->addWidget(saveButton);
-		presetButtons->addWidget(updateButton);
-		presetButtons->addWidget(renameButton);
-		presetButtons->addWidget(removeButton);
+		static const Direction directions[] = {
+			{"pan-up-left", "Warp.Zoom.Dock.Pan.UpLeft", 0, 0},
+			{"pan-up", "Warp.Zoom.Dock.Pan.Up", 1, 0},
+			{"pan-up-right", "Warp.Zoom.Dock.Pan.UpRight", 2, 0},
+			{"pan-left", "Warp.Zoom.Dock.Pan.Left", 0, 1},
+			{"pan-right", "Warp.Zoom.Dock.Pan.Right", 2, 1},
+			{"pan-down-left", "Warp.Zoom.Dock.Pan.DownLeft", 0, 2},
+			{"pan-down", "Warp.Zoom.Dock.Pan.Down", 1, 2},
+			{"pan-down-right", "Warp.Zoom.Dock.Pan.DownRight", 2, 2},
+		};
 
-		connect(recallButton, &QPushButton::clicked, this, [this]() { recall(presets->currentItem()); });
+		for (const Direction &direction : directions) {
+			auto *button = new WarpZoomPadButton(warpZoomDrawing(direction.drawing), pad);
+			float dx = (float)(direction.column - 1) * WARP_ZOOM_DOCK_PAN;
+			float dy = (float)(direction.row - 1) * WARP_ZOOM_DOCK_PAN;
 
-		/* Recalling is a double-click or the button, never a single click:
-		 * picking a preset to rename must not put it on air. */
-		connect(presets, &QListWidget::itemActivated, this, [this](QListWidgetItem *item) { recall(item); });
-		connect(presets, &QListWidget::itemSelectionChanged, this, [this]() { updateButtons(); });
+			/* A drawing says which way a button goes to anyone
+			 * looking at it and nothing at all to anyone who is
+			 * not, so every one of them says what it is in words,
+			 * for the tooltip and for a reader. */
+			warpZoomName(button, direction.name);
+			warpZoomCompact(button);
+			pad->place(button, direction.row, direction.column);
 
-		connect(saveButton, &QPushButton::clicked, this, [this]() {
-			OBSSourceAutoRelease source = zoomSource();
-
-			if (!source)
-				return;
-
-			warpZoomSavePreset(this, source);
-			refreshLists();
-		});
-
-		connect(updateButton, &QPushButton::clicked, this, [this]() {
-			OBSSourceAutoRelease source = zoomSource();
-			QString id = selectedPreset();
-
-			if (!source || id.isEmpty())
-				return;
-
-			warp_zoom_view view;
-
-			/* Whatever is being looked at: the shot lined up when
-			 * there is one, and otherwise the framing it is heading
-			 * for, so keeping a shot partway through a move keeps
-			 * the shot rather than wherever the move had got to. */
-			if (framingNow(source, &view))
-				warp_zoom_source_update_preset(source, WARP_UTF8(id), nullptr, &view, -1);
-
-			refreshLists();
-		});
-
-		connect(renameButton, &QPushButton::clicked, this, [this]() {
-			OBSSourceAutoRelease source = zoomSource();
-			QString id = selectedPreset();
-			bool ok = false;
-
-			if (!source || id.isEmpty())
-				return;
-
-			QString name = QInputDialog::getText(
-				this, QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Rename")),
-				QString::fromUtf8(obs_module_text("Warp.Zoom.Preset.Save.Prompt")), QLineEdit::Normal,
-				selectedName(), &ok);
-
-			if (ok && !name.trimmed().isEmpty())
-				warp_zoom_source_update_preset(source, WARP_UTF8(id), WARP_UTF8(name.trimmed()),
-							       nullptr, -1);
-
-			refreshLists();
-		});
-
-		connect(removeButton, &QPushButton::clicked, this, [this]() {
-			OBSSourceAutoRelease source = zoomSource();
-			QString id = selectedPreset();
-
-			if (!source || id.isEmpty())
-				return;
-
-			warp_zoom_source_remove_preset(source, WARP_UTF8(id));
-			refreshLists();
-		});
-
-		/* speed, which is the other thing an operator rides live */
-		speedSlider = new QSlider(Qt::Horizontal, this);
-		speedSlider->setRange(WARP_FLOW_SPEED_MIN, WARP_FLOW_SPEED_MAX);
-		speedSlider->setValue(100);
-		speedSlider->setMinimumWidth(WARP_ZOOM_SLIDER_MIN);
-
-		speedLabel = new QLabel(this);
-		speedLabel->setMinimumWidth(WARP_ZOOM_READOUT_MIN);
-		speedLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-
-		auto *speedRow = new QHBoxLayout();
-
-		speedRow->addWidget(new QLabel(QString::fromUtf8(obs_module_text("Warp.Video.Speed")), this));
-		speedRow->addWidget(speedSlider, 1);
-		speedRow->addWidget(speedLabel);
-
-		auto *speedButtons = new WarpZoomFlow();
-
-		for (int speed : warpZoomSpeeds) {
-			auto *button = new QPushButton(QString("%1%").arg(speed), this);
-
-			connect(button, &QPushButton::clicked, this, [this, speed]() { setSpeed(speed); });
-			speedButtons->addWidget(button);
+			connect(button, &QPushButton::clicked, this, [this, dx, dy]() { pan(dx, dy, -1); });
 		}
 
-		connect(targets, &QComboBox::currentIndexChanged, this, [this](int index) {
-			if (loading || index < 0 || index >= chosen.size())
-				return;
+		auto *resetButton = new WarpZoomPadButton(warpZoomDrawing("reset"), pad);
 
-			target = chosen[index];
-			refreshLists();
+		resetButton->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Reset.Desc")));
+		resetButton->setAccessibleName(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Reset")));
+		warpZoomCompact(resetButton);
+		pad->place(resetButton, 1, 1);
+
+		connect(resetButton, &QPushButton::clicked, this, [this]() {
+			OBSSourceAutoRelease source = zoomSource();
+
+			if (source)
+				warp_zoom_source_reset(source, -1);
 		});
 
-		connect(follow, &QCheckBox::toggled, this, [this](bool) { refreshLists(); });
+		/* The zoom, beside the pad the way the rocker on a camera desk
+		 * sits beside the stick: out and in either side of how far in
+		 * the picture is, the bar under them, and under that the
+		 * doublings as buttons of their own. */
+		auto *in = new WarpZoomPadButton(warpZoomDrawing("zoom-in"), blockFrame);
+		auto *out = new WarpZoomPadButton(warpZoomDrawing("zoom-out"), blockFrame);
+
+		warpZoomName(in, "Warp.Zoom.Dock.In");
+		warpZoomName(out, "Warp.Zoom.Dock.Out");
+		warpZoomCompact(in);
+		warpZoomCompact(out);
+
+		connect(in, &QPushButton::clicked, this, [this]() { adjust(WARP_ZOOM_STEP, -1); });
+		connect(out, &QPushButton::clicked, this, [this]() { adjust(1.0f / WARP_ZOOM_STEP, -1); });
+
+		zoomLabel = new QLabel(blockFrame);
+		zoomLabel->setAlignment(Qt::AlignCenter);
+		zoomLabel->setMinimumWidth(WARP_ZOOM_READOUT_MIN);
+		dressReadout(false);
+
+		rocker = new WarpZoomRocker(out, zoomLabel, in, blockFrame);
+
+		zoomSlider = new QSlider(Qt::Horizontal, blockFrame);
+		zoomSlider->setRange(0, WARP_ZOOM_BAR_STEPS);
+		zoomSlider->setSingleStep(WARP_ZOOM_BAR_STEPS / 100);
+		zoomSlider->setPageStep(WARP_ZOOM_BAR_STEPS / 10);
+		zoomSlider->setValue(0);
+		zoomSlider->setAccessibleName(QString::fromUtf8(obs_module_text("Warp.Zoom.Zoom")));
+		/* a bar has a length it would rather be; in a dock narrowed to a
+		 * strip it takes what is left over instead */
+		zoomSlider->setMinimumWidth(WARP_ZOOM_SLIDER_MIN);
+
+		auto *stopRow = new WarpZoomCells(0, 0, 2);
+
+		for (float stop : warpZoomStops) {
+			QString label = QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Stop")).arg(qRound(stop));
+			QPushButton *button = warpZoomChip(label, blockFrame);
+
+			button->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Stop.Desc"))
+						   .arg(qRound(stop * 100.0f)));
+			button->setAccessibleName(button->toolTip());
+			stopRow->addWidget(button);
+			stopButtons.append(button);
+
+			connect(button, &QPushButton::clicked, this, [this, stop]() { zoomTo(stop); });
+		}
+
+		auto *zoomBox = new QVBoxLayout();
+
+		zoomBox->setSpacing(4);
+		zoomBox->addWidget(rocker);
+		zoomBox->addStretch(1);
+		zoomBox->addWidget(zoomSlider);
+		zoomBox->addStretch(1);
+		zoomBox->addLayout(stopRow);
+
+		frameRow = new QBoxLayout(QBoxLayout::LeftToRight);
+		frameRow->setSpacing(8);
+		frameRow->addWidget(pad);
+		frameRow->addLayout(zoomBox, 1);
+
+		box->addLayout(frameRow);
 
 		connect(zoomSlider, &QSlider::valueChanged, this, [this](int value) {
 			if (loading)
@@ -1997,7 +2786,7 @@ private:
 			if (!framingNow(source, &view, &staging))
 				return;
 
-			view.zoom = (float)value / 100.0f;
+			view.zoom = warpZoomFromBar(value);
 
 			/* Riding the bar is direct handling, the same as dragging
 			 * the picture: where the handle is put is where the
@@ -2017,38 +2806,182 @@ private:
 
 		connect(zoomSlider, &QSlider::sliderPressed, this, [this]() { setRiding(true); });
 		connect(zoomSlider, &QSlider::sliderReleased, this, [this]() { setRiding(false); });
+	}
+
+	/* The presets: a tile each, and the two buttons that are about the set
+	 * rather than about one of them. */
+	void buildPresets()
+	{
+		blockPresets = new QWidget(this);
+
+		auto *box = new QVBoxLayout(blockPresets);
+
+		box->setContentsMargins(0, 0, 0, 0);
+		box->setSpacing(4);
+
+		editButton = warpZoomChoice(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Edit")), blockPresets);
+		editButton->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Edit.Desc")));
+
+		auto *saveButton =
+			new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.SaveFraming")), blockPresets);
+
+		saveButton->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Save.Desc")));
+
+		QLabel *caption = warpZoomCaption("Warp.Zoom.Dock.Presets", blockPresets);
+
+		/* the heading has what the buttons leave when they share a line
+		 * with it, and a line of its own when they do not */
+		caption->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+
+		auto *head = new WarpZoomFlow(4);
+
+		head->addWidget(caption);
+		head->addWidget(editButton);
+		head->addWidget(saveButton);
+
+		/* The tiles scroll rather than holding the dock open: a source
+		 * can have dozens of presets and the dock has the height it has.
+		 * What they stand on is the dock, not a panel of the scroll
+		 * area's own, so nothing is drawn behind them. */
+		tileHost = new QWidget();
+		tileCells = new WarpZoomCells(WARP_ZOOM_TILE_MIN, 0, 4);
+		tileHost->setLayout(tileCells);
+
+		tileScroll = new QScrollArea(blockPresets);
+		tileScroll->setWidgetResizable(true);
+		tileScroll->setFrameShape(QFrame::NoFrame);
+		tileScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+		tileScroll->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
+		tileScroll->setWidget(tileHost);
+		tileScroll->viewport()->setAutoFillBackground(false);
+		tileHost->setAutoFillBackground(false);
+
+		box->addLayout(head);
+		box->addWidget(tileScroll, 1);
+
+		connect(editButton, &QPushButton::toggled, this, [this](bool checked) {
+			editing = checked;
+			editButton->setText(QString::fromUtf8(
+				obs_module_text(editing ? "Warp.Zoom.Dock.Edit.Done" : "Warp.Zoom.Dock.Edit")));
+
+			for (WarpZoomTile *tile : tiles)
+				tile->setEditing(editing);
+		});
+
+		connect(saveButton, &QPushButton::clicked, this, [this]() {
+			OBSSourceAutoRelease source = zoomSource();
+
+			if (!source)
+				return;
+
+			warpZoomSavePreset(this, source);
+			refreshLists();
+		});
+	}
+
+	/* The speed, which is the other thing an operator rides live. */
+	void buildSpeed()
+	{
+		blockSpeed = new QWidget(this);
+
+		auto *box = new QVBoxLayout(blockSpeed);
+
+		box->setContentsMargins(0, 0, 0, 0);
+		box->setSpacing(4);
+
+		speedLabel = new QLabel(blockSpeed);
+		speedLabel->setMinimumWidth(WARP_ZOOM_READOUT_MIN);
+		speedLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+		speedLabel->setStyleSheet(QString::fromUtf8("font-weight: bold;"));
+
+		auto *head = new QHBoxLayout();
+
+		head->addWidget(warpZoomCaption("Warp.Video.Speed", blockSpeed), 1);
+		head->addWidget(speedLabel);
+
+		/* the preset speeds the hotkeys are bound to, the one the source
+		 * is playing at staying down */
+		auto *speedRow = new WarpZoomCells(0, 0, 2);
+
+		for (int speed : warpZoomSpeeds) {
+			QPushButton *button = warpZoomChip(QString("%1%").arg(speed), blockSpeed);
+
+			speedRow->addWidget(button);
+			speedButtons.append(button);
+
+			connect(button, &QPushButton::clicked, this, [this, speed]() {
+				setSpeed(speed);
+				refreshView();
+			});
+		}
+
+		speedSlider = new QSlider(Qt::Horizontal, blockSpeed);
+		speedSlider->setRange(WARP_FLOW_SPEED_MIN, WARP_FLOW_SPEED_MAX);
+		speedSlider->setValue(100);
+		speedSlider->setMinimumWidth(WARP_ZOOM_SLIDER_MIN);
+		speedSlider->setAccessibleName(QString::fromUtf8(obs_module_text("Warp.Video.Speed")));
+
+		box->addLayout(head);
+		box->addLayout(speedRow);
+		box->addWidget(speedSlider);
 
 		connect(speedSlider, &QSlider::valueChanged, this, [this](int value) {
 			if (!loading)
 				setSpeed(value);
 		});
-
-		/* The presets stand on a slab of their own: the list, the
-		 * buttons that work it are one
-		 * thing an operator sets a show up with, and the dock says so
-		 * by shading the ground under them rather than by running them
-		 * in with the rows above and below. */
-		auto *presetSection = new WarpZoomSection(this);
-		auto *presetBox = new QVBoxLayout(presetSection);
-
-		presetBox->setContentsMargins(6, 6, 6, 6);
-		presetBox->addWidget(
-			new QLabel(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Presets")), presetSection));
-		presetBox->addWidget(presets, 1);
-		presetBox->addLayout(presetButtons);
-
-		layout->addWidget(targets);
-		layout->addWidget(follow);
-		layout->addWidget(preview, 1);
-		layout->addLayout(zoomRow);
-		layout->addWidget(pad);
-		layout->addLayout(stageRow);
-		layout->addWidget(presetSection, 1);
-		layout->addLayout(speedRow);
-		layout->addLayout(speedButtons);
 	}
 
 	obs_source_t *zoomSource() const { return warpZoomTargetSource(target); }
+
+	/* the preset tile at a point in the dock, if that is what is there */
+	WarpZoomTile *tileUnder(const QPoint &point) const
+	{
+		for (QWidget *widget = childAt(point); widget && widget != this; widget = widget->parentWidget()) {
+			if (tiles.contains(static_cast<WarpZoomTile *>(widget)))
+				return static_cast<WarpZoomTile *>(widget);
+		}
+
+		return nullptr;
+	}
+
+	/* The figures between the zoom buttons: big enough to be read at a
+	 * glance, and in the colour of a waiting shot while they are saying
+	 * where one would go rather than where the picture is. Their size is
+	 * taken from the dock's font rather than their own, which is the one
+	 * this has already made bigger. Dressed only when something changes,
+	 * since a stylesheet set is a style change to everything under it. */
+	void dressReadout(bool staging)
+	{
+		if (readoutDressed && readoutStaging == staging)
+			return;
+
+		readoutDressed = true;
+		readoutStaging = staging;
+
+		QString sheet = QString::fromUtf8("font-weight: bold; font-size: %1px;")
+					.arg(qMax(14, fontInfo().pixelSize() * 3 / 2));
+
+		if (staging)
+			sheet += QString::fromUtf8(" color: %1;").arg(warpZoomStageColor().name(QColor::HexRgb));
+
+		zoomLabel->setStyleSheet(sheet);
+	}
+
+	/* Take, in the colour of the shot it would put up while there is one,
+	 * so the button that puts something on air is the one that stands out
+	 * when it can. */
+	void dressTake(bool armed)
+	{
+		if (takeDressed && takeArmed == armed)
+			return;
+
+		takeDressed = true;
+		takeArmed = armed;
+
+		takeButton->setStyleSheet(armed ? QString::fromUtf8("background-color: %1; color: #1a1205;")
+							  .arg(warpZoomStageColor().name(QColor::HexRgb))
+						: QString());
+	}
 
 	/* The picture is grabbed twice as often while a control is being ridden,
 	 * so what the operator is doing is seen as they do it rather than at the
@@ -2097,28 +3030,64 @@ private:
 			preview->setView(view);
 	}
 
-	QString selectedPreset() const
-	{
-		QListWidgetItem *item = presets->currentItem();
-
-		return item ? item->data(Qt::UserRole).toString() : QString();
-	}
-
-	QString selectedName() const
-	{
-		QListWidgetItem *item = presets->currentItem();
-
-		return item ? item->data(Qt::UserRole + 1).toString() : QString();
-	}
-
-	void recall(QListWidgetItem *item)
+	void recall(const QString &id)
 	{
 		OBSSourceAutoRelease source = zoomSource();
 
-		if (source && item)
-			warp_zoom_source_recall(source, WARP_UTF8(item->data(Qt::UserRole).toString()));
+		if (source && !id.isEmpty())
+			warp_zoom_source_recall(source, WARP_UTF8(id));
 
-		updateButtons();
+		refreshView();
+	}
+
+	/* One of the doublings under the bar. A jump rather than a nudge, so it
+	 * eases the way a preset recall does, and keeps the middle of the
+	 * picture where it is. */
+	void zoomTo(float zoom)
+	{
+		OBSSourceAutoRelease source = zoomSource();
+		warp_zoom_view view;
+
+		if (!source || !framingNow(source, &view))
+			return;
+
+		view.zoom = zoom;
+		warp_zoom_source_set(source, &view, -1);
+		refreshView();
+	}
+
+	/* the three things that change a preset, by the id it was made with */
+	void presetAction(WarpZoomTile::Action action, const QString &id, const QString &name)
+	{
+		OBSSourceAutoRelease source = zoomSource();
+
+		if (!source || id.isEmpty())
+			return;
+
+		if (action == WarpZoomTile::Update) {
+			warp_zoom_view view;
+
+			/* Whatever is being looked at: the shot lined up when
+			 * there is one, and otherwise the framing it is heading
+			 * for, so keeping a shot partway through a move keeps
+			 * the shot rather than wherever the move had got to. */
+			if (framingNow(source, &view))
+				warp_zoom_source_update_preset(source, WARP_UTF8(id), nullptr, &view, -1);
+		} else if (action == WarpZoomTile::Rename) {
+			bool ok = false;
+			QString typed = QInputDialog::getText(
+				this, QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Rename")),
+				QString::fromUtf8(obs_module_text("Warp.Zoom.Preset.Save.Prompt")), QLineEdit::Normal,
+				name, &ok);
+
+			if (ok && !typed.trimmed().isEmpty())
+				warp_zoom_source_update_preset(source, WARP_UTF8(id), WARP_UTF8(typed.trimmed()),
+							       nullptr, -1);
+		} else if (action == WarpZoomTile::Remove) {
+			warp_zoom_source_remove_preset(source, WARP_UTF8(id));
+		}
+
+		refreshLists();
 	}
 
 	void pan(float dx, float dy, int glide)
@@ -2149,19 +3118,6 @@ private:
 		calldata_set_int(&cd, "speed", speed);
 		proc_handler_call(obs_source_get_proc_handler(parent), "warp_set_speed", &cd);
 		calldata_free(&cd);
-	}
-
-	void updateButtons()
-	{
-		QListWidgetItem *item = presets->currentItem();
-		bool editable = item && !item->data(Qt::UserRole + 2).toBool();
-
-		/* the reset position is always there and always the whole
-		 * picture: it is recalled like any other preset and changed
-		 * like none of them */
-		updateButton->setEnabled(editable);
-		renameButton->setEnabled(editable);
-		removeButton->setEnabled(editable);
 	}
 
 	/* the sources that can be framed, and the presets of the one that is */
@@ -2229,33 +3185,60 @@ private:
 	{
 		OBSSourceAutoRelease source = zoomSource();
 		QVector<WarpZoomPresetRow> rows = warpZoomReadPresets(source);
-		QString selected = selectedPreset();
+		QStringList said;
 
-		QStringList labels;
+		/* everything a tile draws, so the tiles are remade when any of
+		 * it changes and left alone - hover, press and all - while the
+		 * dock merely ticks over */
+		for (const WarpZoomPresetRow &row : rows)
+			said << QString("%1|%2|%3|%4|%5|%6")
+					.arg(row.id, row.name)
+					.arg(row.view.zoom)
+					.arg(row.view.x)
+					.arg(row.view.y)
+					.arg(row.fixed);
 
-		for (int i = 0; i < rows.size(); i++)
-			labels << warpZoomPresetLabel(rows[i], i);
-
-		/* the list is rebuilt only when it has actually changed, so a
-		 * preset stays selected while the dock ticks over */
-		if (labels == shownPresets)
+		if (said == shownPresets)
 			return;
 
-		shownPresets = labels;
-		presets->clear();
+		shownPresets = said;
 
-		for (int i = 0; i < rows.size(); i++) {
-			auto *item = new QListWidgetItem(labels[i], presets);
-
-			item->setData(Qt::UserRole, rows[i].id);
-			item->setData(Qt::UserRole + 1, rows[i].name);
-			item->setData(Qt::UserRole + 2, rows[i].fixed);
-
-			if (rows[i].id == selected)
-				presets->setCurrentItem(item);
+		/* Put away rather than deleted on the spot: this is reached
+		 * from a tile's own click when a preset is removed, and a
+		 * widget is not deleted from inside the signal it is sending. */
+		for (WarpZoomTile *tile : tiles) {
+			tileCells->removeWidget(tile);
+			tile->hide();
+			tile->deleteLater();
 		}
 
-		updateButtons();
+		tiles.clear();
+
+		for (int i = 0; i < rows.size(); i++) {
+			auto *tile = new WarpZoomTile(rows[i], i, tileHost);
+			QString id = rows[i].id;
+			QString name = rows[i].name;
+
+			tile->setEditing(editing);
+			tile->onRecall = [this, id]() {
+				recall(id);
+			};
+			/* asked for once the click that asked has finished, as
+			 * renaming opens a window and removing remakes the tiles */
+			tile->onAction = [this, id, name](WarpZoomTile::Action action) {
+				QMetaObject::invokeMethod(
+					this, [this, action, id, name]() { presetAction(action, id, name); },
+					Qt::QueuedConnection);
+			};
+
+			tileCells->addWidget(tile);
+			tile->show();
+			tiles.append(tile);
+		}
+
+		/* the first tile is what says how much room a row of them
+		 * takes, which the picture is placed around */
+		fitParts();
 	}
 
 	void refreshView()
@@ -2286,17 +3269,43 @@ private:
 		const warp_zoom_view &shown = is_staged ? stage : heading;
 
 		if (!zoomSlider->isSliderDown())
-			zoomSlider->setValue((int)(shown.zoom * 100.0f));
+			zoomSlider->setValue(warpZoomToBar(shown.zoom));
 
 		zoomLabel->setText(QString("%1%").arg(qRound(shown.zoom * 100.0f)));
+		dressReadout(is_staged);
 
-		/* what the right-click menu says about confirm the next time it
-		 * is opened, kept here because the menu is built on demand */
+		for (int i = 0; i < stopButtons.size(); i++) {
+			stopButtons[i]->setEnabled(have);
+			stopButtons[i]->setChecked(have && std::fabs(shown.zoom - warpZoomStops[i]) < 0.005f);
+		}
+
+		/* which preset the picture is on, and which one is waiting */
+		for (WarpZoomTile *tile : tiles)
+			tile->setState(have && warpZoomSameView(heading, tile->row().view),
+				       is_staged && warpZoomSameView(stage, tile->row().view));
+
+		/* Direct or confirm, read back from the source every time: it is
+		 * the source's setting, and the properties window and a
+		 * websocket request can change it as well as the dock. */
 		canConfirm = have;
 		confirming = confirm_on;
 
-		takeButton->setVisible(is_staged);
-		dropButton->setVisible(is_staged);
+		directButton->setEnabled(have);
+		confirmButton->setEnabled(have);
+		directButton->setChecked(!confirm_on);
+		confirmButton->setChecked(confirm_on);
+
+		directHint->setVisible(!confirm_on);
+		takeButton->setVisible(confirm_on);
+		dropButton->setVisible(confirm_on);
+		takeButton->setEnabled(is_staged);
+		dropButton->setEnabled(is_staged);
+		/* where taking it would put the picture, on the button that
+		 * does it */
+		takeButton->setText(is_staged ? QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.TakeTo"))
+							.arg(qRound(stage.zoom * 100.0f))
+					      : QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Take")));
+		dressTake(is_staged);
 
 		preview->setStage(stage, is_staged);
 
@@ -2315,6 +3324,11 @@ private:
 		/* the speed controls are for the Warp sources; a camera with a
 		 * zoom filter on it has no playback to ride */
 		speedSlider->setEnabled(have_speed);
+
+		for (int i = 0; i < speedButtons.size(); i++) {
+			speedButtons[i]->setEnabled(have_speed);
+			speedButtons[i]->setChecked(have_speed && speed == warpZoomSpeeds[i]);
+		}
 
 		if (have_speed && speed >= WARP_FLOW_SPEED_MIN) {
 			if (!speedSlider->isSliderDown())
@@ -2345,28 +3359,73 @@ private:
 		}
 
 		OBSSourceAutoRelease parent = warpZoomParent(target);
+		WarpZoomFrame frame;
+
+		if (parent) {
+			OBSSourceAutoRelease source = zoomSource();
+			warp_zoom_view view = warp_zoom_default_view();
+			warp_zoom_view stage = warp_zoom_default_view();
+			bool is_staged = false;
+			bool confirm_on = false;
+			bool have = source && warp_zoom_source_get(source, &view, nullptr) &&
+				    warp_zoom_source_stage(source, &stage, &is_staged, &confirm_on);
+
+			/* On confirm the picture is the shot being looked at -
+			 * the one lined up, or the one on air while nothing is -
+			 * taken from under the zoom, so it can be lined up
+			 * anywhere in the picture rather than only inside what
+			 * is on air. Direct, what is looked at is what goes to
+			 * air, so that is what is grabbed. */
+			if (have && confirm_on) {
+				const warp_zoom_view &window = is_staged ? stage : view;
+
+				frame = grabber.grab(parent, &window,
+						     target.filterName.isEmpty() ? nullptr : source.Get());
+			} else {
+				frame = grabber.grab(parent);
+			}
+		}
 
 		preview->setLive(parent != nullptr);
-		preview->setImage(parent ? grabber.grab(parent) : QImage());
+		preview->setImage(frame.image, frame.whole, frame.window);
+
+		/* a source of another shape is a picture of another height */
+		if (preview->shape() != pictureShape)
+			fitParts();
 
 		refreshView();
 	}
 
+	QGridLayout *grid = nullptr;
+	QVBoxLayout *topBox = nullptr;
+	QBoxLayout *frameRow = nullptr;
+	QWidget *blockTop = nullptr;
+	QWidget *blockFrame = nullptr;
+	QWidget *blockPresets = nullptr;
+	QWidget *blockSpeed = nullptr;
+
 	QComboBox *targets = nullptr;
-	QCheckBox *follow = nullptr;
+	QPushButton *follow = nullptr;
+	WarpZoomPadButton *pictureButton = nullptr;
+	WarpZoomPreview *preview = nullptr;
+	QPushButton *directButton = nullptr;
+	QPushButton *confirmButton = nullptr;
+	QLabel *directHint = nullptr;
 	QPushButton *takeButton = nullptr;
 	QPushButton *dropButton = nullptr;
-	WarpZoomPreview *preview = nullptr;
 	WarpZoomPad *pad = nullptr;
+	WarpZoomRocker *rocker = nullptr;
 	QSlider *zoomSlider = nullptr;
 	QLabel *zoomLabel = nullptr;
-	WarpZoomPadButton *resetButton = nullptr;
-	QPushButton *updateButton = nullptr;
-	QPushButton *renameButton = nullptr;
-	QPushButton *removeButton = nullptr;
-	QListWidget *presets = nullptr;
+	QVector<QPushButton *> stopButtons;
+	QPushButton *editButton = nullptr;
+	QScrollArea *tileScroll = nullptr;
+	QWidget *tileHost = nullptr;
+	WarpZoomCells *tileCells = nullptr;
+	QVector<WarpZoomTile *> tiles;
 	QSlider *speedSlider = nullptr;
 	QLabel *speedLabel = nullptr;
+	QVector<QPushButton *> speedButtons;
 	QTimer *previewTimer = nullptr;
 	QTimer *refreshTimer = nullptr;
 
@@ -2377,12 +3436,22 @@ private:
 	 * drop the shot it had waiting */
 	WarpZoomTarget held;
 	WarpZoomGrabber grabber;
+	/* the shape of the picture the height it is given was worked out for */
+	QSize pictureShape;
 	bool loading = false;
 	bool minimal = false;
+	bool wide = false;
+	bool placed = false;
+	bool editing = false;
 	/* what the source the dock is pointed at has to say about confirm, for
 	 * the menu that is only built when it is asked for */
 	bool confirming = false;
 	bool canConfirm = false;
+	/* what the readout and Take were last dressed as */
+	bool readoutDressed = false;
+	bool readoutStaging = false;
+	bool takeDressed = false;
+	bool takeArmed = false;
 };
 
 /* ------------------------------------------------------------------------- */
