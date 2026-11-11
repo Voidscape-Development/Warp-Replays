@@ -72,7 +72,7 @@ Everything that would reframe the source stages instead — dragging the picture
 
 While a shot is waiting:
 
-* The dock's picture shows **the shot you are building** rather than what is on air, so you judge the framing by looking at it, with an amber border round it and a **STAGED** label beside the **ON AIR** one. The only pixels anyone has are the ones the source is putting out, so a shot lined up inside the live one — which is what tightening in from a wider shot always is, including the whole-picture start every clip gets — is exact. A shot that reaches outside it cannot be drawn from what is there, and those parts are hatched rather than invented.
+* The dock's picture shows **the shot you are building** rather than what is on air, so you judge the framing by looking at it, with an amber border round it and a **STAGED** label beside the **ON AIR** one. On confirm the dock takes its picture from under the zoom rather than through it, so a shot can be lined up **anywhere in the picture**, wherever the one on air happens to be: zoomed into the bottom right, the top left can still be found and framed, and is drawn at the detail it will have on air. Nothing on air moves while you do.
 * The corner map shows **both windows**: what is on air in white, and the shot waiting in dashed amber. A preset that is the shot waiting is outlined the same way.
 * **Take** puts it up, easing into it the way a preset recall does, and says the zoom it would go to. **Cancel** drops it. Both have hotkeys of their own, so a shot lined up in the dock can be taken from a Stream Deck, and both are websocket requests.
 

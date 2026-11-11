@@ -953,9 +953,14 @@ public:
 	 * drag while there is one */
 	std::function<void(bool)> onHold;
 
-	void setImage(const QImage &image)
+	/* The picture, and how it was taken: through the zoom, as it goes to
+	 * air, or from under it, in which case 'window' is the part of the whole
+	 * picture it holds. */
+	void setImage(const QImage &image, bool whole, const warp_zoom_view &window)
 	{
 		picture = image;
+		pictureWhole = whole;
+		pictureWindow = window;
 		update();
 	}
 
@@ -1010,8 +1015,11 @@ protected:
 				     area.y() + (area.height() - scaled.height()) / 2),
 			      scaled);
 
-		if (staged)
-			drawStaged(painter);
+		/* A picture taken off the source as it goes to air is the framing
+		 * on air and is drawn as it is. Anything else is a window being
+		 * drawn out of a picture taken through another one. */
+		if (staged || pictureWhole)
+			drawFramed(painter);
 		else
 			painter.drawImage(shown, picture);
 
@@ -1019,41 +1027,58 @@ protected:
 		drawBadge(painter);
 	}
 
-	/* Draws the staged shot out of the picture that is on air.
+	/* Draws the framing being looked at out of the picture there is.
 	 *
-	 * The only pixels anyone has are the ones the source is putting out,
-	 * framed as it is now, so a shot lined up inside that - which is what
-	 * tightening in from a wider shot always is - is exact. A shot that
-	 * reaches outside it cannot be drawn from what we have, and those parts
-	 * are left as hatching rather than invented. */
-	void drawStaged(QPainter &painter)
+	 * While the source is on confirm the picture is taken from under the
+	 * zoom rather than through it - the whole of what the source has, with
+	 * the window being looked at drawn straight out of it - so a shot can be
+	 * lined up anywhere in the picture and seen, wherever the one on air
+	 * happens to be. Lined up from a picture that had already been zoomed,
+	 * a shot outside the one on air had nothing to be drawn from.
+	 *
+	 * The picture on screen is the one grabbed a moment ago, through the
+	 * window that was wanted then, and the window wanted now has moved on if
+	 * a hand is on it. So it is drawn where it belongs in the window wanted
+	 * now, which keeps the picture under a drag rather than a grab behind
+	 * it. Whatever that leaves uncovered - a sliver at the edge for a frame
+	 * of a fast drag, or everything outside the shot on air for a picture
+	 * that was taken through the zoom - is hatched rather than invented. */
+	void drawFramed(QPainter &painter)
 	{
-		float live_window = 1.0f / framing.zoom;
-		float stage_window = 1.0f / stage.zoom;
+		const warp_zoom_view &from = pictureWhole ? pictureWindow : framing;
+		const warp_zoom_view &to = staged ? stage : framing;
+		float from_window = 1.0f / from.zoom;
+		float to_window = 1.0f / to.zoom;
 
-		/* the staged window, in fractions of the picture on screen */
-		double u0 = ((stage.x - stage_window * 0.5f) - (framing.x - live_window * 0.5f)) / live_window;
-		double v0 = ((stage.y - stage_window * 0.5f) - (framing.y - live_window * 0.5f)) / live_window;
-		double du = stage_window / live_window;
+		/* the window wanted, in fractions of the picture there is */
+		double u0 = ((to.x - to_window * 0.5f) - (from.x - from_window * 0.5f)) / from_window;
+		double v0 = ((to.y - to_window * 0.5f) - (from.y - from_window * 0.5f)) / from_window;
+		double du = to_window / from_window;
 
 		QRectF source(u0 * picture.width(), v0 * picture.height(), du * picture.width(), du * picture.height());
 		QRectF have = source.intersected(QRectF(0, 0, picture.width(), picture.height()));
 
 		painter.fillRect(shown, QBrush(QColor(70, 70, 74), Qt::BDiagPattern));
 
-		if (have.isEmpty() || source.width() <= 0.0 || source.height() <= 0.0)
+		if (!have.isEmpty() && source.width() > 0.0 && source.height() > 0.0) {
+			/* whatever part of the shot we do have goes in the
+			 * matching part of the frame, so it stays where it
+			 * belongs in the composition */
+			QRectF target(shown.x() + (have.left() - source.left()) / source.width() * shown.width(),
+				      shown.y() + (have.top() - source.top()) / source.height() * shown.height(),
+				      have.width() / source.width() * shown.width(),
+				      have.height() / source.height() * shown.height());
+
+			painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+			painter.drawImage(target, picture, have);
+			painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
+		}
+
+		if (!staged)
 			return;
 
-		/* whatever part of the shot we do have goes in the matching part
-		 * of the frame, so it stays where it belongs in the composition */
-		QRectF target(shown.x() + (have.left() - source.left()) / source.width() * shown.width(),
-			      shown.y() + (have.top() - source.top()) / source.height() * shown.height(),
-			      have.width() / source.width() * shown.width(),
-			      have.height() / source.height() * shown.height());
-
-		painter.drawImage(target, picture, have);
-
-		painter.setPen(QPen(QColor(224, 152, 44), 2));
+		painter.setPen(QPen(warpZoomStageColor(), 2));
+		painter.setBrush(Qt::NoBrush);
 		painter.drawRect(QRectF(shown).adjusted(1, 1, -1, -1));
 	}
 
@@ -1223,6 +1248,8 @@ private:
 	QPointF last;
 	warp_zoom_view framing = warp_zoom_default_view();
 	warp_zoom_view stage = warp_zoom_default_view();
+	warp_zoom_view pictureWindow = warp_zoom_default_view();
+	bool pictureWhole = false;
 	bool staged = false;
 	bool dragging = false;
 	bool live = false;
@@ -1231,6 +1258,15 @@ private:
 
 /* ------------------------------------------------------------------------- */
 /* grabbing the picture */
+
+/* a picture off a source, and how it was taken */
+struct WarpZoomFrame {
+	QImage image;
+	/* taken from under the zoom rather than through it, in which case
+	 * 'window' is the part of the whole picture the image holds */
+	bool whole = false;
+	warp_zoom_view window = warp_zoom_default_view();
+};
 
 class WarpZoomGrabber {
 public:
@@ -1248,14 +1284,25 @@ public:
 	 * before, which the GPU has long since finished: the picture runs a
 	 * grab behind, and nothing waits. Only the first grab after the
 	 * surfaces are made reads its own frame, so the dock never opens on
-	 * nothing. */
-	QImage grab(obs_source_t *source)
+	 * nothing.
+	 *
+	 * With a 'window' the picture is taken from under the zoom instead of
+	 * through it: the Warp Zoom filters in what is being drawn are told to
+	 * stand aside for this one render - only the filter 'only' names, when
+	 * it names one, so a scene framed through a filter of its own keeps the
+	 * zooms of whatever is inside it - and the window is drawn straight out
+	 * of the whole picture at the size of the grab. That is the shot as it
+	 * would look on air, at the detail a shot on air has, without anything
+	 * on air having moved. Each surface is kept with how its frame was
+	 * taken, since the frame handed back is the one from the grab before. */
+	WarpZoomFrame grab(obs_source_t *source, const warp_zoom_view *window = nullptr, obs_source_t *only = nullptr)
 	{
+		WarpZoomFrame frame;
 		uint32_t source_cx = obs_source_get_width(source);
 		uint32_t source_cy = obs_source_get_height(source);
 
 		if (!source_cx || !source_cy)
-			return QImage();
+			return frame;
 
 		uint32_t grab_cx = source_cx;
 		uint32_t grab_cy = source_cy;
@@ -1266,9 +1313,7 @@ public:
 		}
 
 		if (!grab_cx || !grab_cy)
-			return QImage();
-
-		QImage image;
+			return frame;
 
 		/* An async source only uploads its frames while it is being
 		 * shown, so a source that is not on air anywhere would be
@@ -1309,19 +1354,45 @@ public:
 		if (texrender && stages[0] && stages[1] && gs_texrender_begin(texrender, cx, cy)) {
 			struct vec4 clear;
 
+			float left = 0.0f;
+			float top = 0.0f;
+			float right = (float)source_cx;
+			float bottom = (float)source_cy;
+
+			if (window) {
+				float span = 1.0f / window->zoom;
+
+				left = (window->x - span * 0.5f) * (float)source_cx;
+				top = (window->y - span * 0.5f) * (float)source_cy;
+				right = left + span * (float)source_cx;
+				bottom = top + span * (float)source_cy;
+			}
+
 			vec4_zero(&clear);
 			gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
-			gs_ortho(0.0f, (float)source_cx, 0.0f, (float)source_cy, -100.0f, 100.0f);
+			gs_ortho(left, right, top, bottom, -100.0f, 100.0f);
 
 			gs_blend_state_push();
 			gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
 
+			/* asked for and taken back either side of the one render,
+			 * with the graphics context held throughout, so nothing
+			 * that goes to air is ever drawn while it is set */
+			if (window)
+				warp_zoom_filter_render_whole(true, only);
+
 			obs_source_video_render(source);
+
+			if (window)
+				warp_zoom_filter_render_whole(false, nullptr);
 
 			gs_blend_state_pop();
 			gs_texrender_end(texrender);
 
 			gs_stage_texture(stages[written], gs_texrender_get_texture(texrender));
+
+			taken[written].whole = window != nullptr;
+			taken[written].window = window ? *window : warp_zoom_default_view();
 
 			/* the frame staged on the grab before, or this one when
 			 * there has not been one since the surfaces were made */
@@ -1330,7 +1401,10 @@ public:
 			uint32_t linesize = 0;
 
 			if (gs_stagesurface_map(stages[read], &data, &linesize)) {
-				image = QImage(data, (int)cx, (int)cy, (int)linesize, QImage::Format_RGBA8888).copy();
+				frame.image =
+					QImage(data, (int)cx, (int)cy, (int)linesize, QImage::Format_RGBA8888).copy();
+				frame.whole = taken[read].whole;
+				frame.window = taken[read].window;
 				gs_stagesurface_unmap(stages[read]);
 			}
 
@@ -1342,7 +1416,7 @@ public:
 
 		obs_source_dec_showing(source);
 
-		return image;
+		return frame;
 	}
 
 	void release()
@@ -1376,6 +1450,8 @@ private:
 
 	gs_texrender_t *texrender = nullptr;
 	gs_stagesurf_t *stages[2] = {nullptr, nullptr};
+	/* how the frame in each surface was taken; the image is left empty */
+	WarpZoomFrame taken[2];
 	/* the surface the next frame is copied into, and whether the other
 	 * one holds a frame copied out on an earlier grab */
 	size_t written = 0;
@@ -3283,9 +3359,35 @@ private:
 		}
 
 		OBSSourceAutoRelease parent = warpZoomParent(target);
+		WarpZoomFrame frame;
+
+		if (parent) {
+			OBSSourceAutoRelease source = zoomSource();
+			warp_zoom_view view = warp_zoom_default_view();
+			warp_zoom_view stage = warp_zoom_default_view();
+			bool is_staged = false;
+			bool confirm_on = false;
+			bool have = source && warp_zoom_source_get(source, &view, nullptr) &&
+				    warp_zoom_source_stage(source, &stage, &is_staged, &confirm_on);
+
+			/* On confirm the picture is the shot being looked at -
+			 * the one lined up, or the one on air while nothing is -
+			 * taken from under the zoom, so it can be lined up
+			 * anywhere in the picture rather than only inside what
+			 * is on air. Direct, what is looked at is what goes to
+			 * air, so that is what is grabbed. */
+			if (have && confirm_on) {
+				const warp_zoom_view &window = is_staged ? stage : view;
+
+				frame = grabber.grab(parent, &window,
+						     target.filterName.isEmpty() ? nullptr : source.Get());
+			} else {
+				frame = grabber.grab(parent);
+			}
+		}
 
 		preview->setLive(parent != nullptr);
-		preview->setImage(parent ? grabber.grab(parent) : QImage());
+		preview->setImage(frame.image, frame.whole, frame.window);
 
 		/* a source of another shape is a picture of another height */
 		if (preview->shape() != pictureShape)
