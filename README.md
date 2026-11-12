@@ -465,7 +465,7 @@ The Warp window shows an instant replay flow as *Loaded* or *Empty* rather than 
 Ideas that are designed but not built yet live in [ROADMAP.md](ROADMAP.md), with notes to pick them up from:
 
 * **In-memory replay buffer** — keep the last few minutes of the stream's encoded packets in memory and play replays straight out of them, with no save to wait for.
-* Background probing of playlist files, a playlist panel in the Warp window, and the test harness in CI.
+* Background probing of playlist files, a playlist panel in the Warp window, and the render tests in CI.
 
 ## Building
 
@@ -481,6 +481,16 @@ cmake --build --preset ubuntu-x86_64
 ```
 
 GitHub Actions workflows build the plugin for Windows, macOS, and Ubuntu on every push and pull request.
+
+### Render tests
+
+`tests/` holds a harness that runs libobs headless on Linux, loads the plugin, plays real clips through Warp Media and Warp Playlist sources, and checks what the Warp Progress Bar and Warp Status Icon draw, pixel by pixel. It is run by hand, not in CI:
+
+```sh
+tests/run-render-tests.sh
+```
+
+See [tests/README.md](tests/README.md) for what it needs installed and what it checks.
 
 ## License
 
