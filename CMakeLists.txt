@@ -63,6 +63,7 @@ target_sources(
     src/warp-zoom-filter.c
     src/warp-overlay.c
     src/warp-progress-source.c
+    src/warp-status-icon-source.c
     src/media-playback/decode.c
     src/media-playback/media.c
     src/media-playback/stretch.c

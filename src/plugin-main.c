@@ -35,6 +35,7 @@ extern struct obs_source_info warp_playlist_source_info;
 extern struct obs_source_info warp_detection_filter_info;
 extern struct obs_source_info warp_zoom_filter_info;
 extern struct obs_source_info warp_progress_source_info;
+extern struct obs_source_info warp_status_icon_source_info;
 
 #ifdef WARP_HAVE_FRONTEND
 extern void warp_register_tools_menu(void);
@@ -48,6 +49,7 @@ bool obs_module_load(void)
 	obs_register_source(&warp_detection_filter_info);
 	obs_register_source(&warp_zoom_filter_info);
 	obs_register_source(&warp_progress_source_info);
+	obs_register_source(&warp_status_icon_source_info);
 
 #ifdef WARP_HAVE_FRONTEND
 	warp_register_tools_menu();
