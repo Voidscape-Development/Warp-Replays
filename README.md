@@ -46,6 +46,37 @@ Media controls (the ones in the OBS media controls dock) apply to the playlist: 
 
 Every playlist action can also be driven from outside OBS — see [obs-websocket control](#obs-websocket-control).
 
+### Warp Progress Bar
+
+A source that draws how far through its replay a Warp Media or Warp Playlist source is, to sit over the replay on air. Add it like any other source and pick the source it **follows** from the list at the top of its properties. It is kept by the source itself rather than its name, so renaming the replay source does not lose it, and a source that is not there yet — a scene collection still loading — is picked up as soon as it is.
+
+* **What it measures**: the file that is playing, from its start to its end, or the clip of it when the file is played as one — the same position and length the media controls show. For a playlist it starts again with every file.
+* **Shape**: a **horizontal bar**, a **vertical bar** or a **ring**. The bars fill left to right or bottom to top, or the other way round; the ring fills clockwise from the top. Bars take a **corner radius**, and the ring **rounded ends**.
+* **Colors**: the fill, a **gradient** along it to a second color, the background track (with its own opacity, down to none), a **border** of any width, and a **playhead** marker at the position.
+* **Color by state**: a fill color of its own while **paused** (stepping pauses), in **slow motion**, played **fast**, and once it has **ended**. The fill fades from one to the next.
+* **Time**: the elapsed time, the time remaining, either of them over the total, or a percentage, above or below the bar or on it (in the middle of a ring), in any font. **Count time at the playback speed** makes it time on the clock rather than in the clip: at 50%, a clip with 4 seconds left reads 8. The bar itself always shows how much of the clip has played.
+* **Smooth motion**: the fill glides every frame between the positions the source reports, rather than ticking with the frames of the video. A seek, a frame step or a new file is followed at once.
+* **Playlist transitions**: when a playlist moves to another file, the fill eases back from where the outgoing file left it to the incoming one over the length of the transition, so it runs back as the picture changes rather than snapping to the start while the old file is still on screen. A cut, or a switch with no transition, snaps.
+* **When there is nothing to show**: what a stopped source, an ended one, and one with nothing loaded each look like — empty, full, the last position, or hidden. By default an ended replay shows full and the bar is hidden otherwise.
+* **Hide while off air**: fades the bar out whenever the source it follows is not in the program output, so it can sit in a scene of its own on top of everything and only show while a replay is on air.
+
+The source is as big as the bar or ring is set to be, plus a band for the time when it is above or below, so it lines up in a scene like any other source.
+
+### Warp Status Icon
+
+A source that shows what a Warp Media or Warp Playlist source is doing, as an icon over the replay on air, following a source the same way the [progress bar](#warp-progress-bar) does.
+
+* **The state, all along**: play, pause, stopped and ended. With **Hide while playing normally** on (the default) nothing shows while the replay plays at 100%, so the icon only comes up when something is out of the ordinary; going back into play still flashes the play icon.
+* **What just happened, for a moment**: a **frame step** forward or back, with the frames stepped beside it (steps the same way in a row add up, so holding the key reads +7 rather than +1 seven times); a **speed change**, with the new speed; and **next**, **previous** and **restart**. Each is shown for a set time — a second by default — and then gives way back to the state. A playlist rolling on to its next file by itself is not flashed.
+* **Speed**: slow motion and fast have icons of their own, shown for as long as the speed is not 100%. With **Show the speed as a badge** on, the badge sits in the corner of play or pause — paused in slow motion reads as both; with it off, the speed icon takes play's place.
+* **Look**: built-in icons drawn at whatever size the source is, so they stay sharp; their color; a **background** circle or rounded square behind them with a color and opacity of its own; a **drop shadow**; and the **value** — the speed or the frames stepped — to the right of the icon or below it, in any font and color. Changes **fade** from one icon to the next.
+* **Own images**: any icon can be replaced by an image file of your own, one per state, drawn inside the icon's background.
+* **Hide while off air**, the same as the progress bar's.
+
+Each kind of thing it shows — steps, speed, and next/previous/restart — can be turned off on its own.
+
+Both sources follow their source through the `warp_playlist_switched` signal and the [signals](#warp-detection-filter) the Warp sources already emit, so they react to a hotkey, the media controls, a flow, a Warp Detection filter or a [websocket request](#obs-websocket-control) alike. Which source they follow can be changed over obs-websocket too, with [`SetOverlayTarget`](#overlay-requests).
+
 ### Zoom
 
 Every Warp source can be zoomed into and panned around while it plays, and so can any other source, through the **Warp Zoom** filter. It is one system in three places: the filter that draws it, the presets a framing is kept as, and the dock an operator works it from.
@@ -162,6 +193,14 @@ warp_zoom_changed(ptr source, float zoom, float x, float y, string change, strin
 warp_zoom_staged(ptr source, bool staged, float zoom, float x, float y, string change, string preset)
 ```
 
+A Warp Playlist also emits one of its own as each file goes up in place of the one before it:
+
+```
+warp_playlist_switched(ptr source, string reason, int transition_ms)
+```
+
+`reason` is `next` or `previous` when one was asked for (a hotkey, the media controls, a websocket request), `first` when the playlist was sent back to its first file, `start` when it started up — loaded, put on screen, or played after a stop — and `auto` when it moved on by itself as a file ran out. `transition_ms` is how long the transition it runs through takes, or 0 for a cut. The file going up is the one the media controls report from the moment it fires, while the one going out is still on screen under the transition for that long.
+
 On `warp_zoom_changed`, `zoom` is 1 for the whole picture and up to 8 at the tightest, `x` and `y` are where the middle of what is shown sits in the file, and `change` is `manual`, `preset`, `reset` or `set`, with `preset` naming the preset when one was recalled. A Warp Zoom filter emits it on itself. `warp_zoom_staged` reports a shot being [lined up](#lining-a-shot-up), and again with `staged` false as it is taken or dropped; nothing has moved on screen when it fires.
 
 For the rest, `change` is `set`, `increased` or `decreased`; `frames` is negative when stepping backward; `action` is `play`, `pause` or `restart`. The speed a file starts at is not a change: a playlist moving to its next file resets the speed without emitting anything. `warp_media_action` reports commands, so playback a source drives by itself — restarting as it goes on screen, the pause a frame step does first, a playlist rolling on to its next file — emits nothing.
@@ -235,6 +274,19 @@ Nine more frame the source rather than driving playback, and are the one group t
 | `DropZoom` | | Drops the shot that is lined up, leaving the picture where it is |
 
 `glide` is how long the move takes, in milliseconds; leave it out for the source's own preset glide, or send `0` for a move that lands at once. Every one of these answers with `zoomPresets`, so a control surface can lay out its buttons from the reply it already has.
+
+#### Overlay requests
+
+Two requests work on a [Warp Progress Bar](#warp-progress-bar) or [Warp Status Icon](#warp-status-icon) instead, named by `sourceName` or `sourceUuid`, so a control surface can move a replay's bar and icon over to whichever replay source is about to go on air:
+
+| Request | Fields | What it does |
+| --- | --- | --- |
+| `SetOverlayTarget` | `targetName` or `targetUuid` | Has the overlay follow that Warp Media or Warp Playlist source. Leave both out, or empty, to have it follow nothing |
+| `GetOverlayTarget` | | Changes nothing, and answers with what the overlay follows |
+
+Both answer with `sourceName`, `sourceUuid` and `sourceKind` for the overlay, and `targetName` and `targetUuid` for what it follows — empty when it follows nothing, and the name empty as well when the source it follows is not in the scene collection.
+
+#### Responses
 
 Every response says whether the request was carried out, and reports where playback stands afterwards, so a control surface can follow the source without asking again:
 

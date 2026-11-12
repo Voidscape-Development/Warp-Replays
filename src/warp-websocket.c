@@ -28,6 +28,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "obs-websocket-api.h"
 #include "warp-events.h"
+#include "warp-overlay.h"
 #include "warp-websocket.h"
 #include "warp-zoom.h"
 
@@ -893,6 +894,131 @@ static void warp_ws_flow_cb(obs_data_t *request, obs_data_t *response, void *pri
 #endif /* WARP_HAVE_FRONTEND_API */
 
 /* ------------------------------------------------------------------------- */
+/* the overlays
+ *
+ * A Warp Progress Bar or Warp Status Icon is pointed at the Warp source it
+ * follows with SetOverlayTarget, so a control surface can move a replay's bar
+ * and icon over to whichever source is about to go on air:
+ *
+ *   {"vendorName": "warp", "requestType": "SetOverlayTarget",
+ *    "requestData": {"sourceName": "Replay Bar", "targetName": "Replay 2"}}
+ *
+ * The overlay is named by "sourceName" or "sourceUuid", the Warp source it is
+ * to follow by "targetName" or "targetUuid"; an empty target, or none, leaves
+ * it following nothing. GetOverlayTarget answers with what it follows now. */
+
+enum warp_ws_overlay_action {
+	WARP_WS_OVERLAY_SET,
+	WARP_WS_OVERLAY_GET,
+};
+
+struct warp_ws_overlay_request {
+	const char *type;
+	enum warp_ws_overlay_action action;
+};
+
+static struct warp_ws_overlay_request warp_ws_overlay_requests[] = {
+	{"SetOverlayTarget", WARP_WS_OVERLAY_SET},
+	{"GetOverlayTarget", WARP_WS_OVERLAY_GET},
+};
+
+static bool warp_ws_is_overlay(obs_source_t *source)
+{
+	const char *id = obs_source_get_id(source);
+
+	return id && (strcmp(id, WARP_PROGRESS_SOURCE_ID) == 0 || strcmp(id, WARP_STATUS_ICON_SOURCE_ID) == 0);
+}
+
+static bool warp_ws_is_warp_source(obs_source_t *source)
+{
+	const char *id = obs_source_get_id(source);
+
+	return id && (strcmp(id, WARP_MEDIA_SOURCE_ID) == 0 || strcmp(id, WARP_PLAYLIST_SOURCE_ID) == 0);
+}
+
+/* a source named by '<prefix>Uuid' or '<prefix>Name' in the request, with a
+ * reference, or NULL; 'named' says whether the request named one at all */
+static obs_source_t *warp_ws_named_source(obs_data_t *request, const char *uuid_field, const char *name_field,
+					  bool *named)
+{
+	const char *uuid = obs_data_get_string(request, uuid_field);
+	const char *name = obs_data_get_string(request, name_field);
+
+	*named = (uuid && *uuid) || (name && *name);
+
+	if (uuid && *uuid)
+		return obs_get_source_by_uuid(uuid);
+	if (name && *name)
+		return obs_get_source_by_name(name);
+
+	return NULL;
+}
+
+static void warp_ws_add_overlay_status(obs_source_t *overlay, obs_data_t *response)
+{
+	obs_data_t *settings = obs_source_get_settings(overlay);
+	const char *uuid = obs_data_get_string(settings, WARP_OVERLAY_TARGET);
+	obs_source_t *target = uuid && *uuid ? obs_get_source_by_uuid(uuid) : NULL;
+
+	obs_data_set_string(response, "sourceName", obs_source_get_name(overlay));
+	obs_data_set_string(response, "sourceUuid", obs_source_get_uuid(overlay));
+	obs_data_set_string(response, "sourceKind", obs_source_get_id(overlay));
+	obs_data_set_string(response, "targetUuid", uuid ? uuid : "");
+	obs_data_set_string(response, "targetName", target ? obs_source_get_name(target) : "");
+
+	obs_source_release(target);
+	obs_data_release(settings);
+}
+
+static void warp_ws_overlay_cb(obs_data_t *request, obs_data_t *response, void *priv_data)
+{
+	const struct warp_ws_overlay_request *req = priv_data;
+	bool named;
+	obs_source_t *overlay = warp_ws_named_source(request, "sourceUuid", "sourceName", &named);
+
+	if (!overlay) {
+		warp_ws_fail(response, named ? "there is no such source" : "sourceName or sourceUuid is required");
+		return;
+	}
+
+	if (!warp_ws_is_overlay(overlay)) {
+		warp_ws_fail(response, "'%s' is not a Warp Progress Bar or Warp Status Icon source",
+			     obs_source_get_name(overlay));
+		obs_source_release(overlay);
+		return;
+	}
+
+	if (req->action == WARP_WS_OVERLAY_SET) {
+		obs_source_t *target = warp_ws_named_source(request, "targetUuid", "targetName", &named);
+
+		if (named && !target) {
+			warp_ws_fail(response, "there is no such target source");
+			obs_source_release(overlay);
+			return;
+		}
+
+		if (target && !warp_ws_is_warp_source(target)) {
+			warp_ws_fail(response, "'%s' is not a Warp Media or Warp Playlist source",
+				     obs_source_get_name(target));
+			obs_source_release(target);
+			obs_source_release(overlay);
+			return;
+		}
+
+		obs_data_t *settings = obs_data_create();
+
+		obs_data_set_string(settings, WARP_OVERLAY_TARGET, target ? obs_source_get_uuid(target) : "");
+		obs_source_update(overlay, settings);
+		obs_data_release(settings);
+		obs_source_release(target);
+	}
+
+	obs_data_set_bool(response, "success", true);
+	warp_ws_add_overlay_status(overlay, response);
+	obs_source_release(overlay);
+}
+
+/* ------------------------------------------------------------------------- */
 
 static void warp_ws_request_cb(obs_data_t *request, obs_data_t *response, void *priv_data)
 {
@@ -934,6 +1060,15 @@ void warp_websocket_register(void)
 		struct warp_ws_request *req = &warp_ws_requests[i];
 
 		if (obs_websocket_vendor_register_request(warp_ws_vendor, req->type, warp_ws_request_cb, req))
+			registered++;
+		else
+			obs_log(LOG_WARNING, "could not register the '%s' vendor request", req->type);
+	}
+
+	for (size_t i = 0; i < sizeof(warp_ws_overlay_requests) / sizeof(*warp_ws_overlay_requests); i++) {
+		struct warp_ws_overlay_request *req = &warp_ws_overlay_requests[i];
+
+		if (obs_websocket_vendor_register_request(warp_ws_vendor, req->type, warp_ws_overlay_cb, req))
 			registered++;
 		else
 			obs_log(LOG_WARNING, "could not register the '%s' vendor request", req->type);
