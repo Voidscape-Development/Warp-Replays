@@ -55,6 +55,10 @@ A source that draws how far through its replay a Warp Media or Warp Playlist sou
   * **Broadcast** (the default): a thin bar over a pale glass track, its warm fill lit along the top and glowing at its leading edge, a knob at the position, and the time in a dark chip riding along above it.
   * **Segmented**: a white strip counted off into 24 pieces.
   * **Sport**: slanted ends and a cyan-to-blue fill with a line for a head, the time in a chip slanted to match.
+  * **Scoreboard**: a chunky square block in amber on black, with the time printed inside it.
+  * **Glass**: a frosted white capsule with a pale rim, the time in dark type on a white chip — at its best over dark pictures.
+  * **Neon**: a thin tube of magenta into cyan, glowing hard, with the time in cyan.
+  * **Gold**: gold leaf, brightly lit and edged darker, with a pale gold knob.
   * **Minimal**: a red hairline with a dot at the position.
   * **Flat**: plain shapes with no light, glow or shadow.
 * **Shape**: a **horizontal bar**, a **vertical bar** or a **ring**. The bars fill left to right or bottom to top, or the other way round; the ring fills clockwise from the top. Bars take a **corner radius** and **slanted ends**, and the ring **rounded ends**. Any of them can be cut into **segments**.
@@ -79,9 +83,17 @@ A source that shows what a Warp Media or Warp Playlist source is doing, as an ic
 * **Style**: a starting point for the look, filled in the same way as the progress bar's.
   * **Chip** (the default): the icon and what it means in one dark pill with an accent rim — `PAUSED`, `SLOW MO 50%`, `FRAME +5` — that widens and narrows smoothly as the words change, with the replay's progress as a fine accent line under them.
   * **Badge**: the icon on a disc whose rim fills round with the replay's progress, the speed as an accent pip in its corner, and the value beside it.
+  * **Tag**: a square sports tag — the icon dark on an amber block, the words white on black after it.
+  * **Sport**: the tag leaning forward, in cyan and navy.
+  * **Glass**: a frosted white pill with dark type.
+  * **Neon**: the icon alone in pale cyan, its shadow turned into a glow.
+  * **Outline**: line art — an empty ring that fills round with the progress, and the icon.
   * **Minimal**: the icon alone, lifted off the picture by a soft shadow.
   * **Flat**: the icon on a plain disc, with no rounding or motion.
+
+  Several are made to go together: the Sport bar and icon, Scoreboard and Tag, Glass and Glass, Neon and Neon.
 * **Text**: what the icon means (`PAUSED`, `SLOW MO`), its value (the speed, or the frames stepped), or both, in any font and color — inside the chip, or to the right of the icon or below it.
+* **Chip**: a pill, a rounded rectangle, a square or a slanted parallelogram, with the icon on a **block of the accent** at its start when wanted, the way a sports tag is cut.
 * **Look**: built-in icons drawn at whatever size the source is, so they stay sharp, with their corners **rounded** off; their color; a **background** circle or rounded square behind them with a color and opacity of its own; an **accent** rim, and the replay's **progress** shown in it; and a **drop shadow**. Changes **fade** from one icon to the next, and a new icon **pops in**.
 * **Own images**: any icon can be replaced by an image file of your own, one per state, drawn inside the icon's background.
 * **Hide while off air**, the same as the progress bar's.

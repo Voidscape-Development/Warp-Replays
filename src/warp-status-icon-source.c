@@ -114,6 +114,8 @@ static const char *warp_icon_label_text[WARP_ICON_COUNT] = {
 #define S_ACCENT_WIDTH "accent_width"
 #define S_SHOW_PROGRESS "show_progress"
 #define S_ROUNDED "rounded_glyphs"
+#define S_CHIP_SHAPE "chip_shape"
+#define S_ACCENT_BLOCK "accent_block"
 #define S_POP "pop"
 #define S_SHADOW "shadow"
 #define S_SHADOW_COLOR "shadow_color"
@@ -139,6 +141,16 @@ static const char *warp_icon_label_text[WARP_ICON_COUNT] = {
 #define STYLE_BADGE "badge"
 #define STYLE_MINIMAL "minimal"
 #define STYLE_FLAT "flat"
+#define STYLE_NEON "neon"
+#define STYLE_GLASS "glass"
+#define STYLE_TAG "tag"
+#define STYLE_SPORT "sport"
+#define STYLE_OUTLINE "outline"
+
+#define SHAPE_PILL "pill"
+#define SHAPE_ROUNDED "rounded"
+#define SHAPE_SQUARE "square"
+#define SHAPE_SLANTED "slanted"
 
 #define LAYOUT_CHIP "chip"
 #define LAYOUT_BESIDE "beside"
@@ -167,6 +179,13 @@ static const char *warp_icon_label_text[WARP_ICON_COUNT] = {
 #define POP_SECONDS 0.24f
 /* how far a glyph's corners are rounded, in glyph units */
 #define GLYPH_ROUND 0.09f
+
+enum warp_icon_chip_shape {
+	WARP_ICON_CHIP_PILL,
+	WARP_ICON_CHIP_ROUNDED,
+	WARP_ICON_CHIP_SQUARE,
+	WARP_ICON_CHIP_SLANTED,
+};
 
 enum warp_icon_content {
 	WARP_ICON_CONTENT_VALUE,
@@ -197,6 +216,9 @@ struct warp_icon_source {
 	/* settings; the update runs on the graphics thread for a video
 	 * source, which is where they are read */
 	bool chip;
+	enum warp_icon_chip_shape chip_shape;
+	/* the glyph sits on a block of the accent color at the chip's start */
+	bool accent_block;
 	uint32_t size;
 	float plate_shape;
 	float glyph_scale;
@@ -312,7 +334,14 @@ static void warp_icon_update(void *data, obs_data_t *settings)
 
 	warp_overlay_target_set(&s->target, obs_data_get_string(settings, WARP_OVERLAY_TARGET));
 
+	const char *chip_shape = obs_data_get_string(settings, S_CHIP_SHAPE);
+
 	s->chip = strcmp(obs_data_get_string(settings, S_LAYOUT), LAYOUT_CHIP) == 0;
+	s->chip_shape = strcmp(chip_shape, SHAPE_ROUNDED) == 0   ? WARP_ICON_CHIP_ROUNDED
+			: strcmp(chip_shape, SHAPE_SQUARE) == 0  ? WARP_ICON_CHIP_SQUARE
+			: strcmp(chip_shape, SHAPE_SLANTED) == 0 ? WARP_ICON_CHIP_SLANTED
+								 : WARP_ICON_CHIP_PILL;
+	s->accent_block = obs_data_get_bool(settings, S_ACCENT_BLOCK);
 	s->size = (uint32_t)obs_data_get_int(settings, S_SIZE);
 	s->plate_shape = strcmp(plate, PLATE_CIRCLE) == 0 ? 1.0f : strcmp(plate, PLATE_ROUNDED) == 0 ? 2.0f : 0.0f;
 	s->glyph_scale = (float)obs_data_get_int(settings, S_GLYPH_SCALE) / 100.0f;
@@ -443,6 +472,8 @@ static void warp_icon_apply_style(obs_data_t *settings, const char *style, bool 
 	set_bool(&w, S_TEXT_SHADOW, true);
 	set_int(&w, S_GLYPH_SCALE, 46);
 	set_string(&w, S_TEXT_POSITION, POS_RIGHT);
+	set_string(&w, S_CHIP_SHAPE, SHAPE_PILL);
+	set_bool(&w, S_ACCENT_BLOCK, false);
 
 	if (strcmp(style, STYLE_BADGE) == 0) {
 		/* a disc with the replay's progress running round its rim */
@@ -460,6 +491,76 @@ static void warp_icon_apply_style(obs_data_t *settings, const char *style, bool 
 		set_int(&w, S_SIZE, 96);
 		set_int(&w, S_GLYPH_SCALE, 62);
 		set_bool(&w, S_SHADOW, true);
+		set_string(&w, S_TEXT_CONTENT, CONTENT_VALUE);
+		set_font_size(&w, 40);
+	} else if (strcmp(style, STYLE_NEON) == 0) {
+		/* the glyph alone in cyan, its shadow turned into a glow */
+		set_string(&w, S_LAYOUT, LAYOUT_BESIDE);
+		set_string(&w, S_PLATE, PLATE_NONE);
+		set_int(&w, S_PLATE_COLOR, ARGB(0xCC0A0A14));
+		set_int(&w, S_SIZE, 96);
+		set_int(&w, S_GLYPH_SCALE, 60);
+		set_int(&w, S_GLYPH_COLOR, ARGB(0xFFB8F7FF));
+		set_bool(&w, S_SHADOW, true);
+		set_int(&w, S_SHADOW_COLOR, ARGB(0xB321E6FF));
+		set_int(&w, S_SHADOW_DISTANCE, 0);
+		set_int(&w, S_SHADOW_BLUR, 18);
+		set_int(&w, S_ACCENT_COLOR, ARGB(0xFFFF2BD6));
+		set_int(&w, S_TEXT_COLOR, ARGB(0xFF8FF3FF));
+		set_string(&w, S_TEXT_CONTENT, CONTENT_VALUE);
+		set_font_size(&w, 40);
+	} else if (strcmp(style, STYLE_GLASS) == 0) {
+		/* a frosted white pill with dark type, for dark pictures */
+		set_string(&w, S_LAYOUT, LAYOUT_CHIP);
+		set_int(&w, S_SIZE, 68);
+		set_int(&w, S_PLATE_COLOR, ARGB(0xE0F4F5F7));
+		set_int(&w, S_GLYPH_COLOR, ARGB(0xFF141418));
+		set_int(&w, S_TEXT_COLOR, ARGB(0xFF141418));
+		set_int(&w, S_ACCENT_COLOR, ARGB(0x66141418));
+		set_int(&w, S_ACCENT_WIDTH, 1);
+		set_bool(&w, S_SHOW_PROGRESS, true);
+		set_bool(&w, S_TEXT_SHADOW, false);
+		set_string(&w, S_TEXT_CONTENT, CONTENT_BOTH);
+		set_font_size(&w, 26);
+	} else if (strcmp(style, STYLE_TAG) == 0) {
+		/* a square sports tag: the glyph dark on an amber block, the
+		 * words white on black */
+		set_string(&w, S_LAYOUT, LAYOUT_CHIP);
+		set_string(&w, S_CHIP_SHAPE, SHAPE_SQUARE);
+		set_bool(&w, S_ACCENT_BLOCK, true);
+		set_int(&w, S_SIZE, 64);
+		set_int(&w, S_PLATE_COLOR, ARGB(0xEB101014));
+		set_int(&w, S_GLYPH_COLOR, ARGB(0xFF101014));
+		set_bool(&w, S_SHOW_PROGRESS, true);
+		set_bool(&w, S_TEXT_SHADOW, false);
+		set_string(&w, S_TEXT_CONTENT, CONTENT_BOTH);
+		set_font_size(&w, 26);
+	} else if (strcmp(style, STYLE_SPORT) == 0) {
+		/* the tag leaning forward, in the sport bar's cyan and navy */
+		set_string(&w, S_LAYOUT, LAYOUT_CHIP);
+		set_string(&w, S_CHIP_SHAPE, SHAPE_SLANTED);
+		set_bool(&w, S_ACCENT_BLOCK, true);
+		set_int(&w, S_SIZE, 64);
+		set_int(&w, S_PLATE_COLOR, ARGB(0xEB0B1020));
+		set_int(&w, S_ACCENT_COLOR, ARGB(0xFF19E3FF));
+		set_int(&w, S_GLYPH_COLOR, ARGB(0xFF0B1020));
+		set_bool(&w, S_SHOW_PROGRESS, true);
+		set_bool(&w, S_TEXT_SHADOW, false);
+		set_string(&w, S_TEXT_CONTENT, CONTENT_BOTH);
+		set_font_size(&w, 26);
+	} else if (strcmp(style, STYLE_OUTLINE) == 0) {
+		/* line art: an empty ring that is the progress, and the glyph */
+		set_string(&w, S_LAYOUT, LAYOUT_BESIDE);
+		set_string(&w, S_PLATE, PLATE_CIRCLE);
+		set_int(&w, S_PLATE_COLOR, ARGB(0x00000000));
+		set_int(&w, S_SIZE, 104);
+		set_int(&w, S_ACCENT_COLOR, ARGB(0xFFFFFFFF));
+		set_int(&w, S_ACCENT_WIDTH, 4);
+		set_bool(&w, S_SHOW_PROGRESS, true);
+		set_bool(&w, S_SHADOW, true);
+		set_int(&w, S_SHADOW_COLOR, ARGB(0x80000000));
+		set_int(&w, S_SHADOW_DISTANCE, 1);
+		set_int(&w, S_SHADOW_BLUR, 4);
 		set_string(&w, S_TEXT_CONTENT, CONTENT_VALUE);
 		set_font_size(&w, 40);
 	} else if (strcmp(style, STYLE_FLAT) == 0) {
@@ -517,6 +618,8 @@ static bool warp_icon_modified(obs_properties_t *props, obs_property_t *prop, ob
 	bool text = obs_data_get_bool(settings, S_VALUE_TEXT);
 
 	obs_property_set_visible(obs_properties_get(props, S_PLATE), !chip);
+	obs_property_set_visible(obs_properties_get(props, S_CHIP_SHAPE), chip);
+	obs_property_set_visible(obs_properties_get(props, S_ACCENT_BLOCK), chip);
 	obs_property_set_visible(obs_properties_get(props, S_PLATE_COLOR), plate);
 	obs_property_set_visible(obs_properties_get(props, S_ACCENT_COLOR), plate);
 	obs_property_set_visible(obs_properties_get(props, S_ACCENT_WIDTH), plate);
@@ -564,6 +667,11 @@ static obs_properties_t *warp_icon_properties(void *data)
 	obs_property_list_add_string(p, obs_module_text("Warp.Icon.Style.Chip"), STYLE_CHIP);
 	obs_property_list_add_string(p, obs_module_text("Warp.Icon.Style.Badge"), STYLE_BADGE);
 	obs_property_list_add_string(p, obs_module_text("Warp.Icon.Style.Minimal"), STYLE_MINIMAL);
+	obs_property_list_add_string(p, obs_module_text("Warp.Icon.Style.Tag"), STYLE_TAG);
+	obs_property_list_add_string(p, obs_module_text("Warp.Icon.Style.Sport"), STYLE_SPORT);
+	obs_property_list_add_string(p, obs_module_text("Warp.Icon.Style.Glass"), STYLE_GLASS);
+	obs_property_list_add_string(p, obs_module_text("Warp.Icon.Style.Neon"), STYLE_NEON);
+	obs_property_list_add_string(p, obs_module_text("Warp.Icon.Style.Outline"), STYLE_OUTLINE);
 	obs_property_list_add_string(p, obs_module_text("Warp.Icon.Style.Flat"), STYLE_FLAT);
 	obs_property_set_long_description(p, obs_module_text("Warp.Overlay.Style.Desc"));
 	obs_property_set_modified_callback(p, warp_icon_style_modified);
@@ -598,6 +706,14 @@ static obs_properties_t *warp_icon_properties(void *data)
 	obs_property_list_add_string(p, obs_module_text("Warp.Icon.Layout.Beside"), LAYOUT_BESIDE);
 	obs_property_set_long_description(p, obs_module_text("Warp.Icon.Layout.Desc"));
 	obs_property_set_modified_callback(p, warp_icon_modified);
+	p = obs_properties_add_list(group, S_CHIP_SHAPE, obs_module_text("Warp.Icon.ChipShape"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, obs_module_text("Warp.Icon.ChipShape.Pill"), SHAPE_PILL);
+	obs_property_list_add_string(p, obs_module_text("Warp.Icon.ChipShape.Rounded"), SHAPE_ROUNDED);
+	obs_property_list_add_string(p, obs_module_text("Warp.Icon.ChipShape.Square"), SHAPE_SQUARE);
+	obs_property_list_add_string(p, obs_module_text("Warp.Icon.ChipShape.Slanted"), SHAPE_SLANTED);
+	p = obs_properties_add_bool(group, S_ACCENT_BLOCK, obs_module_text("Warp.Icon.AccentBlock"));
+	obs_property_set_long_description(p, obs_module_text("Warp.Icon.AccentBlock.Desc"));
 	p = obs_properties_add_int(group, S_SIZE, obs_module_text("Warp.Icon.Size"), 8, 4096, 1);
 	obs_property_int_set_suffix(p, " px");
 	p = obs_properties_add_list(group, S_PLATE, obs_module_text("Warp.Icon.Plate"), OBS_COMBO_TYPE_LIST,
@@ -814,15 +930,44 @@ static float warp_icon_chip_text_scale(const struct warp_icon_source *s, uint32_
 	return th && (float)th > room ? room / (float)th : 1.0f;
 }
 
+/* How the chip is laid out, all worked out from its height. A slanted chip
+ * leans by 'lean' over its height, and everything in it moves along by half
+ * that so it sits in the middle of the lean. */
+struct warp_icon_chip {
+	float lean;
+	float radius;
+	/* the glyph's cell: the square the glyph is centred in, the block of
+	 * the accent behind it when there is one */
+	float cell;
+	float text_x;
+	float end;
+};
+
+static void warp_icon_chip_layout(const struct warp_icon_source *s, struct warp_icon_chip *c)
+{
+	float size = (float)s->size;
+	bool rounded = s->chip_shape == WARP_ICON_CHIP_PILL || s->chip_shape == WARP_ICON_CHIP_ROUNDED;
+
+	c->lean = s->chip_shape == WARP_ICON_CHIP_SLANTED ? roundf(size * 0.3f) : 0.0f;
+	c->radius = s->chip_shape == WARP_ICON_CHIP_PILL      ? size * 0.5f
+		    : s->chip_shape == WARP_ICON_CHIP_ROUNDED ? roundf(size * 0.22f)
+							      : 0.0f;
+	c->cell = size + c->lean;
+	c->text_x = s->accent_block ? c->cell + roundf(size * 0.24f) : roundf(size * CHIP_TEXT_X + c->lean * 0.5f);
+	c->end = roundf(size * (rounded ? CHIP_TEXT_END : 0.3f) + c->lean * 0.5f);
+}
+
 /* how wide the chip is with 'tw' x 'th' of text in it */
 static float warp_icon_chip_width(const struct warp_icon_source *s, uint32_t tw, uint32_t th)
 {
-	float size = (float)s->size;
+	struct warp_icon_chip c;
+
+	warp_icon_chip_layout(s, &c);
 
 	if (!tw)
-		return size;
+		return c.cell;
 
-	return roundf(size * CHIP_TEXT_X + (float)tw * warp_icon_chip_text_scale(s, th) + size * CHIP_TEXT_END);
+	return roundf(c.text_x + (float)tw * warp_icon_chip_text_scale(s, th) + c.end);
 }
 
 static float ease_out_back(float t)
@@ -1177,25 +1322,39 @@ static void warp_icon_render(void *data, gs_effect_t *unused)
 	pthread_mutex_lock(&s->image_mutex);
 
 	if (s->chip) {
-		/* the pill, filling with the replay as it plays, rimmed in the
-		 * accent */
+		/* the chip, rimmed in the accent, in its shape */
+		struct warp_icon_chip c;
 		struct warp_overlay_bar pill = {0};
 
-		pill.w = fmaxf(s->chip_w, size);
+		warp_icon_chip_layout(s, &c);
+
+		pill.w = fmaxf(s->chip_w, c.cell);
 		pill.h = size;
-		pill.radius = size * 0.5f;
+		pill.radius = c.radius;
+		pill.slant = c.lean;
 		pill.opacity = plate_alpha;
 		pill.border = (float)s->accent_width;
-		pill.progress = s->show_progress ? s->fraction : 0.0f;
 		warp_overlay_rgba(&pill.track, s->plate_color);
 		warp_overlay_rgba(&pill.border_color, s->accent_color);
-		pill.progress = 0.0f;
 		warp_overlay_draw_bar(effect, &pill, 0.0f, 0.0f);
+
+		/* the glyph's block of accent, cut at the chip's angle */
+		if (s->accent_block) {
+			struct warp_overlay_bar block = {0};
+
+			block.w = c.cell;
+			block.h = size;
+			block.radius = c.radius;
+			block.slant = c.lean;
+			block.opacity = plate_alpha;
+			warp_overlay_rgba(&block.track, s->accent_color);
+			warp_overlay_draw_bar(effect, &block, 0.0f, 0.0f);
+		}
 
 		/* the replay's progress as a fine line under the text, set to
 		 * its measure like an underline */
-		float line_x = size * CHIP_TEXT_X;
-		float line_w = pill.w - size * CHIP_TEXT_END - line_x;
+		float line_x = c.text_x;
+		float line_w = pill.w - c.end - line_x;
 
 		if (s->show_progress && line_w > 2.0f) {
 			struct warp_overlay_bar line = {0};
@@ -1205,17 +1364,22 @@ static void warp_icon_render(void *data, gs_effect_t *unused)
 			line.radius = line.h * 0.5f;
 			line.progress = s->fraction;
 			line.opacity = plate_alpha;
-			vec4_set(&line.track, 1.0f, 1.0f, 1.0f, 0.18f);
 			warp_overlay_rgba(&line.fill, s->accent_color);
+			line.fill.w = fmaxf(line.fill.w, 0.85f);
 			line.fill2 = line.fill;
+			/* the part still to play, a faint trace of the same */
+			line.track = line.fill;
+			line.track.w *= 0.25f;
 			warp_overlay_draw_bar(effect, &line, line_x, roundf(size * 0.80f - line.h * 0.5f));
 		}
 
+		float gx = roundf(c.lean * 0.5f);
+
 		if (s->fade < 1.0f)
-			warp_icon_draw_glyph(s, effect, s->previous.glyph, 0.0f, s->plate_color, s->glyph_color, 0.0f,
+			warp_icon_draw_glyph(s, effect, s->previous.glyph, 0.0f, s->plate_color, s->glyph_color, gx,
 					     0.0f, size, 1.0f, s->alpha * (1.0f - s->fade));
-		warp_icon_draw_glyph(s, effect, s->current.glyph, 0.0f, s->plate_color, s->glyph_color, 0.0f, 0.0f,
-				     size, warp_icon_pop(s), s->alpha * s->fade);
+		warp_icon_draw_glyph(s, effect, s->current.glyph, 0.0f, s->plate_color, s->glyph_color, gx, 0.0f, size,
+				     warp_icon_pop(s), s->alpha * s->fade);
 	} else {
 		if (s->fade < 1.0f)
 			warp_icon_draw_beside(s, effect, &s->previous, 0.0f, s->alpha * (1.0f - s->fade));
@@ -1237,15 +1401,18 @@ static void warp_icon_render(void *data, gs_effect_t *unused)
 	float x, y, scale = 1.0f;
 
 	if (s->chip) {
+		struct warp_icon_chip c;
+
+		warp_icon_chip_layout(s, &c);
 		scale = warp_icon_chip_text_scale(s, th);
-		x = size * CHIP_TEXT_X;
+		x = c.text_x;
 		/* lifted a little when the progress line runs under it, so the
 		 * two read as a caption over its meter rather than underlined */
 		y = (size * (s->show_progress ? 0.9f : 1.0f) - (float)th * scale) * 0.5f;
 
 		/* the text is only shown once the chip has opened out to take
 		 * it, so it never spills over the end */
-		float room = s->chip_w - size * CHIP_TEXT_END - x;
+		float room = s->chip_w - c.end - x;
 		float fits = room / fmaxf((float)tw * scale, 1.0f);
 
 		text_alpha *= fits >= 1.0f ? 1.0f : fmaxf(0.0f, (fits - 0.6f) / 0.4f);

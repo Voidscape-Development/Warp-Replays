@@ -870,8 +870,10 @@ static uint32_t opaque_columns(const struct picture *p)
 
 static void test_styles(obs_source_t *media)
 {
-	static const char *bar_styles[] = {"broadcast", "segmented", "sport", "minimal", "flat"};
-	static const char *icon_styles[] = {"chip", "badge", "minimal", "flat"};
+	static const char *bar_styles[] = {"broadcast", "segmented", "sport",   "scoreboard", "glass",
+					   "neon",      "gold",      "minimal", "flat"};
+	static const char *icon_styles[] = {"chip", "badge",   "tag",     "sport", "glass",
+					    "neon", "outline", "minimal", "flat"};
 	struct picture pic;
 	char name[128];
 
@@ -902,6 +904,23 @@ static void test_styles(obs_source_t *media)
 
 		if (strcmp(bar_styles[i], "broadcast") == 0) {
 			check(pic.w > 640, "its shadow and glow are given room round the bar (%u wide)", pic.w);
+		}
+
+		if (strcmp(bar_styles[i], "scoreboard") == 0) {
+			/* the time is printed in the bar, so the source is no
+			 * taller than the bar and the room for its shadow */
+			uint32_t light = 0;
+			uint32_t bar_y = (pic.h - 30) / 2;
+
+			for (uint32_t x = 0; x < pic.w; x++)
+				for (uint32_t y = bar_y; y < bar_y + 30; y++) {
+					const uint8_t *c = px(&pic, x, y);
+					if (c[3] > 200 && c[0] > 200 && c[1] > 200 && c[2] > 200)
+						light++;
+				}
+
+			check(pic.h <= 30 + 2 * 16, "the scoreboard keeps its time inside the bar (%u high)", pic.h);
+			check(light > 30, "where it shows light on the dark track (%u pixels)", light);
 		}
 		picture_free(&pic);
 
@@ -957,6 +976,17 @@ static void test_styles(obs_source_t *media)
 			snprintf(name, sizeof(name), "style-icon-%s-step", icon_styles[i]);
 			picture_free(&pic);
 			render_and_save(icon, &pic, name);
+		}
+
+		if (strcmp(icon_styles[i], "tag") == 0 || strcmp(icon_styles[i], "sport") == 0) {
+			/* the corner of the glyph's cell is the accent */
+			/* left of the glyph, halfway down, where the slant of a
+			 * slanted block has come in */
+			bool tag = strcmp(icon_styles[i], "tag") == 0;
+			const uint8_t *c = px(&pic, tag ? 6 : 16, 32);
+
+			check(tag ? (c[0] > 220 && c[1] > 150 && c[2] < 60) : (c[0] < 80 && c[1] > 180 && c[2] > 200),
+			      "the %s icon sits on a block of its accent (%d,%d,%d)", icon_styles[i], c[0], c[1], c[2]);
 		}
 
 		if (strcmp(icon_styles[i], "badge") == 0) {

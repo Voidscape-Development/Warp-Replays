@@ -256,9 +256,10 @@ float4 bar_linear(float2 p)
 		acc = over(acc, head_fill, max(edge * 0.8, body));
 	}
 
-	/* the track, a little darker along its top as if set into the picture */
+	/* the track, a touch darker along its top as if set into the picture
+	 * when the bar is lit at all; a flat shape keeps its color exactly */
 	float4 track = track_color;
-	track.rgb *= 0.82 + 0.18 * across;
+	track.rgb *= 1.0 - 0.3 * saturate(sheen) * (1.0 - across);
 	acc = over(acc, track, inner);
 
 	acc = over(acc, lit_fill(along / length_px, across), inner * fill_mask);
@@ -340,8 +341,10 @@ float4 bar_ring(float2 p)
 		acc = over(acc, head_fill, max(edge * 0.8, body));
 	}
 
+	/* the track, a touch darker along its top as if set into the picture
+	 * when the bar is lit at all; a flat shape keeps its color exactly */
 	float4 track = track_color;
-	track.rgb *= 0.82 + 0.18 * across;
+	track.rgb *= 1.0 - 0.3 * saturate(sheen) * (1.0 - across);
 	acc = over(acc, track, inner);
 	acc = over(acc, lit_fill(turn, across), inner * fill_mask);
 

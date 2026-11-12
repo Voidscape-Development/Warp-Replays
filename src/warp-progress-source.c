@@ -86,6 +86,10 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define STYLE_SPORT "sport"
 #define STYLE_MINIMAL "minimal"
 #define STYLE_FLAT "flat"
+#define STYLE_NEON "neon"
+#define STYLE_GLASS "glass"
+#define STYLE_SCOREBOARD "scoreboard"
+#define STYLE_GOLD "gold"
 
 #define PLAYHEAD_NONE "none"
 #define PLAYHEAD_LINE "line"
@@ -434,6 +438,73 @@ static void warp_progress_apply_style(obs_data_t *settings, const char *style, b
 		set_int(&w, S_PLAYHEAD_WIDTH, 12);
 		set_string(&w, S_TEXT_POSITION, POS_BELOW);
 		set_bool(&w, S_TEXT_SHADOW, true);
+	} else if (strcmp(style, STYLE_NEON) == 0) {
+		/* a tube of magenta into cyan, glowing hard, on a dark track */
+		set_int(&w, S_HEIGHT, 6);
+		set_int(&w, S_RING_THICKNESS, 8);
+		set_int(&w, S_RADIUS, 3);
+		set_bool(&w, S_GRADIENT, true);
+		set_int(&w, S_FILL_COLOR, ARGB(0xFFFF2BD6));
+		set_int(&w, S_FILL_COLOR2, ARGB(0xFF21E6FF));
+		set_int(&w, S_TRACK_COLOR, ARGB(0x29FFFFFF));
+		set_int(&w, S_SHEEN, 35);
+		set_int(&w, S_GLOW, 26);
+		set_bool(&w, S_SHADOW, false);
+		set_string(&w, S_PLAYHEAD, PLAYHEAD_LINE);
+		set_int(&w, S_PLAYHEAD_WIDTH, 2);
+		set_int(&w, S_PLAYHEAD_COLOR, ARGB(0xFFFFFFFF));
+		set_string(&w, S_TEXT_POSITION, POS_FOLLOW);
+		set_bool(&w, S_TEXT_CHIP, true);
+		set_int(&w, S_CHIP_COLOR, ARGB(0xCC0A0A14));
+		set_int(&w, S_TEXT_COLOR, ARGB(0xFF8FF3FF));
+	} else if (strcmp(style, STYLE_GLASS) == 0) {
+		/* a frosted capsule: white fill in a pale rim, dark type on a
+		 * white chip */
+		set_int(&w, S_HEIGHT, 14);
+		set_int(&w, S_RING_THICKNESS, 14);
+		set_int(&w, S_RADIUS, 7);
+		set_int(&w, S_FILL_COLOR, ARGB(0xEBFFFFFF));
+		set_int(&w, S_TRACK_COLOR, ARGB(0x2EFFFFFF));
+		set_int(&w, S_BORDER_WIDTH, 1);
+		set_int(&w, S_BORDER_COLOR, ARGB(0x73FFFFFF));
+		set_int(&w, S_SHEEN, 40);
+		set_int(&w, S_SHADOW_COLOR, ARGB(0x59000000));
+		set_int(&w, S_SHADOW_BLUR, 14);
+		set_string(&w, S_TEXT_POSITION, POS_ABOVE);
+		set_bool(&w, S_TEXT_CHIP, true);
+		set_int(&w, S_CHIP_COLOR, ARGB(0xE0F4F5F7));
+		set_int(&w, S_TEXT_COLOR, ARGB(0xFF141418));
+	} else if (strcmp(style, STYLE_SCOREBOARD) == 0) {
+		/* a chunky square block with the time printed inside it */
+		set_int(&w, S_HEIGHT, 30);
+		set_int(&w, S_RING_THICKNESS, 26);
+		set_int(&w, S_RADIUS, 0);
+		set_int(&w, S_FILL_COLOR, ARGB(0xFFFFB400));
+		set_int(&w, S_TRACK_COLOR, ARGB(0xEB101014));
+		set_int(&w, S_SHEEN, 25);
+		set_bool(&w, S_ROUNDED_ENDS, false);
+		set_string(&w, S_TEXT_POSITION, POS_INSIDE);
+		set_bool(&w, S_TEXT_OUTLINE, true);
+	} else if (strcmp(style, STYLE_GOLD) == 0) {
+		/* gold leaf, brightly lit, edged darker, with a pale gold knob */
+		set_int(&w, S_HEIGHT, 10);
+		set_int(&w, S_RING_THICKNESS, 12);
+		set_int(&w, S_RADIUS, 5);
+		set_bool(&w, S_GRADIENT, true);
+		set_int(&w, S_FILL_COLOR, ARGB(0xFFFFEFA6));
+		set_int(&w, S_FILL_COLOR2, ARGB(0xFFC8902A));
+		set_int(&w, S_TRACK_COLOR, ARGB(0x8C140F05));
+		set_int(&w, S_BORDER_WIDTH, 1);
+		set_int(&w, S_BORDER_COLOR, ARGB(0xB37A5A14));
+		set_int(&w, S_SHEEN, 70);
+		set_int(&w, S_GLOW, 8);
+		set_string(&w, S_PLAYHEAD, PLAYHEAD_KNOB);
+		set_int(&w, S_PLAYHEAD_WIDTH, 16);
+		set_int(&w, S_PLAYHEAD_COLOR, ARGB(0xFFFFE8A0));
+		set_string(&w, S_TEXT_POSITION, POS_FOLLOW);
+		set_bool(&w, S_TEXT_CHIP, true);
+		set_int(&w, S_CHIP_COLOR, ARGB(0xD91A1408));
+		set_int(&w, S_TEXT_COLOR, ARGB(0xFFFFE8A0));
 	} else if (strcmp(style, STYLE_FLAT) == 0) {
 		/* plain shapes, no light or shadow */
 		set_int(&w, S_HEIGHT, 12);
@@ -592,6 +663,10 @@ static obs_properties_t *warp_progress_properties(void *data)
 	obs_property_list_add_string(p, obs_module_text("Warp.Progress.Style.Broadcast"), STYLE_BROADCAST);
 	obs_property_list_add_string(p, obs_module_text("Warp.Progress.Style.Segmented"), STYLE_SEGMENTED);
 	obs_property_list_add_string(p, obs_module_text("Warp.Progress.Style.Sport"), STYLE_SPORT);
+	obs_property_list_add_string(p, obs_module_text("Warp.Progress.Style.Scoreboard"), STYLE_SCOREBOARD);
+	obs_property_list_add_string(p, obs_module_text("Warp.Progress.Style.Glass"), STYLE_GLASS);
+	obs_property_list_add_string(p, obs_module_text("Warp.Progress.Style.Neon"), STYLE_NEON);
+	obs_property_list_add_string(p, obs_module_text("Warp.Progress.Style.Gold"), STYLE_GOLD);
 	obs_property_list_add_string(p, obs_module_text("Warp.Progress.Style.Minimal"), STYLE_MINIMAL);
 	obs_property_list_add_string(p, obs_module_text("Warp.Progress.Style.Flat"), STYLE_FLAT);
 	obs_property_set_long_description(p, obs_module_text("Warp.Overlay.Style.Desc"));
