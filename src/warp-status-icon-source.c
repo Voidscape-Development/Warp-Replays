@@ -528,7 +528,7 @@ static void warp_icon_apply_style(obs_data_t *settings, const char *style, bool 
 	set_string(&w, S_GLYPH_SET, SET_SOLID);
 	set_int(&w, S_GLYPH_COLOR2, ARGB(0x66FFFFFF));
 	set_bool(&w, S_GLYPH_COLOR2_OWN, false);
-	set_int(&w, S_DUOTONE_SHADE, 35);
+	set_int(&w, S_DUOTONE_SHADE, 50);
 
 	if (strcmp(style, STYLE_BADGE) == 0) {
 		/* a disc with the replay's progress running round its rim */
@@ -612,7 +612,6 @@ static void warp_icon_apply_style(obs_data_t *settings, const char *style, bool 
 		set_int(&w, S_GLYPH_SCALE, 54);
 		set_string(&w, S_GLYPH_SET, SET_DUOTONE);
 		set_int(&w, S_GLYPH_COLOR, ARGB(0xFFFFC233));
-		set_int(&w, S_DUOTONE_SHADE, 40);
 		set_string(&w, S_TEXT_CONTENT, CONTENT_VALUE);
 		set_font_size(&w, 40);
 	} else if (strcmp(style, STYLE_AURORA) == 0) {
