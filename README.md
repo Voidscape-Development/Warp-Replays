@@ -87,7 +87,7 @@ A source that shows what a Warp Media or Warp Playlist source is doing, as an ic
   * **Sport**: the tag leaning forward, in cyan and navy.
   * **Glass**: a frosted white pill with dark type.
   * **Neon**: the icon alone in pale cyan, its shadow turned into a glow.
-  * **Duotone**: two-tone icons, white leading amber, on a dark rounded tile.
+  * **Duotone**: amber icons in two shades of amber, on a dark rounded tile.
   * **Aurora**: icons shaded cyan into violet, with a violet glow and no plate.
   * **Outline**: line art — outlined icons in an empty ring that fills round with the progress.
   * **Minimal**: the icon alone, lifted off the picture by a soft shadow.
@@ -97,7 +97,7 @@ A source that shows what a Warp Media or Warp Playlist source is doing, as an ic
 * **Text**: what the icon means (`PAUSED`, `SLOW MO`), its value (the speed, or the frames stepped), or both, in any font and color — inside the chip, or to the right of the icon or below it.
 * **Icon set**: how the icons themselves are drawn, with any style.
   * **Solid**.
-  * **Duotone**: each icon in two colors, split by meaning — the part that says what happened leads and the rest supports it. The frame bar of a step, the front triangle of fast forward and next, the arrowhead of restart, the triangle of slow motion, the square of ended. Pause splits its two bars; play sits on a disc and stop in a soft square.
+  * **Duotone**: each icon in two tones, split by meaning — the part that says what happened leads in the icon color and the rest supports it in a shade of it, 35% darker unless the **Supporting Shade** says otherwise (below zero, lighter). **Pick the supporting color** gives the supporting part a color of its own instead, for icons in two different colors. The frame bar of a step, the front triangle of fast forward and next, the arrowhead of restart, the triangle of slow motion, the square of ended. Pause splits its two bars; play sits on a disc and stop in a soft square.
   * **Outline**: line art, drawn inside the solid icon's edge so it keeps the same size.
   * **Gradient**: shaded from one color at the top to another at the bottom.
 

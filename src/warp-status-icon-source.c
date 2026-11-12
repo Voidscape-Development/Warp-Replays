@@ -117,6 +117,10 @@ static const char *warp_icon_label_text[WARP_ICON_COUNT] = {
 #define S_CHIP_SHAPE "chip_shape"
 #define S_GLYPH_SET "glyph_set"
 #define S_GLYPH_COLOR2 "glyph_color2"
+/* a duotone's supporting color is a shade of the icon color unless this is
+ * set, by 'duotone_shade' percent: darker above zero, lighter below it */
+#define S_GLYPH_COLOR2_OWN "glyph_color2_own"
+#define S_DUOTONE_SHADE "duotone_shade"
 #define S_ACCENT_BLOCK "accent_block"
 #define S_POP "pop"
 #define S_SHADOW "shadow"
@@ -339,6 +343,28 @@ static void warp_icon_load_image(struct warp_icon_image *img, const char *path)
 	}
 }
 
+/* 'color' (0xAABBGGRR) taken 'percent' of the way to black, or to white when
+ * 'percent' is below zero, keeping its alpha: the supporting shade of a
+ * duotone icon */
+static uint32_t warp_icon_shade(uint32_t color, int percent)
+{
+	uint32_t out = color & 0xFF000000u;
+	int amount = percent < -100 ? -100 : percent > 100 ? 100 : percent;
+
+	for (int shift = 0; shift < 24; shift += 8) {
+		int c = (int)((color >> shift) & 0xFF);
+
+		if (amount >= 0)
+			c = c * (100 - amount) / 100;
+		else
+			c = c + (255 - c) * -amount / 100;
+
+		out |= (uint32_t)c << shift;
+	}
+
+	return out;
+}
+
 static void warp_icon_update(void *data, obs_data_t *settings)
 {
 	struct warp_icon_source *s = data;
@@ -367,6 +393,10 @@ static void warp_icon_update(void *data, obs_data_t *settings)
 			: strcmp(set, SET_OUTLINE) == 0  ? 2.0f
 			: strcmp(set, SET_GRADIENT) == 0 ? 3.0f
 							 : 0.0f;
+
+	/* a duotone is one color in two shades unless told otherwise */
+	if (s->glyph_mode == 1.0f && !obs_data_get_bool(settings, S_GLYPH_COLOR2_OWN))
+		s->glyph_color2 = warp_icon_shade(s->glyph_color, (int)obs_data_get_int(settings, S_DUOTONE_SHADE));
 	s->plate_color = (uint32_t)obs_data_get_int(settings, S_PLATE_COLOR);
 	s->accent_color = (uint32_t)obs_data_get_int(settings, S_ACCENT_COLOR);
 	s->accent_width = (uint32_t)obs_data_get_int(settings, S_ACCENT_WIDTH);
@@ -497,6 +527,8 @@ static void warp_icon_apply_style(obs_data_t *settings, const char *style, bool 
 	set_bool(&w, S_ACCENT_BLOCK, false);
 	set_string(&w, S_GLYPH_SET, SET_SOLID);
 	set_int(&w, S_GLYPH_COLOR2, ARGB(0x66FFFFFF));
+	set_bool(&w, S_GLYPH_COLOR2_OWN, false);
+	set_int(&w, S_DUOTONE_SHADE, 35);
 
 	if (strcmp(style, STYLE_BADGE) == 0) {
 		/* a disc with the replay's progress running round its rim */
@@ -572,14 +604,15 @@ static void warp_icon_apply_style(obs_data_t *settings, const char *style, bool 
 		set_string(&w, S_TEXT_CONTENT, CONTENT_BOTH);
 		set_font_size(&w, 26);
 	} else if (strcmp(style, STYLE_DUOTONE) == 0) {
-		/* two-tone glyphs, white leading amber, on a dark tile */
+		/* amber glyphs in two shades of amber, on a dark tile */
 		set_string(&w, S_LAYOUT, LAYOUT_BESIDE);
 		set_string(&w, S_PLATE, PLATE_ROUNDED);
 		set_int(&w, S_PLATE_COLOR, ARGB(0xE6101014));
 		set_int(&w, S_SIZE, 104);
 		set_int(&w, S_GLYPH_SCALE, 54);
 		set_string(&w, S_GLYPH_SET, SET_DUOTONE);
-		set_int(&w, S_GLYPH_COLOR2, ARGB(0xFFFFB400));
+		set_int(&w, S_GLYPH_COLOR, ARGB(0xFFFFC233));
+		set_int(&w, S_DUOTONE_SHADE, 40);
 		set_string(&w, S_TEXT_CONTENT, CONTENT_VALUE);
 		set_font_size(&w, 40);
 	} else if (strcmp(style, STYLE_AURORA) == 0) {
@@ -671,9 +704,15 @@ static bool warp_icon_modified(obs_properties_t *props, obs_property_t *prop, ob
 	bool text = obs_data_get_bool(settings, S_VALUE_TEXT);
 
 	const char *set = obs_data_get_string(settings, S_GLYPH_SET);
-	bool two = strcmp(set, SET_DUOTONE) == 0 || strcmp(set, SET_GRADIENT) == 0;
+	bool duotone = strcmp(set, SET_DUOTONE) == 0;
+	bool own = obs_data_get_bool(settings, S_GLYPH_COLOR2_OWN);
 
-	obs_property_set_visible(obs_properties_get(props, S_GLYPH_COLOR2), two);
+	/* a duotone's second color is a shade of the first unless one is
+	 * picked; a gradient always has both ends picked */
+	obs_property_set_visible(obs_properties_get(props, S_GLYPH_COLOR2_OWN), duotone);
+	obs_property_set_visible(obs_properties_get(props, S_DUOTONE_SHADE), duotone && !own);
+	obs_property_set_visible(obs_properties_get(props, S_GLYPH_COLOR2),
+				 strcmp(set, SET_GRADIENT) == 0 || (duotone && own));
 	obs_property_set_description(obs_properties_get(props, S_GLYPH_COLOR2),
 				     obs_module_text(strcmp(set, SET_GRADIENT) == 0 ? "Warp.Icon.GlyphColor2.Gradient"
 										    : "Warp.Icon.GlyphColor2"));
@@ -805,6 +844,13 @@ static obs_properties_t *warp_icon_properties(void *data)
 	obs_property_set_long_description(p, obs_module_text("Warp.Icon.GlyphSet.Desc"));
 	obs_property_set_modified_callback(p, warp_icon_modified);
 	obs_properties_add_color_alpha(group, S_GLYPH_COLOR, obs_module_text("Warp.Icon.GlyphColor"));
+	p = obs_properties_add_int_slider(group, S_DUOTONE_SHADE, obs_module_text("Warp.Icon.DuotoneShade"), -80, 80,
+					  1);
+	obs_property_int_set_suffix(p, "%");
+	obs_property_set_long_description(p, obs_module_text("Warp.Icon.DuotoneShade.Desc"));
+	p = obs_properties_add_bool(group, S_GLYPH_COLOR2_OWN, obs_module_text("Warp.Icon.GlyphColor2Own"));
+	obs_property_set_long_description(p, obs_module_text("Warp.Icon.GlyphColor2Own.Desc"));
+	obs_property_set_modified_callback(p, warp_icon_modified);
 	obs_properties_add_color_alpha(group, S_GLYPH_COLOR2, obs_module_text("Warp.Icon.GlyphColor2"));
 	obs_properties_add_bool(group, S_ROUNDED, obs_module_text("Warp.Icon.Rounded"));
 	p = obs_properties_add_bool(group, S_SHADOW, obs_module_text("Warp.Icon.Shadow"));

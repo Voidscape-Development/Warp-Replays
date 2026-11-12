@@ -1011,7 +1011,9 @@ static void test_styles(obs_source_t *media)
  * each state and event, each held up long enough to read back. */
 static void test_glyph_sets(obs_source_t *media)
 {
-	static const char *sets[] = {"solid", "duotone", "outline", "gradient"};
+	/* duotone-own is a duotone with its supporting color picked rather
+	 * than shaded */
+	static const char *sets[] = {"solid", "duotone", "duotone-own", "outline", "gradient"};
 	struct picture pic;
 	char name[128];
 	char path[1024];
@@ -1052,8 +1054,14 @@ static void test_glyph_sets(obs_source_t *media)
 		obs_data_set_int(look, "size", 96);
 		obs_data_set_int(look, "glyph_scale", 56);
 		obs_data_set_bool(look, "rounded_glyphs", true);
-		obs_data_set_string(look, "glyph_set", sets[i]);
-		obs_data_set_int(look, "glyph_color", 0xFFFFFFFF);
+		bool duo = strncmp(sets[i], "duotone", 7) == 0;
+		bool own = strcmp(sets[i], "duotone-own") == 0;
+
+		obs_data_set_string(look, "glyph_set", duo ? "duotone" : sets[i]);
+		obs_data_set_bool(look, "glyph_color2_own", own);
+		obs_data_set_int(look, "duotone_shade", 35);
+		/* a shaded duotone in amber (0xFFC233), everything else white */
+		obs_data_set_int(look, "glyph_color", duo && !own ? 0xFF33C2FF : 0xFFFFFFFF);
 		/* amber, as 0xAABBGGRR */
 		obs_data_set_int(look, "glyph_color2", 0xFF00B4FF);
 		obs_data_set_bool(look, "value_text", false);
@@ -1079,6 +1087,16 @@ static void test_glyph_sets(obs_source_t *media)
 		SHOT(icon, "pause");
 
 		if (strcmp(sets[i], "duotone") == 0) {
+			/* the left bar leads in the icon color, the right one
+			 * follows in a shade of it 35% darker */
+			const uint8_t *left = px(&pic, 48 - 10, 48);
+			const uint8_t *right = px(&pic, 48 + 10, 48);
+
+			check(left[0] > 240 && left[1] > 180 && left[2] < 80,
+			      "shaded duotone pause leads in amber (%d,%d,%d)", left[0], left[1], left[2]);
+			check(right[0] > 145 && right[0] < 185 && right[1] > 105 && right[1] < 145 && right[2] < 60,
+			      "and follows in a darker amber (%d,%d,%d)", right[0], right[1], right[2]);
+		} else if (strcmp(sets[i], "duotone-own") == 0) {
 			/* the left bar leads in the first color, the right one
 			 * follows in the second */
 			const uint8_t *left = px(&pic, 48 - 10, 48);
