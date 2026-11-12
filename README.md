@@ -87,12 +87,21 @@ A source that shows what a Warp Media or Warp Playlist source is doing, as an ic
   * **Sport**: the tag leaning forward, in cyan and navy.
   * **Glass**: a frosted white pill with dark type.
   * **Neon**: the icon alone in pale cyan, its shadow turned into a glow.
-  * **Outline**: line art — an empty ring that fills round with the progress, and the icon.
+  * **Duotone**: two-tone icons, white leading amber, on a dark rounded tile.
+  * **Aurora**: icons shaded cyan into violet, with a violet glow and no plate.
+  * **Outline**: line art — outlined icons in an empty ring that fills round with the progress.
   * **Minimal**: the icon alone, lifted off the picture by a soft shadow.
   * **Flat**: the icon on a plain disc, with no rounding or motion.
 
   Several are made to go together: the Sport bar and icon, Scoreboard and Tag, Glass and Glass, Neon and Neon.
 * **Text**: what the icon means (`PAUSED`, `SLOW MO`), its value (the speed, or the frames stepped), or both, in any font and color — inside the chip, or to the right of the icon or below it.
+* **Icon set**: how the icons themselves are drawn, with any style.
+  * **Solid**.
+  * **Duotone**: each icon in two colors, split by meaning — the part that says what happened leads and the rest supports it. The frame bar of a step, the front triangle of fast forward and next, the arrowhead of restart, the triangle of slow motion, the square of ended. Pause splits its two bars; play sits on a disc and stop in a soft square.
+  * **Outline**: line art, drawn inside the solid icon's edge so it keeps the same size.
+  * **Gradient**: shaded from one color at the top to another at the bottom.
+
+  Badges stay solid, so they read at the size they are.
 * **Chip**: a pill, a rounded rectangle, a square or a slanted parallelogram, with the icon on a **block of the accent** at its start when wanted, the way a sports tag is cut.
 * **Look**: built-in icons drawn at whatever size the source is, so they stay sharp, with their corners **rounded** off; their color; a **background** circle or rounded square behind them with a color and opacity of its own; an **accent** rim, and the replay's **progress** shown in it; and a **drop shadow**. Changes **fade** from one icon to the next, and a new icon **pops in**.
 * **Own images**: any icon can be replaced by an image file of your own, one per state, drawn inside the icon's background.

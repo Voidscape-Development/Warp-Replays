@@ -60,6 +60,10 @@ uniform float shadow;
 uniform float2 shadow_offset;
 uniform float shadow_soft;
 uniform float4 glyph_color;
+/* 0 solid, 1 duotone, 2 outline, 3 gradient; the second color is the
+ * supporting part of a duotone glyph, and the bottom of a gradient one */
+uniform float glyph_mode;
+uniform float4 glyph_color2;
 uniform float4 plate_color;
 uniform float4 shadow_color;
 
@@ -90,6 +94,8 @@ VertData VSDefault(VertData v_in)
 /* shapes ------------------------------------------------------------------- */
 
 #define PI 3.14159265
+/* how thick an outline icon's stroke is, in glyph units */
+#define OUTLINE 0.13
 #define TAU 6.2831853
 
 float sd_box(float2 p, float2 half_size, float r)
@@ -381,54 +387,79 @@ float4 PSBar(VertData v_in) : TARGET
 
 /* the icon ----------------------------------------------------------------- */
 
+/* Every glyph is drawn as two parts: the one that says what happened, and the
+ * one that supports it. Solid, outline and gradient icons draw the two as one
+ * shape; a duotone icon gives each its own color. A part a glyph does not have
+ * is far away. A few glyphs are only split for duotone: play sits on a disc and
+ * stop in a soft square there, since on their own they are one shape. */
+#define NONE 1000.0
+
 float sd_play(float2 p)
 {
 	return sd_triangle(p, float2(-0.5, -0.8), float2(-0.5, 0.8), float2(0.85, 0.0));
 }
 
-float sd_pause(float2 p)
+float2 parts_play(float2 p, bool duo)
 {
-	float2 q = float2(abs(p.x) - 0.38, p.y);
+	if (!duo)
+		return float2(sd_play(p), NONE);
 
-	return sd_box(q, float2(0.19, 0.78), 0.05);
+	/* a smaller triangle on a disc, set right a little to sit optically
+	 * in the middle */
+	float k = 0.55;
+
+	return float2(sd_play((p - float2(0.06, 0.0)) / k) * k, length(p) - 0.96);
 }
 
-float sd_stop(float2 p)
+float2 parts_pause(float2 p)
 {
-	return sd_box(p, float2(0.7, 0.7), 0.1);
+	/* the left bar leads and the right one follows it */
+	float left = sd_box(p + float2(0.38, 0.0), float2(0.19, 0.78), 0.05);
+	float right = sd_box(p - float2(0.38, 0.0), float2(0.19, 0.78), 0.05);
+
+	return float2(left, right);
 }
 
-float sd_ended(float2 p)
+float2 parts_stop(float2 p, bool duo)
 {
-	return min(sd_ring(p, 0.86, 0.16), sd_box(p, float2(0.36, 0.36), 0.06));
+	if (!duo)
+		return float2(sd_box(p, float2(0.7, 0.7), 0.1), NONE);
+
+	return float2(sd_box(p, float2(0.34, 0.34), 0.05), sd_box(p, float2(0.84, 0.84), 0.2));
 }
 
-float sd_step(float2 p)
+float2 parts_ended(float2 p)
 {
+	return float2(sd_box(p, float2(0.36, 0.36), 0.06), sd_ring(p, 0.86, 0.16));
+}
+
+float2 parts_step(float2 p)
+{
+	/* the bar is the frame the step lands on, so it leads */
 	float tri = sd_triangle(p, float2(-0.75, -0.72), float2(-0.75, 0.72), float2(0.4, 0.0));
 	float bar = sd_box(p - float2(0.62, 0.0), float2(0.14, 0.72), 0.04);
 
-	return min(tri, bar);
+	return float2(bar, tri);
 }
 
-float sd_skip(float2 p)
+float2 parts_skip(float2 p)
 {
 	float a = sd_triangle(p, float2(-0.9, -0.62), float2(-0.9, 0.62), float2(-0.15, 0.0));
 	float b = sd_triangle(p, float2(-0.18, -0.62), float2(-0.18, 0.62), float2(0.57, 0.0));
 	float bar = sd_box(p - float2(0.74, 0.0), float2(0.13, 0.62), 0.04);
 
-	return min(min(a, b), bar);
+	return float2(min(b, bar), a);
 }
 
-float sd_fast(float2 p)
+float2 parts_fast(float2 p)
 {
 	float a = sd_triangle(p, float2(-0.92, -0.66), float2(-0.92, 0.66), float2(0.0, 0.0));
 	float b = sd_triangle(p, float2(0.0, -0.66), float2(0.0, 0.66), float2(0.92, 0.0));
 
-	return min(a, b);
+	return float2(b, a);
 }
 
-float sd_slow(float2 p)
+float2 parts_slow(float2 p)
 {
 	/* a play triangle inside a dashed circle */
 	float ring = sd_ring(p, 0.86, 0.14);
@@ -436,10 +467,10 @@ float sd_slow(float2 p)
 	float dash = (abs(n - floor(n) - 0.5) - 0.3) * (TAU * 0.86 / 12.0);
 	float tri = sd_triangle(p, float2(-0.28, -0.42), float2(-0.28, 0.42), float2(0.44, 0.0));
 
-	return min(max(ring, dash), tri);
+	return float2(tri, max(ring, dash));
 }
 
-float sd_restart(float2 p)
+float2 parts_restart(float2 p)
 {
 	/* a circle with a gap at the top, the arrow on its right-hand end
 	 * pointing back round anticlockwise */
@@ -455,43 +486,56 @@ float sd_restart(float2 p)
 	float2 back = float2(-cos(a), -sin(a));
 	float head = sd_triangle(p, at + radial * 0.32, at - radial * 0.32, at + back * 0.38);
 
-	return min(arc, head);
+	return float2(head, arc);
 }
 
-/* the distance to glyph number 'g' at p; see warp-status-icon.c */
-float sd_glyph_sharp(float2 p, float g)
+/* the two parts of glyph number 'g' at p; see warp-status-icon.c */
+float2 parts_sharp(float2 p, float g, bool duo)
 {
 	if (g < 1.5)
-		return sd_play(p);
+		return parts_play(p, duo);
 	if (g < 2.5)
-		return sd_pause(p);
+		return parts_pause(p);
 	if (g < 3.5)
-		return sd_stop(p);
+		return parts_stop(p, duo);
 	if (g < 4.5)
-		return sd_ended(p);
+		return parts_ended(p);
 	if (g < 5.5)
-		return sd_step(p);
+		return parts_step(p);
 	if (g < 6.5)
-		return sd_step(float2(-p.x, p.y));
+		return parts_step(float2(-p.x, p.y));
 	if (g < 7.5)
-		return sd_skip(p);
+		return parts_skip(p);
 	if (g < 8.5)
-		return sd_skip(float2(-p.x, p.y));
+		return parts_skip(float2(-p.x, p.y));
 	if (g < 9.5)
-		return sd_restart(p);
+		return parts_restart(p);
 	if (g < 10.5)
-		return sd_fast(p);
+		return parts_fast(p);
 
-	return sd_slow(p);
+	return parts_slow(p);
 }
 
-/* the glyph with its corners rounded off: drawn a touch smaller and grown back
- * out by the rounding, so it keeps its size */
-float sd_glyph(float2 p, float g)
+/* the parts with their corners rounded off: drawn a touch smaller and grown
+ * back out by the rounding, so the glyph keeps its size */
+float2 glyph_parts(float2 p, float g, bool duo)
 {
 	float k = 1.0 + glyph_round;
 
-	return sd_glyph_sharp(p * k, g) / k - glyph_round * 0.85;
+	return parts_sharp(p * k, g, duo) / k - float2(glyph_round, glyph_round) * 0.85;
+}
+
+/* The glyph as one shape, the way the icon set draws it: an outline icon is a
+ * stroke inside the edge of the solid one, so it keeps the same size. */
+float sd_glyph(float2 p, float g)
+{
+	float2 d = glyph_parts(p, g, glyph_mode > 0.5 && glyph_mode < 1.5);
+	float solid = min(d.x, d.y);
+
+	if (glyph_mode > 1.5 && glyph_mode < 2.5)
+		return abs(solid + OUTLINE * 0.5) - OUTLINE * 0.5;
+
+	return solid;
 }
 
 float sd_plate(float2 q)
@@ -523,7 +567,21 @@ float4 PSIcon(VertData v_in) : TARGET
 			acc = over(acc, shadow_color, saturate(0.5 - d_shadow / soft));
 		}
 
-		acc = over(acc, glyph_color, cover(sd_glyph(g, glyph), gpx));
+		if (glyph_mode > 0.5 && glyph_mode < 1.5) {
+			/* duotone: the supporting part, then the leading one over it */
+			float2 d = glyph_parts(g, glyph, true);
+
+			acc = over(acc, glyph_color2, cover(d.y, gpx));
+			acc = over(acc, glyph_color, cover(d.x, gpx));
+		} else if (glyph_mode > 2.5) {
+			/* gradient: the first color at the top, the second at the
+			 * bottom, across the glyph's own height */
+			float4 c = lerp(glyph_color, glyph_color2, saturate(g.y * 0.55 + 0.5));
+
+			acc = over(acc, c, cover(sd_glyph(g, glyph), gpx));
+		} else {
+			acc = over(acc, glyph_color, cover(sd_glyph(g, glyph), gpx));
+		}
 	}
 
 	return unpremultiply(acc);

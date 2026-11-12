@@ -115,6 +115,8 @@ static const char *warp_icon_label_text[WARP_ICON_COUNT] = {
 #define S_SHOW_PROGRESS "show_progress"
 #define S_ROUNDED "rounded_glyphs"
 #define S_CHIP_SHAPE "chip_shape"
+#define S_GLYPH_SET "glyph_set"
+#define S_GLYPH_COLOR2 "glyph_color2"
 #define S_ACCENT_BLOCK "accent_block"
 #define S_POP "pop"
 #define S_SHADOW "shadow"
@@ -146,6 +148,13 @@ static const char *warp_icon_label_text[WARP_ICON_COUNT] = {
 #define STYLE_TAG "tag"
 #define STYLE_SPORT "sport"
 #define STYLE_OUTLINE "outline"
+#define STYLE_DUOTONE "duotone"
+#define STYLE_AURORA "aurora"
+
+#define SET_SOLID "solid"
+#define SET_DUOTONE "duotone"
+#define SET_OUTLINE "outline"
+#define SET_GRADIENT "gradient"
 
 #define SHAPE_PILL "pill"
 #define SHAPE_ROUNDED "rounded"
@@ -223,6 +232,10 @@ struct warp_icon_source {
 	float plate_shape;
 	float glyph_scale;
 	uint32_t glyph_color;
+	/* how the glyphs are drawn, as the effect numbers it: solid, duotone,
+	 * outline or gradient; and the second color the last two use */
+	float glyph_mode;
+	uint32_t glyph_color2;
 	uint32_t plate_color;
 	uint32_t accent_color;
 	uint32_t accent_width;
@@ -346,6 +359,14 @@ static void warp_icon_update(void *data, obs_data_t *settings)
 	s->plate_shape = strcmp(plate, PLATE_CIRCLE) == 0 ? 1.0f : strcmp(plate, PLATE_ROUNDED) == 0 ? 2.0f : 0.0f;
 	s->glyph_scale = (float)obs_data_get_int(settings, S_GLYPH_SCALE) / 100.0f;
 	s->glyph_color = (uint32_t)obs_data_get_int(settings, S_GLYPH_COLOR);
+	s->glyph_color2 = (uint32_t)obs_data_get_int(settings, S_GLYPH_COLOR2);
+
+	const char *set = obs_data_get_string(settings, S_GLYPH_SET);
+
+	s->glyph_mode = strcmp(set, SET_DUOTONE) == 0    ? 1.0f
+			: strcmp(set, SET_OUTLINE) == 0  ? 2.0f
+			: strcmp(set, SET_GRADIENT) == 0 ? 3.0f
+							 : 0.0f;
 	s->plate_color = (uint32_t)obs_data_get_int(settings, S_PLATE_COLOR);
 	s->accent_color = (uint32_t)obs_data_get_int(settings, S_ACCENT_COLOR);
 	s->accent_width = (uint32_t)obs_data_get_int(settings, S_ACCENT_WIDTH);
@@ -474,6 +495,8 @@ static void warp_icon_apply_style(obs_data_t *settings, const char *style, bool 
 	set_string(&w, S_TEXT_POSITION, POS_RIGHT);
 	set_string(&w, S_CHIP_SHAPE, SHAPE_PILL);
 	set_bool(&w, S_ACCENT_BLOCK, false);
+	set_string(&w, S_GLYPH_SET, SET_SOLID);
+	set_int(&w, S_GLYPH_COLOR2, ARGB(0x66FFFFFF));
 
 	if (strcmp(style, STYLE_BADGE) == 0) {
 		/* a disc with the replay's progress running round its rim */
@@ -548,8 +571,38 @@ static void warp_icon_apply_style(obs_data_t *settings, const char *style, bool 
 		set_bool(&w, S_TEXT_SHADOW, false);
 		set_string(&w, S_TEXT_CONTENT, CONTENT_BOTH);
 		set_font_size(&w, 26);
+	} else if (strcmp(style, STYLE_DUOTONE) == 0) {
+		/* two-tone glyphs, white leading amber, on a dark tile */
+		set_string(&w, S_LAYOUT, LAYOUT_BESIDE);
+		set_string(&w, S_PLATE, PLATE_ROUNDED);
+		set_int(&w, S_PLATE_COLOR, ARGB(0xE6101014));
+		set_int(&w, S_SIZE, 104);
+		set_int(&w, S_GLYPH_SCALE, 54);
+		set_string(&w, S_GLYPH_SET, SET_DUOTONE);
+		set_int(&w, S_GLYPH_COLOR2, ARGB(0xFFFFB400));
+		set_string(&w, S_TEXT_CONTENT, CONTENT_VALUE);
+		set_font_size(&w, 40);
+	} else if (strcmp(style, STYLE_AURORA) == 0) {
+		/* glyphs shaded cyan into violet, glowing violet */
+		set_string(&w, S_LAYOUT, LAYOUT_BESIDE);
+		set_string(&w, S_PLATE, PLATE_NONE);
+		set_int(&w, S_PLATE_COLOR, ARGB(0xCC120C24));
+		set_int(&w, S_SIZE, 96);
+		set_int(&w, S_GLYPH_SCALE, 62);
+		set_string(&w, S_GLYPH_SET, SET_GRADIENT);
+		set_int(&w, S_GLYPH_COLOR, ARGB(0xFF5CF2FF));
+		set_int(&w, S_GLYPH_COLOR2, ARGB(0xFFA46BFF));
+		set_bool(&w, S_SHADOW, true);
+		set_int(&w, S_SHADOW_COLOR, ARGB(0x998A5CFF));
+		set_int(&w, S_SHADOW_DISTANCE, 0);
+		set_int(&w, S_SHADOW_BLUR, 18);
+		set_int(&w, S_TEXT_COLOR, ARGB(0xFFD9CCFF));
+		set_string(&w, S_TEXT_CONTENT, CONTENT_VALUE);
+		set_font_size(&w, 40);
 	} else if (strcmp(style, STYLE_OUTLINE) == 0) {
-		/* line art: an empty ring that is the progress, and the glyph */
+		/* line art: an empty ring that is the progress, and the glyph
+		 * drawn as a line to match */
+		set_string(&w, S_GLYPH_SET, SET_OUTLINE);
 		set_string(&w, S_LAYOUT, LAYOUT_BESIDE);
 		set_string(&w, S_PLATE, PLATE_CIRCLE);
 		set_int(&w, S_PLATE_COLOR, ARGB(0x00000000));
@@ -617,6 +670,17 @@ static bool warp_icon_modified(obs_properties_t *props, obs_property_t *prop, ob
 	bool shadow = obs_data_get_bool(settings, S_SHADOW);
 	bool text = obs_data_get_bool(settings, S_VALUE_TEXT);
 
+	const char *set = obs_data_get_string(settings, S_GLYPH_SET);
+	bool two = strcmp(set, SET_DUOTONE) == 0 || strcmp(set, SET_GRADIENT) == 0;
+
+	obs_property_set_visible(obs_properties_get(props, S_GLYPH_COLOR2), two);
+	obs_property_set_description(obs_properties_get(props, S_GLYPH_COLOR2),
+				     obs_module_text(strcmp(set, SET_GRADIENT) == 0 ? "Warp.Icon.GlyphColor2.Gradient"
+										    : "Warp.Icon.GlyphColor2"));
+	obs_property_set_description(obs_properties_get(props, S_GLYPH_COLOR),
+				     obs_module_text(strcmp(set, SET_GRADIENT) == 0  ? "Warp.Icon.GlyphColor.Gradient"
+						     : strcmp(set, SET_DUOTONE) == 0 ? "Warp.Icon.GlyphColor.Duotone"
+										     : "Warp.Icon.GlyphColor"));
 	obs_property_set_visible(obs_properties_get(props, S_PLATE), !chip);
 	obs_property_set_visible(obs_properties_get(props, S_CHIP_SHAPE), chip);
 	obs_property_set_visible(obs_properties_get(props, S_ACCENT_BLOCK), chip);
@@ -671,6 +735,8 @@ static obs_properties_t *warp_icon_properties(void *data)
 	obs_property_list_add_string(p, obs_module_text("Warp.Icon.Style.Sport"), STYLE_SPORT);
 	obs_property_list_add_string(p, obs_module_text("Warp.Icon.Style.Glass"), STYLE_GLASS);
 	obs_property_list_add_string(p, obs_module_text("Warp.Icon.Style.Neon"), STYLE_NEON);
+	obs_property_list_add_string(p, obs_module_text("Warp.Icon.Style.Duotone"), STYLE_DUOTONE);
+	obs_property_list_add_string(p, obs_module_text("Warp.Icon.Style.Aurora"), STYLE_AURORA);
 	obs_property_list_add_string(p, obs_module_text("Warp.Icon.Style.Outline"), STYLE_OUTLINE);
 	obs_property_list_add_string(p, obs_module_text("Warp.Icon.Style.Flat"), STYLE_FLAT);
 	obs_property_set_long_description(p, obs_module_text("Warp.Overlay.Style.Desc"));
@@ -730,7 +796,16 @@ static obs_properties_t *warp_icon_properties(void *data)
 	obs_property_set_long_description(p, obs_module_text("Warp.Icon.ShowProgress.Desc"));
 	p = obs_properties_add_int_slider(group, S_GLYPH_SCALE, obs_module_text("Warp.Icon.GlyphScale"), 10, 100, 1);
 	obs_property_int_set_suffix(p, "%");
+	p = obs_properties_add_list(group, S_GLYPH_SET, obs_module_text("Warp.Icon.GlyphSet"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, obs_module_text("Warp.Icon.GlyphSet.Solid"), SET_SOLID);
+	obs_property_list_add_string(p, obs_module_text("Warp.Icon.GlyphSet.Duotone"), SET_DUOTONE);
+	obs_property_list_add_string(p, obs_module_text("Warp.Icon.GlyphSet.Outline"), SET_OUTLINE);
+	obs_property_list_add_string(p, obs_module_text("Warp.Icon.GlyphSet.Gradient"), SET_GRADIENT);
+	obs_property_set_long_description(p, obs_module_text("Warp.Icon.GlyphSet.Desc"));
+	obs_property_set_modified_callback(p, warp_icon_modified);
 	obs_properties_add_color_alpha(group, S_GLYPH_COLOR, obs_module_text("Warp.Icon.GlyphColor"));
+	obs_properties_add_color_alpha(group, S_GLYPH_COLOR2, obs_module_text("Warp.Icon.GlyphColor2"));
 	obs_properties_add_bool(group, S_ROUNDED, obs_module_text("Warp.Icon.Rounded"));
 	p = obs_properties_add_bool(group, S_SHADOW, obs_module_text("Warp.Icon.Shadow"));
 	obs_property_set_modified_callback(p, warp_icon_modified);
@@ -1133,8 +1208,8 @@ static void warp_icon_draw_tech(gs_effect_t *effect, const char *name, gs_textur
  * picture, fitted inside the room the glyph would have taken. Called with the
  * image lock held. */
 static void warp_icon_draw_glyph(struct warp_icon_source *s, gs_effect_t *effect, enum warp_icon_glyph glyph,
-				 float shape, uint32_t plate_color, uint32_t glyph_color, float x, float y, float size,
-				 float pop, float opacity)
+				 float shape, uint32_t plate_color, uint32_t glyph_color, float mode, float x, float y,
+				 float size, float pop, float opacity)
 {
 	if (opacity <= 0.0f || size < 1.0f)
 		return;
@@ -1156,6 +1231,8 @@ static void warp_icon_draw_glyph(struct warp_icon_source *s, gs_effect_t *effect
 	gs_effect_set_vec2(gs_effect_get_param_by_name(effect, "shadow_offset"), &shadow_offset);
 	gs_effect_set_float(gs_effect_get_param_by_name(effect, "shadow_soft"), (s->shadow_blur + 1.0f) * units);
 	warp_icon_set_color(effect, "glyph_color", glyph_color);
+	warp_icon_set_color(effect, "glyph_color2", s->glyph_color2);
+	gs_effect_set_float(gs_effect_get_param_by_name(effect, "glyph_mode"), mode);
 	warp_icon_set_color(effect, "plate_color", plate_color);
 	warp_icon_set_color(effect, "shadow_color", s->shadow_color);
 
@@ -1266,10 +1343,10 @@ static void warp_icon_draw_beside(struct warp_icon_source *s, gs_effect_t *effec
 	if (s->value_text && s->text_below)
 		x = ((float)warp_icon_width(s) - size) * 0.5f;
 
-	warp_icon_draw_glyph(s, effect, WARP_ICON_NONE, s->plate_shape, s->plate_color, s->glyph_color, x, 0.0f, size,
-			     1.0f, plate_alpha);
+	warp_icon_draw_glyph(s, effect, WARP_ICON_NONE, s->plate_shape, s->plate_color, s->glyph_color, 0.0f, x, 0.0f,
+			     size, 1.0f, plate_alpha);
 	warp_icon_draw_rim(s, effect, x, size, plate_alpha);
-	warp_icon_draw_glyph(s, effect, look->glyph, 0.0f, s->plate_color, s->glyph_color, x, 0.0f, size,
+	warp_icon_draw_glyph(s, effect, look->glyph, 0.0f, s->plate_color, s->glyph_color, s->glyph_mode, x, 0.0f, size,
 			     warp_icon_pop(s), glyph_alpha);
 
 	if (look->badge != WARP_ICON_NONE) {
@@ -1282,7 +1359,8 @@ static void warp_icon_draw_beside(struct warp_icon_source *s, gs_effect_t *effec
 		uint32_t plate = pip ? s->accent_color : s->plate_color;
 		uint32_t mark = pip ? (s->plate_color | 0xFF000000u) : s->glyph_color;
 
-		warp_icon_draw_glyph(s, effect, look->badge, shape, plate, mark, x + size - badge * 0.92f,
+		/* kept solid, so it reads at the size it is */
+		warp_icon_draw_glyph(s, effect, look->badge, shape, plate, mark, 0.0f, x + size - badge * 0.92f,
 				     size - badge * 0.92f, badge, 1.0f, glyph_alpha);
 	}
 }
@@ -1376,10 +1454,10 @@ static void warp_icon_render(void *data, gs_effect_t *unused)
 		float gx = roundf(c.lean * 0.5f);
 
 		if (s->fade < 1.0f)
-			warp_icon_draw_glyph(s, effect, s->previous.glyph, 0.0f, s->plate_color, s->glyph_color, gx,
-					     0.0f, size, 1.0f, s->alpha * (1.0f - s->fade));
-		warp_icon_draw_glyph(s, effect, s->current.glyph, 0.0f, s->plate_color, s->glyph_color, gx, 0.0f, size,
-				     warp_icon_pop(s), s->alpha * s->fade);
+			warp_icon_draw_glyph(s, effect, s->previous.glyph, 0.0f, s->plate_color, s->glyph_color,
+					     s->glyph_mode, gx, 0.0f, size, 1.0f, s->alpha * (1.0f - s->fade));
+		warp_icon_draw_glyph(s, effect, s->current.glyph, 0.0f, s->plate_color, s->glyph_color, s->glyph_mode,
+				     gx, 0.0f, size, warp_icon_pop(s), s->alpha * s->fade);
 	} else {
 		if (s->fade < 1.0f)
 			warp_icon_draw_beside(s, effect, &s->previous, 0.0f, s->alpha * (1.0f - s->fade));

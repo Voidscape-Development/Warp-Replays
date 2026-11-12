@@ -872,8 +872,8 @@ static void test_styles(obs_source_t *media)
 {
 	static const char *bar_styles[] = {"broadcast", "segmented", "sport",   "scoreboard", "glass",
 					   "neon",      "gold",      "minimal", "flat"};
-	static const char *icon_styles[] = {"chip", "badge",   "tag",     "sport", "glass",
-					    "neon", "outline", "minimal", "flat"};
+	static const char *icon_styles[] = {"chip",    "badge",  "tag",     "sport",   "glass", "neon",
+					    "duotone", "aurora", "outline", "minimal", "flat"};
 	struct picture pic;
 	char name[128];
 
@@ -1005,6 +1005,148 @@ static void test_styles(obs_source_t *media)
 	}
 
 	call_int(media, "warp_set_speed", "speed", 100);
+}
+
+/* Every glyph in every icon set, brought up by driving real sources through
+ * each state and event, each held up long enough to read back. */
+static void test_glyph_sets(obs_source_t *media)
+{
+	static const char *sets[] = {"solid", "duotone", "outline", "gradient"};
+	struct picture pic;
+	char name[128];
+	char path[1024];
+
+	printf("Icon sets\n");
+
+	/* a playlist, for next and previous */
+	obs_data_t *pl_settings = obs_data_create();
+	obs_data_array_t *files = obs_data_array_create();
+
+	for (int i = 0; i < 3; i++) {
+		obs_data_t *file = obs_data_create();
+
+		media_path(path, sizeof(path), "clip-4s.mp4");
+		obs_data_set_string(file, "value", path);
+		obs_data_array_push_back(files, file);
+		obs_data_release(file);
+	}
+
+	obs_data_set_array(pl_settings, "playlist", files);
+	obs_data_set_int(pl_settings, "transition_duration", 100);
+	/* kept going for as long as the gallery takes */
+	obs_data_set_bool(pl_settings, "loop_playlist", true);
+	obs_data_array_release(files);
+
+	obs_source_t *playlist = obs_source_create("warp_playlist_source", "glyph-playlist", pl_settings, NULL);
+	obs_sceneitem_t *item = put_on_program(playlist);
+
+	obs_data_release(pl_settings);
+	wait_state(playlist, OBS_MEDIA_STATE_PLAYING, 4000);
+
+	for (size_t i = 0; i < sizeof(sets) / sizeof(sets[0]); i++) {
+		obs_data_t *look = obs_data_create();
+
+		obs_data_set_string(look, "layout", "beside");
+		obs_data_set_string(look, "plate", "rounded");
+		obs_data_set_int(look, "plate_color", 0xE6141010);
+		obs_data_set_int(look, "size", 96);
+		obs_data_set_int(look, "glyph_scale", 56);
+		obs_data_set_bool(look, "rounded_glyphs", true);
+		obs_data_set_string(look, "glyph_set", sets[i]);
+		obs_data_set_int(look, "glyph_color", 0xFFFFFFFF);
+		/* amber, as 0xAABBGGRR */
+		obs_data_set_int(look, "glyph_color2", 0xFF00B4FF);
+		obs_data_set_bool(look, "value_text", false);
+		obs_data_set_bool(look, "combine_speed", false);
+		obs_data_set_int(look, "flash_ms", 4000);
+
+		obs_source_t *icon = make_overlay("warp_status_icon_source", "glyph-icon", media, look);
+		obs_source_t *pl_icon = make_overlay("warp_status_icon_source", "glyph-pl-icon", playlist, look);
+
+		obs_data_release(look);
+
+#define SHOT(source, glyph_name)                                                   \
+	do {                                                                        \
+		wait_ms(250);                                                       \
+		snprintf(name, sizeof(name), "glyph-%s-%s", sets[i], glyph_name); \
+		render_and_save(source, &pic, name);                                \
+	} while (0)
+
+		load_clip(media, "clip-4s.mp4", "play");
+		wait_state(media, OBS_MEDIA_STATE_PLAYING, 3000);
+		wait_ms(200);
+		obs_source_media_play_pause(media, true);
+		SHOT(icon, "pause");
+
+		if (strcmp(sets[i], "duotone") == 0) {
+			/* the left bar leads in the first color, the right one
+			 * follows in the second */
+			const uint8_t *left = px(&pic, 48 - 10, 48);
+			const uint8_t *right = px(&pic, 48 + 10, 48);
+
+			check(left[0] > 220 && left[1] > 220 && left[2] > 220,
+			      "duotone pause leads in white (%d,%d,%d)", left[0], left[1], left[2]);
+			check(right[0] > 220 && right[1] > 140 && right[1] < 210 && right[2] < 60,
+			      "and follows in amber (%d,%d,%d)", right[0], right[1], right[2]);
+		} else if (strcmp(sets[i], "outline") == 0) {
+			/* an outlined bar is hollow down its middle */
+			const uint8_t *edge = px(&pic, 48 - 15, 48);
+			const uint8_t *hollow = px(&pic, 48 - 10, 48);
+
+			check(edge[0] > 200 && hollow[0] < 120,
+			      "outline pause is drawn as a line (%d at the edge, %d inside)", edge[0], hollow[0]);
+		} else if (strcmp(sets[i], "gradient") == 0) {
+			const uint8_t *top = px(&pic, 48 - 10, 48 - 16);
+			const uint8_t *bottom = px(&pic, 48 - 10, 48 + 16);
+
+			check(top[2] > bottom[2] + 60, "gradient pause runs from white into amber (%d to %d blue)",
+			      top[2], bottom[2]);
+		}
+		picture_free(&pic);
+
+		call_int(media, "warp_step_frames", "frames", 1);
+		SHOT(icon, "step-forward");
+		picture_free(&pic);
+		call_int(media, "warp_step_frames", "frames", -1);
+		SHOT(icon, "step-backward");
+		picture_free(&pic);
+		call_int(media, "warp_set_speed", "speed", 200);
+		SHOT(icon, "fast");
+		picture_free(&pic);
+		call_int(media, "warp_set_speed", "speed", 50);
+		SHOT(icon, "slow");
+		picture_free(&pic);
+		call_int(media, "warp_set_speed", "speed", 100);
+		obs_source_media_play_pause(media, false);
+		SHOT(icon, "play");
+		picture_free(&pic);
+		obs_source_media_restart(media);
+		SHOT(icon, "restart");
+		picture_free(&pic);
+		obs_source_media_stop(media);
+		wait_ms(4000);
+		SHOT(icon, "stop");
+		picture_free(&pic);
+		load_clip(media, "clip-4s.mp4", "play");
+		wait_state(media, OBS_MEDIA_STATE_ENDED, 6000);
+		SHOT(icon, "ended");
+		picture_free(&pic);
+
+		obs_source_media_next(playlist);
+		SHOT(pl_icon, "next");
+		picture_free(&pic);
+		obs_source_media_previous(playlist);
+		SHOT(pl_icon, "previous");
+		picture_free(&pic);
+
+#undef SHOT
+
+		obs_source_release(icon);
+		obs_source_release(pl_icon);
+	}
+
+	obs_sceneitem_remove(item);
+	obs_source_release(playlist);
 }
 
 static void test_target_by_uuid(obs_source_t *media)
@@ -1179,6 +1321,7 @@ int main(int argc, char **argv)
 	test_icon(media);
 	test_playlist();
 	test_styles(media);
+	test_glyph_sets(media);
 
 	obs_set_output_source(0, NULL);
 	obs_source_release(media);
