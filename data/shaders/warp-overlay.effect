@@ -1,0 +1,634 @@
+/*
+Warp
+Copyright (C) 2026 Voidscape Development
+
+Draws the Warp Progress Bar and the Warp Status Icon. Everything is worked out
+per pixel from the distance to the edge of a shape, so a bar, a ring and every
+glyph stay sharp and antialiased at whatever size they are drawn, with no
+texture to scale.
+*/
+
+uniform float4x4 ViewProj;
+
+/* the size of the shape being drawn, in pixels */
+uniform float2 size;
+uniform float opacity;
+
+/* the bar ------------------------------------------------------------------ */
+
+/* The quad is drawn 'pad' pixels bigger than the bar all round, so the
+ * shadow, the glow and a knob bigger than the bar have room to spill into. */
+uniform float pad;
+/* 0 left to right, 1 right to left, 2 bottom to top, 3 top to bottom, 4 ring */
+uniform float mode;
+uniform float progress;
+uniform float radius;
+uniform float border;
+uniform float ring_thickness;
+/* how far the ends of a horizontal bar lean, in pixels */
+uniform float slant;
+/* the track cut into this many segments, with gaps this wide; 0 for none */
+uniform float segments;
+uniform float segment_gap;
+/* the light along the top of the fill, from 0 to 1 */
+uniform float sheen;
+/* how far the glow round the leading edge reaches, in pixels; 0 for none */
+uniform float glow;
+/* a drop shadow under the whole bar */
+uniform float bshadow;
+uniform float bshadow_blur;
+uniform float bshadow_y;
+/* 0 none, 1 a line, 2 a round knob; head_width is its width or diameter */
+uniform float knob;
+uniform float head_width;
+uniform float4 track_color;
+uniform float4 fill_color;
+uniform float4 fill_color2;
+uniform float4 border_color;
+uniform float4 head_color;
+
+/* the icon ----------------------------------------------------------------- */
+
+/* which glyph: see warp-status-icon.c */
+uniform float glyph;
+/* 0 none, 1 circle, 2 rounded square */
+uniform float plate_shape;
+uniform float glyph_scale;
+/* how far the glyph's corners are rounded off, in glyph units */
+uniform float glyph_round;
+uniform float shadow;
+uniform float2 shadow_offset;
+uniform float shadow_soft;
+uniform float4 glyph_color;
+/* 0 solid, 1 duotone, 2 outline, 3 gradient; the second color is the
+ * supporting part of a duotone glyph, and the bottom of a gradient one */
+uniform float glyph_mode;
+uniform float4 glyph_color2;
+uniform float4 plate_color;
+uniform float4 shadow_color;
+
+/* a picture of the operator's own, in place of a glyph */
+uniform texture2d image;
+
+sampler_state textureSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv = v_in.uv;
+
+	return vert_out;
+}
+
+/* shapes ------------------------------------------------------------------- */
+
+#define PI 3.14159265
+/* how thick an outline icon's stroke is, in glyph units */
+#define OUTLINE 0.13
+#define TAU 6.2831853
+
+float sd_box(float2 p, float2 half_size, float r)
+{
+	float2 q = abs(p) - half_size + float2(r, r);
+
+	return length(max(q, float2(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
+float sd_triangle(float2 p, float2 p0, float2 p1, float2 p2)
+{
+	float2 e0 = p1 - p0;
+	float2 e1 = p2 - p1;
+	float2 e2 = p0 - p2;
+	float2 v0 = p - p0;
+	float2 v1 = p - p1;
+	float2 v2 = p - p2;
+	float2 pq0 = v0 - e0 * saturate(dot(v0, e0) / dot(e0, e0));
+	float2 pq1 = v1 - e1 * saturate(dot(v1, e1) / dot(e1, e1));
+	float2 pq2 = v2 - e2 * saturate(dot(v2, e2) / dot(e2, e2));
+	float s = sign(e0.x * e2.y - e0.y * e2.x);
+	float2 d0 = float2(dot(pq0, pq0), s * (v0.x * e0.y - v0.y * e0.x));
+	float2 d1 = float2(dot(pq1, pq1), s * (v1.x * e1.y - v1.y * e1.x));
+	float2 d2 = float2(dot(pq2, pq2), s * (v2.x * e2.y - v2.y * e2.x));
+	float2 d = min(min(d0, d1), d2);
+
+	return -sqrt(d.x) * sign(d.y);
+}
+
+/* a ring of radius r and thickness th */
+float sd_ring(float2 p, float r, float th)
+{
+	return abs(length(p) - r) - th * 0.5;
+}
+
+/* how far round from the top p is, clockwise, from 0 to 1; y runs down */
+float turn_of(float2 p)
+{
+	float a = atan2(p.x, -p.y) / TAU;
+
+	return a - floor(a);
+}
+
+/* coverage of a shape at distance d, with the edge 'px' wide */
+float cover(float d, float px)
+{
+	return saturate(0.5 - d / px);
+}
+
+/* a soft falloff outside a shape, 1 at its edge and 0 'reach' away */
+float falloff(float d, float reach)
+{
+	float t = saturate(d / max(reach, 0.001));
+
+	return (1.0 - t) * (1.0 - t);
+}
+
+/* straight color 'src' laid over premultiplied 'dst' */
+float4 over(float4 dst, float4 src, float a)
+{
+	float sa = src.a * a;
+
+	return float4(src.rgb * sa + dst.rgb * (1.0 - sa), sa + dst.a * (1.0 - sa));
+}
+
+float4 unpremultiply(float4 c)
+{
+	if (c.a <= 0.0)
+		return float4(0.0, 0.0, 0.0, 0.0);
+
+	return float4(c.rgb / c.a, c.a * opacity);
+}
+
+/* the fill's color at 'along' (0 to 1 down the bar), lit by the sheen at
+ * 'across' (0 at the top edge, 1 at the bottom) */
+float4 lit_fill(float along, float across)
+{
+	float4 c = lerp(fill_color, fill_color2, saturate(along));
+	float top = sheen * 0.5 * (1.0 - smoothstep(0.0, 0.6, across));
+	float bottom = sheen * 0.2 * smoothstep(0.55, 1.0, across);
+
+	c.rgb = lerp(c.rgb, float3(1.0, 1.0, 1.0), top) * (1.0 - bottom);
+	return c;
+}
+
+/* a segment gap at 'along' pixels down a track 'len' long: 0 in a gap, 1
+ * outside one, with no gap at either end */
+float segment_mask(float along, float len)
+{
+	if (segments < 1.5)
+		return 1.0;
+
+	float seg = len / segments;
+	float k = floor(along / seg + 0.5);
+
+	if (k < 0.5 || k > segments - 0.5)
+		return 1.0;
+
+	return saturate(abs(along - k * seg) - segment_gap * 0.5 + 0.5);
+}
+
+/* the bar ------------------------------------------------------------------ */
+
+float4 bar_linear(float2 p)
+{
+	float2 c = size * 0.5;
+	bool horizontal = mode < 1.5;
+	float lean = horizontal ? abs(slant) : 0.0;
+	float2 half_size = float2(c.x - lean * 0.5, c.y);
+	float r = min(radius, min(half_size.x, half_size.y));
+
+	/* a slanted bar is a straight one with its rows slid sideways */
+	float2 q = p - c;
+
+	if (horizontal)
+		q.x += q.y / max(size.y, 1.0) * slant;
+
+	float d_outer = sd_box(q, half_size, r);
+	float d_inner = d_outer + border;
+
+	float length_px = horizontal ? half_size.x * 2.0 : size.y;
+	float along;
+	float across;
+
+	if (mode < 0.5) {
+		along = q.x + half_size.x;
+		across = (q.y + c.y) / size.y;
+	} else if (mode < 1.5) {
+		along = half_size.x - q.x;
+		across = (q.y + c.y) / size.y;
+	} else if (mode < 2.5) {
+		along = c.y - q.y;
+		across = (q.x + c.x) / size.x;
+	} else {
+		along = q.y + c.y;
+		across = (q.x + c.x) / size.x;
+	}
+
+	float head = progress * length_px;
+	float fill_mask = saturate(head - along + 0.5);
+	float seg = segment_mask(along, length_px);
+
+	float inner = cover(d_inner, 1.0) * seg;
+	float outer = cover(d_outer, 1.0);
+	float4 head_fill = lerp(fill_color, fill_color2, progress);
+	float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+
+	/* under everything, the bar's shadow, falling only outside it: a
+	 * track that lets the picture through must not show it darkened */
+	if (bshadow > 0.5) {
+		float2 qs = q - float2(0.0, bshadow_y);
+		float d_shadow = sd_box(qs, half_size, r);
+
+		acc = over(acc, shadow_color, falloff(d_shadow + 1.0, bshadow_blur + 1.0) * (1.0 - outer));
+	}
+
+	/* the glow off the fill, strongest at its leading edge */
+	if (glow > 0.0 && progress > 0.0) {
+		float d_fill = max(d_outer, along - head);
+		float2 at = horizontal ? float2(along - head, q.y) : float2(q.x, along - head);
+		float edge = falloff(length(at), glow * 1.6);
+		float body = falloff(max(d_fill, 0.0), glow) * 0.45;
+
+		acc = over(acc, head_fill, max(edge * 0.8, body));
+	}
+
+	/* the track, a touch darker along its top as if set into the picture
+	 * when the bar is lit at all; a flat shape keeps its color exactly */
+	float4 track = track_color;
+	track.rgb *= 1.0 - 0.3 * saturate(sheen) * (1.0 - across);
+	acc = over(acc, track, inner);
+
+	acc = over(acc, lit_fill(along / length_px, across), inner * fill_mask);
+
+	if (border > 0.0)
+		acc = over(acc, border_color, saturate(outer - cover(d_inner, 1.0)));
+
+	if (knob > 0.5 && knob < 1.5) {
+		acc = over(acc, head_color, outer * saturate(head_width * 0.5 + 0.5 - abs(along - head)));
+	} else if (knob > 1.5) {
+		float2 at = horizontal ? float2(along - head, q.y) : float2(q.x, along - head);
+		float kr = head_width * 0.5;
+		float d_knob = length(at) - kr;
+		float d_knob_shadow = length(at - float2(0.0, 1.5)) - kr;
+
+		acc = over(acc, float4(0.0, 0.0, 0.0, 0.45), falloff(d_knob_shadow + 1.0, 4.0));
+
+		float4 kc = head_color;
+		kc.rgb *= 0.88 + 0.12 * saturate(-at.y / max(kr, 1.0) * 0.5 + 0.5);
+		acc = over(acc, kc, cover(d_knob, 1.0));
+	}
+
+	return acc;
+}
+
+float4 bar_ring(float2 p)
+{
+	float2 c = size * 0.5;
+	float outer_r = min(c.x, c.y) - 0.5;
+	float th = min(ring_thickness, outer_r);
+	float mid_r = outer_r - th * 0.5;
+	float2 v = p - c;
+
+	float d_outer = sd_ring(v, mid_r, th);
+	float d_inner = sd_ring(v, mid_r, max(th - border * 2.0, 0.0));
+
+	/* the filled arc: its far end is cut square, or rounded off with a cap
+	 * the width of the ring when the corners are rounded */
+	float turn = turn_of(v);
+	float arc = (progress - turn) * TAU * mid_r;
+	float fill_mask = progress >= 1.0 ? 1.0 : saturate(arc + 0.5);
+	float end = progress * TAU;
+	float2 end_dir = float2(sin(end), -cos(end));
+	float2 end_at = end_dir * mid_r;
+	float half_w = max(th * 0.5 - border, 0.0);
+
+	if (radius > 0.0 && progress > 0.0 && progress < 1.0) {
+		float2 start_at = float2(0.0, -mid_r);
+		float caps = min(length(v - end_at), length(v - start_at)) - half_w;
+
+		fill_mask = max(fill_mask, cover(caps, 1.0));
+	}
+
+	/* segments round the ring, the gaps measured along it */
+	float seg = 1.0;
+
+	if (segments > 1.5) {
+		float k = floor(turn * segments + 0.5);
+		seg = saturate(abs(turn * segments - k) * TAU * mid_r / segments - segment_gap * 0.5 + 0.5);
+	}
+
+	/* across the ring from its outside edge in */
+	float across = saturate((outer_r - length(v)) / max(th, 1.0));
+	float inner = cover(d_inner, 1.0) * seg;
+	float outer = cover(d_outer, 1.0);
+	float4 head_fill = lerp(fill_color, fill_color2, progress);
+	float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+
+	if (bshadow > 0.5) {
+		float d_shadow = sd_ring(v - float2(0.0, bshadow_y), mid_r, th);
+
+		acc = over(acc, shadow_color, falloff(d_shadow + 1.0, bshadow_blur + 1.0) * (1.0 - outer));
+	}
+
+	if (glow > 0.0 && progress > 0.0) {
+		float edge = falloff(length(v - end_at), glow * 1.6 + half_w);
+		float body = arc > 0.0 ? falloff(max(d_outer, 0.0), glow) * 0.45 : 0.0;
+
+		acc = over(acc, head_fill, max(edge * 0.8, body));
+	}
+
+	/* the track, a touch darker along its top as if set into the picture
+	 * when the bar is lit at all; a flat shape keeps its color exactly */
+	float4 track = track_color;
+	track.rgb *= 1.0 - 0.3 * saturate(sheen) * (1.0 - across);
+	acc = over(acc, track, inner);
+	acc = over(acc, lit_fill(turn, across), inner * fill_mask);
+
+	if (border > 0.0)
+		acc = over(acc, border_color, saturate(outer - cover(d_inner, 1.0)));
+
+	if (knob > 0.5 && knob < 1.5) {
+		/* a line out from the centre through the end of the arc */
+		float along_line = abs(v.x * end_dir.y - v.y * end_dir.x);
+		float facing = dot(v, end_dir) > 0.0 ? 1.0 : 0.0;
+
+		acc = over(acc, head_color, outer * facing * saturate(head_width * 0.5 + 0.5 - along_line));
+	} else if (knob > 1.5) {
+		float kr = head_width * 0.5;
+		float d_knob = length(v - end_at) - kr;
+		float d_knob_shadow = length(v - end_at - float2(0.0, 1.5)) - kr;
+
+		acc = over(acc, float4(0.0, 0.0, 0.0, 0.45), falloff(d_knob_shadow + 1.0, 4.0));
+		acc = over(acc, head_color, cover(d_knob, 1.0));
+	}
+
+	return acc;
+}
+
+float4 PSBar(VertData v_in) : TARGET
+{
+	float2 p = v_in.uv * (size + float2(pad, pad) * 2.0) - float2(pad, pad);
+
+	if (mode > 3.5)
+		return unpremultiply(bar_ring(p));
+
+	return unpremultiply(bar_linear(p));
+}
+
+/* the icon ----------------------------------------------------------------- */
+
+/* Every glyph is drawn as two parts: the one that says what happened, and the
+ * one that supports it. Solid, outline and gradient icons draw the two as one
+ * shape; a duotone icon gives each its own color. A part a glyph does not have
+ * is far away. A few glyphs are only split for duotone: play sits on a disc and
+ * stop in a soft square there, since on their own they are one shape. */
+#define NONE 1000.0
+
+float sd_play(float2 p)
+{
+	return sd_triangle(p, float2(-0.5, -0.8), float2(-0.5, 0.8), float2(0.85, 0.0));
+}
+
+float2 parts_play(float2 p, bool duo)
+{
+	if (!duo)
+		return float2(sd_play(p), NONE);
+
+	/* a smaller triangle on a disc, set right a little to sit optically
+	 * in the middle */
+	float k = 0.55;
+
+	return float2(sd_play((p - float2(0.06, 0.0)) / k) * k, length(p) - 0.96);
+}
+
+float2 parts_pause(float2 p)
+{
+	/* the left bar leads and the right one follows it */
+	float left = sd_box(p + float2(0.38, 0.0), float2(0.19, 0.78), 0.05);
+	float right = sd_box(p - float2(0.38, 0.0), float2(0.19, 0.78), 0.05);
+
+	return float2(left, right);
+}
+
+float2 parts_stop(float2 p, bool duo)
+{
+	if (!duo)
+		return float2(sd_box(p, float2(0.7, 0.7), 0.1), NONE);
+
+	return float2(sd_box(p, float2(0.34, 0.34), 0.05), sd_box(p, float2(0.84, 0.84), 0.2));
+}
+
+float2 parts_ended(float2 p)
+{
+	return float2(sd_box(p, float2(0.36, 0.36), 0.06), sd_ring(p, 0.86, 0.16));
+}
+
+float2 parts_step(float2 p)
+{
+	/* the bar is the frame the step lands on, so it leads */
+	float tri = sd_triangle(p, float2(-0.75, -0.72), float2(-0.75, 0.72), float2(0.4, 0.0));
+	float bar = sd_box(p - float2(0.62, 0.0), float2(0.14, 0.72), 0.04);
+
+	return float2(bar, tri);
+}
+
+float2 parts_skip(float2 p)
+{
+	float a = sd_triangle(p, float2(-0.9, -0.62), float2(-0.9, 0.62), float2(-0.15, 0.0));
+	float b = sd_triangle(p, float2(-0.18, -0.62), float2(-0.18, 0.62), float2(0.57, 0.0));
+	float bar = sd_box(p - float2(0.74, 0.0), float2(0.13, 0.62), 0.04);
+
+	return float2(min(b, bar), a);
+}
+
+float2 parts_fast(float2 p)
+{
+	float a = sd_triangle(p, float2(-0.92, -0.66), float2(-0.92, 0.66), float2(0.0, 0.0));
+	float b = sd_triangle(p, float2(0.0, -0.66), float2(0.0, 0.66), float2(0.92, 0.0));
+
+	return float2(b, a);
+}
+
+float2 parts_slow(float2 p)
+{
+	/* a play triangle inside a dashed circle */
+	float ring = sd_ring(p, 0.86, 0.14);
+	float n = turn_of(p) * 12.0;
+	float dash = (abs(n - floor(n) - 0.5) - 0.3) * (TAU * 0.86 / 12.0);
+	float tri = sd_triangle(p, float2(-0.28, -0.42), float2(-0.28, 0.42), float2(0.44, 0.0));
+
+	return float2(tri, max(ring, dash));
+}
+
+float2 parts_restart(float2 p)
+{
+	/* a circle with a gap at the top, the arrow on its right-hand end
+	 * pointing back round anticlockwise */
+	float r = 0.68;
+	float gap = 0.09;
+	float turn = turn_of(p);
+	float from_top = min(turn, 1.0 - turn);
+	float arc = max(sd_ring(p, r, 0.2), (gap - from_top) * TAU * r);
+
+	float a = gap * TAU;
+	float2 at = float2(sin(a), -cos(a)) * r;
+	float2 radial = float2(sin(a), -cos(a));
+	float2 back = float2(-cos(a), -sin(a));
+	float head = sd_triangle(p, at + radial * 0.32, at - radial * 0.32, at + back * 0.38);
+
+	return float2(head, arc);
+}
+
+/* the two parts of glyph number 'g' at p; see warp-status-icon.c */
+float2 parts_sharp(float2 p, float g, bool duo)
+{
+	if (g < 1.5)
+		return parts_play(p, duo);
+	if (g < 2.5)
+		return parts_pause(p);
+	if (g < 3.5)
+		return parts_stop(p, duo);
+	if (g < 4.5)
+		return parts_ended(p);
+	if (g < 5.5)
+		return parts_step(p);
+	if (g < 6.5)
+		return parts_step(float2(-p.x, p.y));
+	if (g < 7.5)
+		return parts_skip(p);
+	if (g < 8.5)
+		return parts_skip(float2(-p.x, p.y));
+	if (g < 9.5)
+		return parts_restart(p);
+	if (g < 10.5)
+		return parts_fast(p);
+
+	return parts_slow(p);
+}
+
+/* the parts with their corners rounded off: drawn a touch smaller and grown
+ * back out by the rounding, so the glyph keeps its size */
+float2 glyph_parts(float2 p, float g, bool duo)
+{
+	float k = 1.0 + glyph_round;
+
+	return parts_sharp(p * k, g, duo) / k - float2(glyph_round, glyph_round) * 0.85;
+}
+
+/* The glyph as one shape, the way the icon set draws it: an outline icon is a
+ * stroke inside the edge of the solid one, so it keeps the same size. */
+float sd_glyph(float2 p, float g)
+{
+	float2 d = glyph_parts(p, g, glyph_mode > 0.5 && glyph_mode < 1.5);
+	float solid = min(d.x, d.y);
+
+	if (glyph_mode > 1.5 && glyph_mode < 2.5)
+		return abs(solid + OUTLINE * 0.5) - OUTLINE * 0.5;
+
+	return solid;
+}
+
+float sd_plate(float2 q)
+{
+	if (plate_shape < 1.5)
+		return length(q) - 1.0;
+
+	return sd_box(q, float2(1.0, 1.0), 0.3);
+}
+
+float4 PSIcon(VertData v_in) : TARGET
+{
+	/* -1 to 1 across the icon, y down, and how wide a pixel is in that */
+	float2 q = v_in.uv * 2.0 - float2(1.0, 1.0);
+	float px = 2.0 / min(size.x, size.y);
+	float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+
+	if (plate_shape > 0.5)
+		acc = over(acc, plate_color, cover(sd_plate(q), px));
+
+	if (glyph > 0.5) {
+		float2 g = q / glyph_scale;
+		float gpx = px / glyph_scale;
+
+		if (shadow > 0.5) {
+			float d_shadow = sd_glyph(g - shadow_offset / glyph_scale, glyph);
+			float soft = max(shadow_soft / glyph_scale, gpx);
+
+			acc = over(acc, shadow_color, saturate(0.5 - d_shadow / soft));
+		}
+
+		if (glyph_mode > 0.5 && glyph_mode < 1.5) {
+			/* duotone: the supporting part, then the leading one over it */
+			float2 d = glyph_parts(g, glyph, true);
+
+			acc = over(acc, glyph_color2, cover(d.y, gpx));
+			acc = over(acc, glyph_color, cover(d.x, gpx));
+		} else if (glyph_mode > 2.5) {
+			/* gradient: the first color at the top, the second at the
+			 * bottom, across the glyph's own height */
+			float4 c = lerp(glyph_color, glyph_color2, saturate(g.y * 0.55 + 0.5));
+
+			acc = over(acc, c, cover(sd_glyph(g, glyph), gpx));
+		} else {
+			acc = over(acc, glyph_color, cover(sd_glyph(g, glyph), gpx));
+		}
+	}
+
+	return unpremultiply(acc);
+}
+
+/* an image of the operator's own, faded by 'opacity' */
+float4 PSImage(VertData v_in) : TARGET
+{
+	float4 c = image.Sample(textureSampler, v_in.uv);
+
+	return float4(c.rgb, c.a * opacity);
+}
+
+/* the same, for a picture whose colors are already multiplied by its alpha */
+float4 PSImagePremultiplied(VertData v_in) : TARGET
+{
+	return image.Sample(textureSampler, v_in.uv) * opacity;
+}
+
+technique Bar
+{
+	pass {
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSBar(v_in);
+	}
+}
+
+technique Icon
+{
+	pass {
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSIcon(v_in);
+	}
+}
+
+technique Image
+{
+	pass {
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSImage(v_in);
+	}
+}
+
+technique ImagePremultiplied
+{
+	pass {
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSImagePremultiplied(v_in);
+	}
+}

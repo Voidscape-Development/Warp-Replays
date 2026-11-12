@@ -16,6 +16,7 @@
 !LICENSE
 !README.md
 !ROADMAP.md
+!/tests
 
 # Exclude lock files
 *.lock.json
