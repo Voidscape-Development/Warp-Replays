@@ -51,16 +51,23 @@ Every playlist action can also be driven from outside OBS — see [obs-websocket
 A source that draws how far through its replay a Warp Media or Warp Playlist source is, to sit over the replay on air. Add it like any other source and pick the source it **follows** from the list at the top of its properties. It is kept by the source itself rather than its name, so renaming the replay source does not lose it, and a source that is not there yet — a scene collection still loading — is picked up as soon as it is.
 
 * **What it measures**: the file that is playing, from its start to its end, or the clip of it when the file is played as one — the same position and length the media controls show. For a playlist it starts again with every file.
-* **Shape**: a **horizontal bar**, a **vertical bar** or a **ring**. The bars fill left to right or bottom to top, or the other way round; the ring fills clockwise from the top. Bars take a **corner radius**, and the ring **rounded ends**.
-* **Colors**: the fill, a **gradient** along it to a second color, the background track (with its own opacity, down to none), a **border** of any width, and a **playhead** marker at the position.
+* **Style**: a starting point for the look, picked at the top of the properties and changed from there as much as you like. Picking one fills in the colors, effects and proportions; it never touches what the bar measures, where it sits or how long it is.
+  * **Broadcast** (the default): a thin bar over a pale glass track, its warm fill lit along the top and glowing at its leading edge, a knob at the position, and the time in a dark chip riding along above it.
+  * **Segmented**: a white strip counted off into 24 pieces.
+  * **Sport**: slanted ends and a cyan-to-blue fill with a line for a head, the time in a chip slanted to match.
+  * **Minimal**: a red hairline with a dot at the position.
+  * **Flat**: plain shapes with no light, glow or shadow.
+* **Shape**: a **horizontal bar**, a **vertical bar** or a **ring**. The bars fill left to right or bottom to top, or the other way round; the ring fills clockwise from the top. Bars take a **corner radius** and **slanted ends**, and the ring **rounded ends**. Any of them can be cut into **segments**.
+* **Colors and light**: the fill, a **gradient** along it to a second color, the background track (with its own opacity, down to none), a **border** of any width, a **sheen** along the top of the fill, a **glow** off its leading edge, and a soft **drop shadow** that falls only outside the bar, so a see-through track stays clear.
+* **Playhead**: none, a line, or a round knob at the position.
 * **Color by state**: a fill color of its own while **paused** (stepping pauses), in **slow motion**, played **fast**, and once it has **ended**. The fill fades from one to the next.
-* **Time**: the elapsed time, the time remaining, either of them over the total, or a percentage, above or below the bar or on it (in the middle of a ring), in any font. **Count time at the playback speed** makes it time on the clock rather than in the clip: at 50%, a clip with 4 seconds left reads 8. The bar itself always shows how much of the clip has played.
+* **Time**: the elapsed time, the time remaining, either of them over the total, or a percentage, riding along above the position, above or below the bar, or on it (in the middle of a ring), in any font, and on a **chip** of its own color when wanted — rounded on a rounded bar, square on a square one, and slanted with a slanted one. **Count time at the playback speed** makes it time on the clock rather than in the clip: at 50%, a clip with 4 seconds left reads 8. The bar itself always shows how much of the clip has played.
 * **Smooth motion**: the fill glides every frame between the positions the source reports, rather than ticking with the frames of the video. A seek, a frame step or a new file is followed at once.
 * **Playlist transitions**: when a playlist moves to another file, the fill eases back from where the outgoing file left it to the incoming one over the length of the transition, so it runs back as the picture changes rather than snapping to the start while the old file is still on screen. A cut, or a switch with no transition, snaps.
 * **When there is nothing to show**: what a stopped source, an ended one, and one with nothing loaded each look like — empty, full, the last position, or hidden. By default an ended replay shows full and the bar is hidden otherwise.
 * **Hide while off air**: fades the bar out whenever the source it follows is not in the program output, so it can sit in a scene of its own on top of everything and only show while a replay is on air.
 
-The source is as big as the bar or ring is set to be, plus a band for the time when it is above or below, so it lines up in a scene like any other source.
+The source is as big as the bar or ring is set to be, plus room round it for its shadow, glow and knob, and a band for the time when it is above or below, so it lines up in a scene like any other source and nothing it draws is cut off.
 
 ### Warp Status Icon
 
@@ -69,7 +76,13 @@ A source that shows what a Warp Media or Warp Playlist source is doing, as an ic
 * **The state, all along**: play, pause, stopped and ended. With **Hide while playing normally** on (the default) nothing shows while the replay plays at 100%, so the icon only comes up when something is out of the ordinary; going back into play still flashes the play icon.
 * **What just happened, for a moment**: a **frame step** forward or back, with the frames stepped beside it (steps the same way in a row add up, so holding the key reads +7 rather than +1 seven times); a **speed change**, with the new speed; and **next**, **previous** and **restart**. Each is shown for a set time — a second by default — and then gives way back to the state. A playlist rolling on to its next file by itself is not flashed.
 * **Speed**: slow motion and fast have icons of their own, shown for as long as the speed is not 100%. With **Show the speed as a badge** on, the badge sits in the corner of play or pause — paused in slow motion reads as both; with it off, the speed icon takes play's place.
-* **Look**: built-in icons drawn at whatever size the source is, so they stay sharp; their color; a **background** circle or rounded square behind them with a color and opacity of its own; a **drop shadow**; and the **value** — the speed or the frames stepped — to the right of the icon or below it, in any font and color. Changes **fade** from one icon to the next.
+* **Style**: a starting point for the look, filled in the same way as the progress bar's.
+  * **Chip** (the default): the icon and what it means in one dark pill with an accent rim — `PAUSED`, `SLOW MO 50%`, `FRAME +5` — that widens and narrows smoothly as the words change, with the replay's progress as a fine accent line under them.
+  * **Badge**: the icon on a disc whose rim fills round with the replay's progress, the speed as an accent pip in its corner, and the value beside it.
+  * **Minimal**: the icon alone, lifted off the picture by a soft shadow.
+  * **Flat**: the icon on a plain disc, with no rounding or motion.
+* **Text**: what the icon means (`PAUSED`, `SLOW MO`), its value (the speed, or the frames stepped), or both, in any font and color — inside the chip, or to the right of the icon or below it.
+* **Look**: built-in icons drawn at whatever size the source is, so they stay sharp, with their corners **rounded** off; their color; a **background** circle or rounded square behind them with a color and opacity of its own; an **accent** rim, and the replay's **progress** shown in it; and a **drop shadow**. Changes **fade** from one icon to the next, and a new icon **pops in**.
 * **Own images**: any icon can be replaced by an image file of your own, one per state, drawn inside the icon's background.
 * **Hide while off air**, the same as the progress bar's.
 

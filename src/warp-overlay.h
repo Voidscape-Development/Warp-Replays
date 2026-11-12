@@ -169,6 +169,48 @@ void warp_overlay_color(struct vec4 *out, uint32_t color);
  * for colors that are faded from one to another between renders */
 void warp_overlay_color_for_render(struct vec4 *out, const struct vec4 *srgb);
 
+/* Everything the overlay effect's Bar technique draws with. The bar, the ring,
+ * the icon's chip and its progress ring are all one of these. Colors are kept
+ * as they are set (sRGB, straight alpha) and made linear as they are drawn. */
+struct warp_overlay_bar {
+	/* the bar's own size; the quad is 'pad' bigger all round */
+	float w;
+	float h;
+	float pad;
+	/* 0 left to right, 1 right to left, 2 bottom to top, 3 top to bottom,
+	 * 4 ring */
+	float mode;
+	float progress;
+	float radius;
+	float border;
+	float ring_thickness;
+	float slant;
+	float segments;
+	float segment_gap;
+	float sheen;
+	float glow;
+	bool shadow;
+	float shadow_blur;
+	float shadow_y;
+	/* 0 none, 1 line, 2 knob */
+	float knob;
+	float head_width;
+	struct vec4 track;
+	struct vec4 fill;
+	struct vec4 fill2;
+	struct vec4 border_color;
+	struct vec4 head;
+	struct vec4 shadow_color;
+	float opacity;
+};
+
+/* a color setting as a vec4, as it is set */
+void warp_overlay_rgba(struct vec4 *out, uint32_t color);
+
+/* Draws 'b' with the bar's top left at (x, y). Graphics thread, inside a
+ * render. */
+void warp_overlay_draw_bar(gs_effect_t *effect, const struct warp_overlay_bar *b, float x, float y);
+
 /* moves 'value' toward 'target' at 'rate' per second */
 float warp_overlay_approach(float value, float target, float rate, float seconds);
 

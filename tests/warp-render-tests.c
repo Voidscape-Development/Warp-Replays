@@ -267,9 +267,19 @@ static void call_int(obs_source_t *source, const char *proc, const char *arg, lo
 	calldata_free(&cd);
 }
 
+/* The plainest look of each overlay, which the pixel checks below are written
+ * against: nothing spills off the bar, nothing pops or rounds on the icon. */
+static const char *flat_bar = "{\"shadow\": false, \"glow\": 0, \"sheen\": 0, \"playhead\": \"none\","
+			      " \"gradient\": false, \"fill_color\": 4294967295, \"text_chip\": false,"
+			      " \"slant\": 0, \"segments\": 0}";
+static const char *flat_icon = "{\"layout\": \"beside\", \"plate\": \"circle\", \"plate_color\": 2566914048,"
+			       " \"size\": 128, \"glyph_scale\": 50, \"rounded_glyphs\": false, \"pop\": false,"
+			       " \"accent_width\": 0, \"show_progress\": false, \"text_content\": \"value\"}";
+
 static obs_source_t *make_overlay(const char *id, const char *name, obs_source_t *target, obs_data_t *extra)
 {
-	obs_data_t *settings = obs_data_create();
+	obs_data_t *settings =
+		obs_data_create_from_json(strcmp(id, "warp_progress_source") == 0 ? flat_bar : flat_icon);
 
 	obs_data_set_string(settings, "target", target ? obs_source_get_uuid(target) : "");
 	if (extra)
@@ -461,7 +471,7 @@ static void test_progress_bar(obs_source_t *media)
 	picture_free(&pic);
 
 	/* a playhead and a border, and the time over the bar */
-	set(bar, "{\"playhead\": true, \"playhead_width\": 6, \"playhead_color\": 4278255360,"
+	set(bar, "{\"playhead\": \"line\", \"playhead_width\": 6, \"playhead_color\": 4278255360,"
 		 " \"border_width\": 2, \"border_color\": 4294901760,"
 		 " \"text\": \"elapsed_total\", \"text_position\": \"above\"}");
 	wait_ms(300);
@@ -488,7 +498,7 @@ static void test_progress_bar(obs_source_t *media)
 	picture_free(&pic);
 
 	/* ended: full by default */
-	set(bar, "{\"playhead\": false, \"border_width\": 0, \"text\": \"none\", \"idle_ended\": \"full\"}");
+	set(bar, "{\"playhead\": \"none\", \"border_width\": 0, \"text\": \"none\", \"idle_ended\": \"full\"}");
 	obs_source_media_play_pause(media, false);
 	check(wait_state(media, OBS_MEDIA_STATE_ENDED, 6000), "the media runs to its end");
 	wait_ms(300);
@@ -832,6 +842,141 @@ static void test_playlist(void)
 	obs_source_release(playlist);
 }
 
+/* picks a style the way the properties do, and applies what it filled in */
+static void apply_style(obs_source_t *source, const char *style)
+{
+	obs_data_t *settings = obs_source_get_settings(source);
+	obs_properties_t *props = obs_source_properties(source);
+
+	obs_data_set_string(settings, "style", style);
+	obs_property_modified(obs_properties_get(props, "style"), settings);
+	obs_source_update(source, settings);
+
+	obs_properties_destroy(props);
+	obs_data_release(settings);
+}
+
+static uint32_t opaque_columns(const struct picture *p)
+{
+	uint32_t right = 0;
+
+	for (uint32_t x = 0; x < p->w; x++)
+		for (uint32_t y = 0; y < p->h; y++)
+			if (px(p, x, y)[3] > 128)
+				right = x + 1;
+
+	return right;
+}
+
+static void test_styles(obs_source_t *media)
+{
+	static const char *bar_styles[] = {"broadcast", "segmented", "sport", "minimal", "flat"};
+	static const char *icon_styles[] = {"chip", "badge", "minimal", "flat"};
+	struct picture pic;
+	char name[128];
+
+	printf("Styles\n");
+
+	load_clip(media, "clip-4s.mp4", "play");
+	wait_state(media, OBS_MEDIA_STATE_PLAYING, 3000);
+	wait_ms(1600);
+	obs_source_media_play_pause(media, true);
+	wait_state(media, OBS_MEDIA_STATE_PAUSED, 1000);
+	call_int(media, "warp_set_speed", "speed", 50);
+
+	for (size_t i = 0; i < sizeof(bar_styles) / sizeof(bar_styles[0]); i++) {
+		obs_source_t *bar = obs_source_create("warp_progress_source", "style-bar", NULL, NULL);
+		obs_data_t *t = obs_data_create();
+
+		obs_data_set_string(t, "target", obs_source_get_uuid(media));
+		obs_data_set_string(t, "text", "elapsed_total");
+		obs_data_set_int(t, "width", 640);
+		obs_source_update(bar, t);
+		obs_data_release(t);
+		apply_style(bar, bar_styles[i]);
+		wait_ms(300);
+
+		snprintf(name, sizeof(name), "style-bar-%s", bar_styles[i]);
+		render_and_save(bar, &pic, name);
+		check(count_opaque(&pic) > 640 * 3, "the %s bar draws (%ux%u)", bar_styles[i], pic.w, pic.h);
+
+		if (strcmp(bar_styles[i], "broadcast") == 0) {
+			check(pic.w > 640, "its shadow and glow are given room round the bar (%u wide)", pic.w);
+		}
+		picture_free(&pic);
+
+		set(bar, "{\"shape\": \"ring\", \"ring_size\": 180, \"text\": \"remaining\","
+			 " \"text_position\": \"inside\"}");
+		wait_ms(200);
+		snprintf(name, sizeof(name), "style-ring-%s", bar_styles[i]);
+		render_and_save(bar, &pic, name);
+		check(count_opaque(&pic) > 1000, "and as a ring");
+		picture_free(&pic);
+
+		obs_source_release(bar);
+	}
+
+	for (size_t i = 0; i < sizeof(icon_styles) / sizeof(icon_styles[0]); i++) {
+		obs_source_t *icon = obs_source_create("warp_status_icon_source", "style-icon", NULL, NULL);
+		obs_data_t *t = obs_data_create();
+		bool chip = strcmp(icon_styles[i], "chip") == 0;
+
+		obs_data_set_string(t, "target", obs_source_get_uuid(media));
+		obs_source_update(icon, t);
+		obs_data_release(t);
+		apply_style(icon, icon_styles[i]);
+		wait_ms(500);
+
+		snprintf(name, sizeof(name), "style-icon-%s-paused-slow", icon_styles[i]);
+		render_and_save(icon, &pic, name);
+		check(count_opaque(&pic) > 500, "the %s icon shows paused in slow motion", icon_styles[i]);
+
+		if (chip) {
+			uint32_t paused_w = opaque_columns(&pic);
+			uint32_t size = obs_source_get_height(icon);
+
+			check(paused_w > size * 2, "the chip opens out to take its text (%u wide, %u high)", paused_w,
+			      size);
+			picture_free(&pic);
+
+			call_int(media, "warp_step_frames", "frames", 5);
+			wait_ms(400);
+			render_and_save(icon, &pic, "style-icon-chip-step");
+			check(count_opaque(&pic) > 500, "and flashes a step");
+			picture_free(&pic);
+
+			call_int(media, "warp_set_speed", "speed", 100);
+			wait_ms(1300);
+			render_and_save(icon, &pic, "style-icon-chip-paused");
+			uint32_t plain_w = opaque_columns(&pic);
+			check(plain_w < paused_w, "and closes up to fit shorter text (%u, was %u)", plain_w, paused_w);
+			call_int(media, "warp_set_speed", "speed", 50);
+		} else {
+			call_int(media, "warp_step_frames", "frames", 5);
+			wait_ms(400);
+			snprintf(name, sizeof(name), "style-icon-%s-step", icon_styles[i]);
+			picture_free(&pic);
+			render_and_save(icon, &pic, name);
+		}
+
+		if (strcmp(icon_styles[i], "badge") == 0) {
+			/* a little way round the rim from the top is the accent */
+			float f = media_fraction(media);
+			float a = f * 0.4f * 6.2831853f;
+			float r = 112.0f * 0.5f - 3.0f;
+			const uint8_t *rim = px(&pic, (uint32_t)(56 + sinf(a) * r), (uint32_t)(56 - cosf(a) * r));
+
+			check(rim[0] > 200 && rim[1] > 140 && rim[2] < 80,
+			      "the badge's rim fills with the progress (%d,%d,%d)", rim[0], rim[1], rim[2]);
+		}
+
+		picture_free(&pic);
+		obs_source_release(icon);
+	}
+
+	call_int(media, "warp_set_speed", "speed", 100);
+}
+
 static void test_target_by_uuid(obs_source_t *media)
 {
 	printf("Target kept by UUID\n");
@@ -1003,6 +1148,7 @@ int main(int argc, char **argv)
 	test_ring(media);
 	test_icon(media);
 	test_playlist();
+	test_styles(media);
 
 	obs_set_output_source(0, NULL);
 	obs_source_release(media);

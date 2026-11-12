@@ -32,7 +32,21 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "warp-overlay.h"
 
+#define S_STYLE "style"
+/* the style the settings were last filled in from, so picking one fills them
+ * in once rather than every time the properties are opened */
+#define S_STYLE_APPLIED "style_applied"
 #define S_SHAPE "shape"
+#define S_SLANT "slant"
+#define S_SEGMENTS "segments"
+#define S_SEGMENT_GAP "segment_gap"
+#define S_SHEEN "sheen"
+#define S_GLOW "glow"
+#define S_SHADOW "shadow"
+#define S_SHADOW_COLOR "shadow_color"
+#define S_SHADOW_BLUR "shadow_blur"
+#define S_TEXT_CHIP "text_chip"
+#define S_CHIP_COLOR "chip_color"
 #define S_REVERSE "reverse"
 #define S_WIDTH "width"
 #define S_HEIGHT "height"
@@ -67,6 +81,16 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define S_IDLE_ENDED "idle_ended"
 #define S_IDLE_NONE "idle_none"
 
+#define STYLE_BROADCAST "broadcast"
+#define STYLE_SEGMENTED "segmented"
+#define STYLE_SPORT "sport"
+#define STYLE_MINIMAL "minimal"
+#define STYLE_FLAT "flat"
+
+#define PLAYHEAD_NONE "none"
+#define PLAYHEAD_LINE "line"
+#define PLAYHEAD_KNOB "knob"
+
 #define SHAPE_HORIZONTAL "horizontal"
 #define SHAPE_VERTICAL "vertical"
 #define SHAPE_RING "ring"
@@ -81,6 +105,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define POS_INSIDE "inside"
 #define POS_ABOVE "above"
 #define POS_BELOW "below"
+#define POS_FOLLOW "follow"
 
 #define IDLE_EMPTY "empty"
 #define IDLE_FULL "full"
@@ -115,6 +140,8 @@ enum warp_progress_text_pos {
 	WARP_PROGRESS_POS_INSIDE,
 	WARP_PROGRESS_POS_ABOVE,
 	WARP_PROGRESS_POS_BELOW,
+	/* above the bar, riding along with the position */
+	WARP_PROGRESS_POS_FOLLOW,
 };
 
 enum warp_progress_idle {
@@ -145,8 +172,19 @@ struct warp_progress_source {
 	bool gradient;
 	uint32_t border_width;
 	uint32_t border_color;
-	bool playhead;
+	/* 0 none, 1 line, 2 knob, as the effect takes it */
+	float playhead;
 	uint32_t playhead_width;
+	uint32_t slant;
+	uint32_t segments;
+	uint32_t segment_gap;
+	float sheen;
+	uint32_t glow;
+	bool shadow;
+	uint32_t shadow_color;
+	uint32_t shadow_blur;
+	bool text_chip;
+	uint32_t chip_color;
 	uint32_t playhead_color;
 	bool color_by_state;
 	uint32_t paused_color;
@@ -230,7 +268,19 @@ static void warp_progress_update(void *data, obs_data_t *settings)
 	s->gradient = obs_data_get_bool(settings, S_GRADIENT);
 	s->border_width = (uint32_t)obs_data_get_int(settings, S_BORDER_WIDTH);
 	s->border_color = (uint32_t)obs_data_get_int(settings, S_BORDER_COLOR);
-	s->playhead = obs_data_get_bool(settings, S_PLAYHEAD);
+	const char *playhead = obs_data_get_string(settings, S_PLAYHEAD);
+
+	s->playhead = strcmp(playhead, PLAYHEAD_KNOB) == 0 ? 2.0f : strcmp(playhead, PLAYHEAD_LINE) == 0 ? 1.0f : 0.0f;
+	s->slant = (uint32_t)obs_data_get_int(settings, S_SLANT);
+	s->segments = (uint32_t)obs_data_get_int(settings, S_SEGMENTS);
+	s->segment_gap = (uint32_t)obs_data_get_int(settings, S_SEGMENT_GAP);
+	s->sheen = (float)obs_data_get_int(settings, S_SHEEN) / 100.0f;
+	s->glow = (uint32_t)obs_data_get_int(settings, S_GLOW);
+	s->shadow = obs_data_get_bool(settings, S_SHADOW);
+	s->shadow_color = (uint32_t)obs_data_get_int(settings, S_SHADOW_COLOR);
+	s->shadow_blur = (uint32_t)obs_data_get_int(settings, S_SHADOW_BLUR);
+	s->text_chip = obs_data_get_bool(settings, S_TEXT_CHIP);
+	s->chip_color = (uint32_t)obs_data_get_int(settings, S_CHIP_COLOR);
 	s->playhead_width = (uint32_t)obs_data_get_int(settings, S_PLAYHEAD_WIDTH);
 	s->playhead_color = (uint32_t)obs_data_get_int(settings, S_PLAYHEAD_COLOR);
 	s->color_by_state = obs_data_get_bool(settings, S_COLOR_BY_STATE);
@@ -245,9 +295,18 @@ static void warp_progress_update(void *data, obs_data_t *settings)
 		       : strcmp(text, TEXT_REMAINING_TOTAL) == 0 ? WARP_PROGRESS_TEXT_REMAINING_TOTAL
 		       : strcmp(text, TEXT_PERCENT) == 0         ? WARP_PROGRESS_TEXT_PERCENT
 								 : WARP_PROGRESS_TEXT_NONE;
-	s->text_pos = strcmp(pos, POS_ABOVE) == 0   ? WARP_PROGRESS_POS_ABOVE
-		      : strcmp(pos, POS_BELOW) == 0 ? WARP_PROGRESS_POS_BELOW
-						    : WARP_PROGRESS_POS_INSIDE;
+	s->text_pos = strcmp(pos, POS_ABOVE) == 0    ? WARP_PROGRESS_POS_ABOVE
+		      : strcmp(pos, POS_BELOW) == 0  ? WARP_PROGRESS_POS_BELOW
+		      : strcmp(pos, POS_FOLLOW) == 0 ? WARP_PROGRESS_POS_FOLLOW
+						     : WARP_PROGRESS_POS_INSIDE;
+
+	/* riding along with the position only makes sense along a bar that
+	 * runs across; up a vertical one the time sits above it, and in a
+	 * ring, in the middle */
+	if (s->text_pos == WARP_PROGRESS_POS_FOLLOW && s->shape == WARP_PROGRESS_VERTICAL)
+		s->text_pos = WARP_PROGRESS_POS_ABOVE;
+	if (s->text_pos == WARP_PROGRESS_POS_FOLLOW && s->shape == WARP_PROGRESS_RING)
+		s->text_pos = WARP_PROGRESS_POS_INSIDE;
 
 	obs_data_release(s->text_font);
 	s->text_font = obs_data_get_obj(settings, S_TEXT_FONT);
@@ -266,38 +325,161 @@ static void warp_progress_update(void *data, obs_data_t *settings)
 	s->colors_set = false;
 }
 
+/* colors as 0xAARRGGBB, the way they are written everywhere else, turned
+ * into the 0xAABBGGRR OBS keeps them as */
+#define ARGB(c) \
+	((long long)(((uint32_t)(c) & 0xFF00FF00u) | (((uint32_t)(c) >> 16) & 0xFFu) | (((uint32_t)(c) & 0xFFu) << 16)))
+
+struct warp_progress_setter {
+	obs_data_t *data;
+	bool as_default;
+};
+
+static void set_int(struct warp_progress_setter *w, const char *key, long long value)
+{
+	if (w->as_default)
+		obs_data_set_default_int(w->data, key, value);
+	else
+		obs_data_set_int(w->data, key, value);
+}
+
+static void set_bool(struct warp_progress_setter *w, const char *key, bool value)
+{
+	if (w->as_default)
+		obs_data_set_default_bool(w->data, key, value);
+	else
+		obs_data_set_bool(w->data, key, value);
+}
+
+static void set_string(struct warp_progress_setter *w, const char *key, const char *value)
+{
+	if (w->as_default)
+		obs_data_set_default_string(w->data, key, value);
+	else
+		obs_data_set_string(w->data, key, value);
+}
+
+/* The styles: the look of the bar, filled in as a starting point to change
+ * from. They set how it looks, never what it measures, where it sits or how
+ * big it is along its length. */
+static void warp_progress_apply_style(obs_data_t *settings, const char *style, bool as_default)
+{
+	struct warp_progress_setter w = {settings, as_default};
+
+	/* what every style starts from */
+	set_bool(&w, S_GRADIENT, false);
+	set_int(&w, S_FILL_COLOR2, ARGB(0xFFFFFFFF));
+	set_int(&w, S_BORDER_WIDTH, 0);
+	set_int(&w, S_BORDER_COLOR, ARGB(0xFF000000));
+	set_int(&w, S_SLANT, 0);
+	set_int(&w, S_SEGMENTS, 0);
+	set_int(&w, S_SEGMENT_GAP, 3);
+	set_int(&w, S_SHEEN, 0);
+	set_int(&w, S_GLOW, 0);
+	set_bool(&w, S_SHADOW, true);
+	set_int(&w, S_SHADOW_COLOR, ARGB(0x8C000000));
+	set_int(&w, S_SHADOW_BLUR, 10);
+	set_string(&w, S_PLAYHEAD, PLAYHEAD_NONE);
+	set_int(&w, S_PLAYHEAD_COLOR, ARGB(0xFFFFFFFF));
+	set_int(&w, S_PLAYHEAD_WIDTH, 16);
+	set_bool(&w, S_ROUNDED_ENDS, true);
+	set_bool(&w, S_TEXT_CHIP, false);
+	set_int(&w, S_CHIP_COLOR, ARGB(0xC8101014));
+	set_int(&w, S_TEXT_COLOR, ARGB(0xFFFFFFFF));
+	set_bool(&w, S_TEXT_SHADOW, false);
+	set_bool(&w, S_TEXT_OUTLINE, false);
+
+	if (strcmp(style, STYLE_SEGMENTED) == 0) {
+		/* a strip of tape, counted off */
+		set_int(&w, S_HEIGHT, 10);
+		set_int(&w, S_RING_THICKNESS, 14);
+		set_int(&w, S_RADIUS, 2);
+		set_int(&w, S_FILL_COLOR, ARGB(0xFFFFFFFF));
+		set_int(&w, S_TRACK_COLOR, ARGB(0x2EFFFFFF));
+		set_int(&w, S_SEGMENTS, 24);
+		set_int(&w, S_SEGMENT_GAP, 3);
+		set_int(&w, S_GLOW, 8);
+		set_bool(&w, S_ROUNDED_ENDS, false);
+		set_string(&w, S_TEXT_POSITION, POS_ABOVE);
+		set_bool(&w, S_TEXT_SHADOW, true);
+	} else if (strcmp(style, STYLE_SPORT) == 0) {
+		/* leaning forward, in a cool gradient, with a line for a head */
+		set_int(&w, S_HEIGHT, 16);
+		set_int(&w, S_RING_THICKNESS, 16);
+		set_int(&w, S_RADIUS, 0);
+		set_int(&w, S_SLANT, 12);
+		set_bool(&w, S_GRADIENT, true);
+		set_int(&w, S_FILL_COLOR, ARGB(0xFF19E3FF));
+		set_int(&w, S_FILL_COLOR2, ARGB(0xFF2F6BFF));
+		set_int(&w, S_TRACK_COLOR, ARGB(0x99000000));
+		set_int(&w, S_SHEEN, 50);
+		set_int(&w, S_GLOW, 10);
+		set_string(&w, S_PLAYHEAD, PLAYHEAD_LINE);
+		set_int(&w, S_PLAYHEAD_WIDTH, 3);
+		set_bool(&w, S_ROUNDED_ENDS, false);
+		set_string(&w, S_TEXT_POSITION, POS_FOLLOW);
+		set_bool(&w, S_TEXT_CHIP, true);
+		set_int(&w, S_CHIP_COLOR, ARGB(0xE62F6BFF));
+	} else if (strcmp(style, STYLE_MINIMAL) == 0) {
+		/* a hairline with a dot on it */
+		set_int(&w, S_HEIGHT, 4);
+		set_int(&w, S_RING_THICKNESS, 6);
+		set_int(&w, S_RADIUS, 2);
+		set_int(&w, S_FILL_COLOR, ARGB(0xFFFF3B30));
+		set_int(&w, S_TRACK_COLOR, ARGB(0x47FFFFFF));
+		set_int(&w, S_SHADOW_COLOR, ARGB(0x59000000));
+		set_int(&w, S_SHADOW_BLUR, 4);
+		set_string(&w, S_PLAYHEAD, PLAYHEAD_KNOB);
+		set_int(&w, S_PLAYHEAD_COLOR, ARGB(0xFFFF3B30));
+		set_int(&w, S_PLAYHEAD_WIDTH, 12);
+		set_string(&w, S_TEXT_POSITION, POS_BELOW);
+		set_bool(&w, S_TEXT_SHADOW, true);
+	} else if (strcmp(style, STYLE_FLAT) == 0) {
+		/* plain shapes, no light or shadow */
+		set_int(&w, S_HEIGHT, 12);
+		set_int(&w, S_RING_THICKNESS, 16);
+		set_int(&w, S_RADIUS, 6);
+		set_int(&w, S_FILL_COLOR, ARGB(0xFFFFFFFF));
+		set_int(&w, S_TRACK_COLOR, ARGB(0x80000000));
+		set_bool(&w, S_SHADOW, false);
+		set_string(&w, S_TEXT_POSITION, POS_ABOVE);
+		set_bool(&w, S_TEXT_SHADOW, true);
+	} else {
+		/* broadcast: a warm fill lit from above with a glowing head and a
+		 * knob, over a pale track, the time in a chip riding with it */
+		set_int(&w, S_HEIGHT, 8);
+		set_int(&w, S_RING_THICKNESS, 12);
+		set_int(&w, S_RADIUS, 4);
+		set_bool(&w, S_GRADIENT, true);
+		set_int(&w, S_FILL_COLOR, ARGB(0xFFFFD34D));
+		set_int(&w, S_FILL_COLOR2, ARGB(0xFFFF8A1F));
+		set_int(&w, S_TRACK_COLOR, ARGB(0x38FFFFFF));
+		set_int(&w, S_SHEEN, 60);
+		set_int(&w, S_GLOW, 12);
+		set_string(&w, S_PLAYHEAD, PLAYHEAD_KNOB);
+		set_int(&w, S_PLAYHEAD_WIDTH, 18);
+		set_string(&w, S_TEXT_POSITION, POS_FOLLOW);
+		set_bool(&w, S_TEXT_CHIP, true);
+	}
+}
+
 static void warp_progress_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_string(settings, WARP_OVERLAY_TARGET, "");
+	obs_data_set_default_string(settings, S_STYLE, STYLE_BROADCAST);
+	obs_data_set_default_string(settings, S_STYLE_APPLIED, STYLE_BROADCAST);
 	obs_data_set_default_string(settings, S_SHAPE, SHAPE_HORIZONTAL);
 	obs_data_set_default_bool(settings, S_REVERSE, false);
-	obs_data_set_default_int(settings, S_WIDTH, 1280);
-	obs_data_set_default_int(settings, S_HEIGHT, 12);
+	obs_data_set_default_int(settings, S_WIDTH, 960);
 	obs_data_set_default_int(settings, S_RING_SIZE, 160);
-	obs_data_set_default_int(settings, S_RING_THICKNESS, 16);
-	obs_data_set_default_int(settings, S_RADIUS, 6);
-	obs_data_set_default_bool(settings, S_ROUNDED_ENDS, true);
-	/* colors are 0xAABBGGRR */
-	obs_data_set_default_int(settings, S_FILL_COLOR, 0xFFFFFFFF);
-	obs_data_set_default_int(settings, S_FILL_COLOR2, 0xFFFFB000);
-	obs_data_set_default_int(settings, S_TRACK_COLOR, 0x80000000);
-	obs_data_set_default_bool(settings, S_GRADIENT, false);
-	obs_data_set_default_int(settings, S_BORDER_WIDTH, 0);
-	obs_data_set_default_int(settings, S_BORDER_COLOR, 0xFF000000);
-	obs_data_set_default_bool(settings, S_PLAYHEAD, false);
-	obs_data_set_default_int(settings, S_PLAYHEAD_WIDTH, 4);
-	obs_data_set_default_int(settings, S_PLAYHEAD_COLOR, 0xFF00D7FF);
+	warp_progress_apply_style(settings, STYLE_BROADCAST, true);
 	obs_data_set_default_bool(settings, S_COLOR_BY_STATE, false);
-	obs_data_set_default_int(settings, S_PAUSED_COLOR, 0xFF00C0FF);
-	obs_data_set_default_int(settings, S_SLOW_COLOR, 0xFFFFC040);
-	obs_data_set_default_int(settings, S_FAST_COLOR, 0xFF4040FF);
-	obs_data_set_default_int(settings, S_ENDED_COLOR, 0xFF808080);
+	obs_data_set_default_int(settings, S_PAUSED_COLOR, ARGB(0xFFFFC000));
+	obs_data_set_default_int(settings, S_SLOW_COLOR, ARGB(0xFF40C0FF));
+	obs_data_set_default_int(settings, S_FAST_COLOR, ARGB(0xFFFF4040));
+	obs_data_set_default_int(settings, S_ENDED_COLOR, ARGB(0xFF808080));
 	obs_data_set_default_string(settings, S_TEXT, TEXT_NONE);
-	obs_data_set_default_string(settings, S_TEXT_POSITION, POS_ABOVE);
-	warp_overlay_default_font(settings, S_TEXT_FONT, 32);
-	obs_data_set_default_int(settings, S_TEXT_COLOR, 0xFFFFFFFF);
-	obs_data_set_default_bool(settings, S_TEXT_OUTLINE, false);
-	obs_data_set_default_bool(settings, S_TEXT_SHADOW, true);
+	warp_overlay_default_font(settings, S_TEXT_FONT, 22);
 	obs_data_set_default_bool(settings, S_REAL_TIME, false);
 	obs_data_set_default_bool(settings, S_SMOOTH, true);
 	obs_data_set_default_bool(settings, S_HIDE_OFF_AIR, false);
@@ -331,11 +513,23 @@ static bool warp_progress_modified(obs_properties_t *props, obs_property_t *prop
 							     ? "Warp.Progress.Reverse.Vertical"
 							     : "Warp.Progress.Reverse"));
 
+	bool horizontal = strcmp(shape, SHAPE_HORIZONTAL) == 0;
+	const char *playhead = obs_data_get_string(settings, S_PLAYHEAD);
+	bool has_playhead = strcmp(playhead, PLAYHEAD_NONE) != 0;
+
+	obs_property_set_visible(obs_properties_get(props, S_SLANT), horizontal);
+	obs_property_set_visible(obs_properties_get(props, S_SEGMENT_GAP), obs_data_get_int(settings, S_SEGMENTS) > 1);
+	obs_property_set_visible(obs_properties_get(props, S_SHADOW_COLOR), obs_data_get_bool(settings, S_SHADOW));
+	obs_property_set_visible(obs_properties_get(props, S_SHADOW_BLUR), obs_data_get_bool(settings, S_SHADOW));
 	obs_property_set_visible(obs_properties_get(props, S_FILL_COLOR2), obs_data_get_bool(settings, S_GRADIENT));
 	obs_property_set_visible(obs_properties_get(props, S_BORDER_COLOR),
 				 obs_data_get_int(settings, S_BORDER_WIDTH) > 0);
-	obs_property_set_visible(obs_properties_get(props, S_PLAYHEAD_WIDTH), obs_data_get_bool(settings, S_PLAYHEAD));
-	obs_property_set_visible(obs_properties_get(props, S_PLAYHEAD_COLOR), obs_data_get_bool(settings, S_PLAYHEAD));
+	obs_property_set_visible(obs_properties_get(props, S_PLAYHEAD_WIDTH), has_playhead);
+	obs_property_set_visible(obs_properties_get(props, S_PLAYHEAD_COLOR), has_playhead);
+	obs_property_set_description(obs_properties_get(props, S_PLAYHEAD_WIDTH),
+				     obs_module_text(strcmp(playhead, PLAYHEAD_KNOB) == 0
+							     ? "Warp.Progress.KnobSize"
+							     : "Warp.Progress.PlayheadWidth"));
 
 	obs_property_set_visible(obs_properties_get(props, S_PAUSED_COLOR), by_state);
 	obs_property_set_visible(obs_properties_get(props, S_SLOW_COLOR), by_state);
@@ -343,6 +537,9 @@ static bool warp_progress_modified(obs_properties_t *props, obs_property_t *prop
 	obs_property_set_visible(obs_properties_get(props, S_ENDED_COLOR), by_state);
 
 	obs_property_set_visible(obs_properties_get(props, S_TEXT_POSITION), text);
+	obs_property_set_visible(obs_properties_get(props, S_TEXT_CHIP), text);
+	obs_property_set_visible(obs_properties_get(props, S_CHIP_COLOR),
+				 text && obs_data_get_bool(settings, S_TEXT_CHIP));
 	obs_property_set_visible(obs_properties_get(props, S_TEXT_FONT), text);
 	obs_property_set_visible(obs_properties_get(props, S_TEXT_COLOR), text);
 	obs_property_set_visible(obs_properties_get(props, S_TEXT_OUTLINE), text);
@@ -350,6 +547,20 @@ static bool warp_progress_modified(obs_properties_t *props, obs_property_t *prop
 	obs_property_set_visible(obs_properties_get(props, S_REAL_TIME), text);
 
 	return true;
+}
+
+/* Picking a style fills in the settings it covers, once: the properties
+ * call this every time they are opened as well, when it changes nothing. */
+static bool warp_progress_style_modified(obs_properties_t *props, obs_property_t *prop, obs_data_t *settings)
+{
+	const char *style = obs_data_get_string(settings, S_STYLE);
+
+	if (strcmp(style, obs_data_get_string(settings, S_STYLE_APPLIED)) != 0) {
+		warp_progress_apply_style(settings, style, false);
+		obs_data_set_string(settings, S_STYLE_APPLIED, style);
+	}
+
+	return warp_progress_modified(props, prop, settings);
 }
 
 static void warp_progress_add_idle(obs_properties_t *props, const char *key, const char *text, bool can_be_full)
@@ -376,6 +587,16 @@ static obs_properties_t *warp_progress_properties(void *data)
 	warp_overlay_add_target_property(props, settings);
 	obs_data_release(settings);
 
+	p = obs_properties_add_list(props, S_STYLE, obs_module_text("Warp.Overlay.Style"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, obs_module_text("Warp.Progress.Style.Broadcast"), STYLE_BROADCAST);
+	obs_property_list_add_string(p, obs_module_text("Warp.Progress.Style.Segmented"), STYLE_SEGMENTED);
+	obs_property_list_add_string(p, obs_module_text("Warp.Progress.Style.Sport"), STYLE_SPORT);
+	obs_property_list_add_string(p, obs_module_text("Warp.Progress.Style.Minimal"), STYLE_MINIMAL);
+	obs_property_list_add_string(p, obs_module_text("Warp.Progress.Style.Flat"), STYLE_FLAT);
+	obs_property_set_long_description(p, obs_module_text("Warp.Overlay.Style.Desc"));
+	obs_property_set_modified_callback(p, warp_progress_style_modified);
+
 	/* shape */
 	group = obs_properties_create();
 
@@ -399,6 +620,13 @@ static obs_properties_t *warp_progress_properties(void *data)
 	p = obs_properties_add_int(group, S_RADIUS, obs_module_text("Warp.Progress.Radius"), 0, 4096, 1);
 	obs_property_int_set_suffix(p, " px");
 	obs_properties_add_bool(group, S_ROUNDED_ENDS, obs_module_text("Warp.Progress.RoundedEnds"));
+	p = obs_properties_add_int(group, S_SLANT, obs_module_text("Warp.Progress.Slant"), 0, 512, 1);
+	obs_property_int_set_suffix(p, " px");
+	p = obs_properties_add_int(group, S_SEGMENTS, obs_module_text("Warp.Progress.Segments"), 0, 200, 1);
+	obs_property_set_long_description(p, obs_module_text("Warp.Progress.Segments.Desc"));
+	obs_property_set_modified_callback(p, warp_progress_modified);
+	p = obs_properties_add_int(group, S_SEGMENT_GAP, obs_module_text("Warp.Progress.SegmentGap"), 1, 64, 1);
+	obs_property_int_set_suffix(p, " px");
 
 	obs_properties_add_group(props, "shape_group", obs_module_text("Warp.Progress.Group.Shape"), OBS_GROUP_NORMAL,
 				 group);
@@ -417,7 +645,22 @@ static obs_properties_t *warp_progress_properties(void *data)
 	obs_property_set_modified_callback(p, warp_progress_modified);
 	obs_properties_add_color_alpha(group, S_BORDER_COLOR, obs_module_text("Warp.Progress.BorderColor"));
 
-	p = obs_properties_add_bool(group, S_PLAYHEAD, obs_module_text("Warp.Progress.Playhead"));
+	p = obs_properties_add_int_slider(group, S_SHEEN, obs_module_text("Warp.Progress.Sheen"), 0, 100, 1);
+	obs_property_int_set_suffix(p, "%");
+	p = obs_properties_add_int(group, S_GLOW, obs_module_text("Warp.Progress.Glow"), 0, 128, 1);
+	obs_property_int_set_suffix(p, " px");
+	obs_property_set_long_description(p, obs_module_text("Warp.Progress.Glow.Desc"));
+	p = obs_properties_add_bool(group, S_SHADOW, obs_module_text("Warp.Progress.Shadow"));
+	obs_property_set_modified_callback(p, warp_progress_modified);
+	obs_properties_add_color_alpha(group, S_SHADOW_COLOR, obs_module_text("Warp.Progress.ShadowColor"));
+	p = obs_properties_add_int(group, S_SHADOW_BLUR, obs_module_text("Warp.Progress.ShadowBlur"), 0, 128, 1);
+	obs_property_int_set_suffix(p, " px");
+
+	p = obs_properties_add_list(group, S_PLAYHEAD, obs_module_text("Warp.Progress.Playhead"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, obs_module_text("Warp.Progress.Playhead.None"), PLAYHEAD_NONE);
+	obs_property_list_add_string(p, obs_module_text("Warp.Progress.Playhead.Knob"), PLAYHEAD_KNOB);
+	obs_property_list_add_string(p, obs_module_text("Warp.Progress.Playhead.Line"), PLAYHEAD_LINE);
 	obs_property_set_modified_callback(p, warp_progress_modified);
 	p = obs_properties_add_int(group, S_PLAYHEAD_WIDTH, obs_module_text("Warp.Progress.PlayheadWidth"), 1, 256, 1);
 	obs_property_int_set_suffix(p, " px");
@@ -449,10 +692,14 @@ static obs_properties_t *warp_progress_properties(void *data)
 
 	p = obs_properties_add_list(group, S_TEXT_POSITION, obs_module_text("Warp.Progress.TextPosition"),
 				    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, obs_module_text("Warp.Progress.TextPosition.Follow"), POS_FOLLOW);
 	obs_property_list_add_string(p, obs_module_text("Warp.Progress.TextPosition.Above"), POS_ABOVE);
 	obs_property_list_add_string(p, obs_module_text("Warp.Progress.TextPosition.Inside"), POS_INSIDE);
 	obs_property_list_add_string(p, obs_module_text("Warp.Progress.TextPosition.Below"), POS_BELOW);
 
+	p = obs_properties_add_bool(group, S_TEXT_CHIP, obs_module_text("Warp.Progress.TextChip"));
+	obs_property_set_modified_callback(p, warp_progress_modified);
+	obs_properties_add_color_alpha(group, S_CHIP_COLOR, obs_module_text("Warp.Progress.ChipColor"));
 	obs_properties_add_font(group, S_TEXT_FONT, obs_module_text("Warp.Overlay.Font"));
 	obs_properties_add_color_alpha(group, S_TEXT_COLOR, obs_module_text("Warp.Overlay.TextColor"));
 	obs_properties_add_bool(group, S_TEXT_OUTLINE, obs_module_text("Warp.Overlay.TextOutline"));
@@ -499,35 +746,126 @@ static void warp_progress_bar_size(const struct warp_progress_source *s, uint32_
 	}
 }
 
-/* the room the text takes above or below the bar */
-static uint32_t warp_progress_text_band(const struct warp_progress_source *s)
+/* The room kept all round the bar for what spills off it: its shadow, its
+ * glow, and a knob bigger than the bar is thick. It is part of the source,
+ * so nothing is cut off when the source is drawn into a texture. */
+static uint32_t warp_progress_pad(const struct warp_progress_source *s)
 {
-	if (!warp_progress_has_text(s) || s->text_pos == WARP_PROGRESS_POS_INSIDE)
-		return 0;
+	uint32_t cx, cy;
+	float pad = 0.0f;
 
-	uint32_t h = warp_overlay_text_height(&s->text);
-	uint32_t font = (uint32_t)warp_overlay_font_size(s->text_font);
-	uint32_t band = h > font ? h : font;
+	warp_progress_bar_size(s, &cx, &cy);
 
-	return band + font / 4;
+	float thickness = s->shape == WARP_PROGRESS_RING ? (float)s->ring_thickness : (float)cy;
+
+	if (s->glow)
+		pad = fmaxf(pad, (float)s->glow * 1.6f + 2.0f);
+	if (s->shadow)
+		pad = fmaxf(pad, (float)s->shadow_blur + (float)s->shadow_blur * 0.25f + 2.0f);
+	if (s->playhead > 1.5f)
+		pad = fmaxf(pad, (float)s->playhead_width * 0.5f - thickness * 0.5f + 5.0f);
+
+	return (uint32_t)ceilf(pad);
+}
+
+/* how the time is laid out: its height, and the chip round it */
+struct warp_progress_text_box {
+	float tw;
+	float th;
+	float pad_x;
+	float pad_y;
+	/* how far a chip leans, to match a slanted bar */
+	float lean;
+	/* the whole box, chip and all */
+	float w;
+	float h;
+};
+
+static void warp_progress_text_box(const struct warp_progress_source *s, struct warp_progress_text_box *box)
+{
+	float font = (float)warp_overlay_font_size(s->text_font);
+	float th = (float)warp_overlay_text_height(&s->text);
+
+	box->tw = (float)warp_overlay_text_width(&s->text);
+	box->th = th > 0.0f ? th : font * 1.2f;
+	box->pad_x = s->text_chip ? roundf(box->th * 0.5f) : 0.0f;
+	box->pad_y = s->text_chip ? roundf(box->th * 0.14f) : 0.0f;
+
+	/* a chip leans as far as the bar does over its own height, so the two
+	 * are cut at the same angle */
+	float bar_h = (float)(s->height ? s->height : 1);
+	float h = box->th + box->pad_y * 2.0f;
+
+	box->lean = s->text_chip && s->shape == WARP_PROGRESS_HORIZONTAL && s->slant
+			    ? roundf(fminf((float)s->slant / bar_h * h, h * 0.5f))
+			    : 0.0f;
+	box->w = box->tw + box->pad_x * 2.0f + box->lean;
+	box->h = box->th + box->pad_y * 2.0f;
+}
+
+/* Where everything goes in the source: the bar, with room round it for what
+ * spills off it, and the time above or below it - set close to the bar, the
+ * way a caption sits on what it captions, leaving just enough room for a knob
+ * standing proud of the bar. */
+struct warp_progress_layout {
+	float pad;
+	float bar_x;
+	float bar_y;
+	float text_y;
+	float w;
+	float h;
+	struct warp_progress_text_box box;
+};
+
+static void warp_progress_layout(const struct warp_progress_source *s, struct warp_progress_layout *l)
+{
+	uint32_t cx, cy;
+
+	warp_progress_bar_size(s, &cx, &cy);
+	warp_progress_text_box(s, &l->box);
+
+	float pad = (float)warp_progress_pad(s);
+	bool band = warp_progress_has_text(s) && s->text_pos != WARP_PROGRESS_POS_INSIDE;
+	float thickness = s->shape == WARP_PROGRESS_RING ? (float)s->ring_thickness : (float)cy;
+	float overhang = s->playhead > 1.5f ? fmaxf(0.0f, (float)s->playhead_width * 0.5f - thickness * 0.5f) : 0.0f;
+	float gap = roundf(fmaxf(6.0f, l->box.th * 0.3f)) + overhang;
+
+	l->pad = pad;
+	l->bar_x = pad;
+	l->bar_y = pad;
+	l->text_y = 0.0f;
+	l->w = (float)cx + pad * 2.0f;
+	l->h = (float)cy + pad * 2.0f;
+
+	if (!band)
+		return;
+
+	if (s->text_pos == WARP_PROGRESS_POS_BELOW) {
+		l->text_y = pad + (float)cy + gap;
+		l->h = fmaxf(l->h, l->text_y + l->box.h);
+	} else {
+		l->bar_y = fmaxf(pad, l->box.h + gap);
+		l->h = l->bar_y + (float)cy + pad;
+	}
+
+	l->bar_y = roundf(l->bar_y);
+	l->text_y = roundf(l->text_y);
 }
 
 static uint32_t warp_progress_width(void *data)
 {
-	struct warp_progress_source *s = data;
-	uint32_t cx, cy;
+	struct warp_progress_layout l;
 
-	warp_progress_bar_size(s, &cx, &cy);
-	return cx;
+	warp_progress_layout(data, &l);
+	return (uint32_t)ceilf(l.w);
 }
 
 static uint32_t warp_progress_height(void *data)
 {
-	struct warp_progress_source *s = data;
-	uint32_t cx, cy;
+	struct warp_progress_layout l;
 
-	warp_progress_bar_size(s, &cx, &cy);
-	return cy + warp_progress_text_band(s);
+	warp_progress_layout(data, &l);
+	return (uint32_t)ceilf(l.h);
 }
 
 static void warp_progress_format_time(char *out, size_t size, double ms, bool negative)
@@ -775,15 +1113,6 @@ static void warp_progress_tick(void *data, float seconds)
 /* ------------------------------------------------------------------------- */
 /* drawing */
 
-static void warp_progress_set_color(gs_effect_t *effect, const char *name, uint32_t color, float alpha)
-{
-	struct vec4 v;
-
-	warp_overlay_color(&v, color);
-	v.w *= alpha;
-	gs_effect_set_vec4(gs_effect_get_param_by_name(effect, name), &v);
-}
-
 static void warp_progress_render(void *data, gs_effect_t *unused)
 {
 	UNUSED_PARAMETER(unused);
@@ -801,97 +1130,124 @@ static void warp_progress_render(void *data, gs_effect_t *unused)
 	if (!cx || !cy)
 		return;
 
-	float bar_y = 0.0f;
-	uint32_t band = warp_progress_text_band(s);
+	struct warp_progress_layout l;
 
-	if (band && s->text_pos == WARP_PROGRESS_POS_ABOVE)
-		bar_y = (float)band;
+	warp_progress_layout(s, &l);
 
-	float mode = 0.0f;
+	float pad = l.pad;
+	float bar_x = l.bar_x;
+	float bar_y = l.bar_y;
+	bool ring = s->shape == WARP_PROGRESS_RING;
 
-	if (s->shape == WARP_PROGRESS_RING)
-		mode = 4.0f;
-	else if (s->shape == WARP_PROGRESS_VERTICAL)
-		mode = s->reverse ? 3.0f : 2.0f;
-	else
-		mode = s->reverse ? 1.0f : 0.0f;
+	struct warp_overlay_bar bar = {0};
 
-	float radius = s->shape == WARP_PROGRESS_RING ? (s->rounded_ends ? 1.0f : 0.0f) : (float)s->radius;
-	struct vec2 size;
+	bar.w = (float)cx;
+	bar.h = (float)cy;
+	bar.pad = pad;
+	bar.progress = s->fraction;
+	bar.border = (float)s->border_width;
+	bar.ring_thickness = (float)s->ring_thickness;
+	bar.slant = s->shape == WARP_PROGRESS_HORIZONTAL ? (float)s->slant * (s->reverse ? -1.0f : 1.0f) : 0.0f;
+	bar.segments = (float)s->segments;
+	bar.segment_gap = (float)s->segment_gap;
+	bar.sheen = s->sheen;
+	bar.glow = (float)s->glow;
+	bar.shadow = s->shadow;
+	bar.shadow_blur = (float)s->shadow_blur;
+	bar.shadow_y = roundf((float)s->shadow_blur * 0.25f);
+	bar.knob = s->playhead;
+	bar.head_width = (float)s->playhead_width;
+	bar.fill = s->fill;
+	bar.fill2 = s->fill2;
+	bar.opacity = s->alpha;
+	warp_overlay_rgba(&bar.track, s->track_color);
+	warp_overlay_rgba(&bar.border_color, s->border_color);
+	warp_overlay_rgba(&bar.head, s->playhead_color);
+	warp_overlay_rgba(&bar.shadow_color, s->shadow_color);
 
-	vec2_set(&size, (float)cx, (float)cy);
+	if (ring) {
+		bar.mode = 4.0f;
+		bar.radius = s->rounded_ends ? 1.0f : 0.0f;
+	} else if (s->shape == WARP_PROGRESS_VERTICAL) {
+		bar.mode = s->reverse ? 3.0f : 2.0f;
+		bar.radius = (float)s->radius;
+	} else {
+		bar.mode = s->reverse ? 1.0f : 0.0f;
+		bar.radius = (float)s->radius;
+	}
 
 	const bool previous = gs_framebuffer_srgb_enabled();
 	gs_enable_framebuffer_srgb(gs_get_linear_srgb());
 
-	gs_effect_set_vec2(gs_effect_get_param_by_name(effect, "size"), &size);
-	gs_effect_set_float(gs_effect_get_param_by_name(effect, "opacity"), s->alpha);
-	gs_effect_set_float(gs_effect_get_param_by_name(effect, "mode"), mode);
-	gs_effect_set_float(gs_effect_get_param_by_name(effect, "progress"), s->fraction);
-	gs_effect_set_float(gs_effect_get_param_by_name(effect, "radius"), radius);
-	gs_effect_set_float(gs_effect_get_param_by_name(effect, "border"), (float)s->border_width);
-	gs_effect_set_float(gs_effect_get_param_by_name(effect, "ring_thickness"), (float)s->ring_thickness);
-	gs_effect_set_float(gs_effect_get_param_by_name(effect, "gradient"), 1.0f);
-	gs_effect_set_float(gs_effect_get_param_by_name(effect, "head_width"),
-			    s->playhead ? (float)s->playhead_width : 0.0f);
-	warp_progress_set_color(effect, "track_color", s->track_color, 1.0f);
-	struct vec4 fill, fill2;
+	warp_overlay_draw_bar(effect, &bar, bar_x, bar_y);
 
-	warp_overlay_color_for_render(&fill, &s->fill);
-	warp_overlay_color_for_render(&fill2, &s->fill2);
-	gs_effect_set_vec4(gs_effect_get_param_by_name(effect, "fill_color"), &fill);
-	gs_effect_set_vec4(gs_effect_get_param_by_name(effect, "fill_color2"), &fill2);
-	warp_progress_set_color(effect, "border_color", s->border_color, 1.0f);
-	warp_progress_set_color(effect, "head_color", s->playhead_color, 1.0f);
+	/* the time, in its chip when it has one */
+	struct warp_progress_text_box box = l.box;
 
-	gs_matrix_push();
-	gs_matrix_translate3f(0.0f, bar_y, 0.0f);
-
-	gs_technique_t *tech = gs_effect_get_technique(effect, "Bar");
-	size_t passes = gs_technique_begin(tech);
-
-	for (size_t i = 0; i < passes; i++) {
-		if (gs_technique_begin_pass(tech, i)) {
-			gs_draw_sprite(NULL, 0, cx, cy);
-			gs_technique_end_pass(tech);
-		}
+	if (!warp_progress_has_text(s) || box.tw <= 0.0f) {
+		gs_enable_framebuffer_srgb(previous);
+		return;
 	}
 
-	gs_technique_end(tech);
-	gs_matrix_pop();
+	float total_w = l.w;
+	float scale = 1.0f;
+	float avail_w = s->text_pos == WARP_PROGRESS_POS_INSIDE ? (float)cx : total_w;
+	float avail_h = s->text_pos == WARP_PROGRESS_POS_INSIDE ? (float)cy : box.h;
+
+	if (s->text_pos == WARP_PROGRESS_POS_INSIDE && ring)
+		avail_w = (float)cx - 2.0f * (float)s->ring_thickness;
+	if (box.w > avail_w && avail_w > 0.0f)
+		scale = avail_w / box.w;
+	if (box.h * scale > avail_h && avail_h > 0.0f)
+		scale = avail_h / box.h;
+
+	float w = box.w * scale;
+	float h = box.h * scale;
+	float x, y;
+
+	if (s->text_pos == WARP_PROGRESS_POS_FOLLOW) {
+		/* centred over the leading edge, kept inside the source */
+		float lean = (float)s->slant;
+		float run = (float)cx - lean;
+		float head = s->reverse ? (float)cx - lean * 0.5f - s->fraction * run : lean * 0.5f + s->fraction * run;
+
+		x = bar_x + head - w * 0.5f;
+		x = fminf(fmaxf(x, 0.0f), total_w - w);
+		y = l.text_y;
+	} else if (s->text_pos == WARP_PROGRESS_POS_INSIDE) {
+		x = (total_w - w) * 0.5f;
+		y = bar_y + ((float)cy - h) * 0.5f;
+	} else {
+		x = (total_w - w) * 0.5f;
+		y = l.text_y;
+	}
+
+	x = roundf(x);
+	y = roundf(y);
+
+	if (s->text_chip) {
+		struct warp_overlay_bar chip = {0};
+
+		chip.w = w;
+		chip.h = h;
+		/* rounded like the bar is: a pill on a rounded bar, square on a
+		 * square one */
+		chip.radius = s->radius > 0 || s->shape != WARP_PROGRESS_HORIZONTAL ? h * 0.5f : 0.0f;
+		chip.slant = box.lean * scale * (s->reverse ? -1.0f : 1.0f);
+		chip.opacity = s->alpha;
+		warp_overlay_rgba(&chip.track, s->chip_color);
+		chip.shadow = s->shadow;
+		chip.shadow_blur = 6.0f;
+		chip.shadow_y = 2.0f;
+		chip.pad = chip.shadow ? 8.0f : 0.0f;
+		warp_overlay_rgba(&chip.shadow_color, s->shadow_color);
+		warp_overlay_draw_bar(effect, &chip, x, y);
+	}
 
 	gs_enable_framebuffer_srgb(previous);
 
-	/* the time, centred on the bar, or in the band above or below it */
-	uint32_t tw = warp_overlay_text_width(&s->text);
-	uint32_t th = warp_overlay_text_height(&s->text);
-
-	if (!warp_progress_has_text(s) || !tw || !th)
-		return;
-
-	float scale = 1.0f;
-	float avail_w = (float)cx;
-	float avail_h = band ? (float)band : (float)cy;
-
-	if (s->text_pos == WARP_PROGRESS_POS_INSIDE && s->shape == WARP_PROGRESS_RING)
-		avail_w = (float)cx - 2.0f * (float)s->ring_thickness;
-
-	if ((float)tw > avail_w && avail_w > 0.0f)
-		scale = avail_w / (float)tw;
-	if ((float)th * scale > avail_h && avail_h > 0.0f)
-		scale = avail_h / (float)th;
-
-	float x = ((float)cx - (float)tw * scale) * 0.5f;
-	float y;
-
-	if (s->text_pos == WARP_PROGRESS_POS_ABOVE)
-		y = 0.0f;
-	else if (s->text_pos == WARP_PROGRESS_POS_BELOW)
-		y = (float)cy + (float)band - (float)th * scale;
-	else
-		y = ((float)cy - (float)th * scale) * 0.5f;
-
-	warp_overlay_text_render(&s->text, x, y, scale, s->alpha);
+	warp_overlay_text_render(&s->text, x + (box.pad_x + box.lean * 0.5f) * scale, y + box.pad_y * scale, scale,
+				 s->alpha);
 }
 
 /* ------------------------------------------------------------------------- */

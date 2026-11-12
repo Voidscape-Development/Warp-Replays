@@ -620,3 +620,74 @@ float warp_overlay_approach(float value, float target, float rate, float seconds
 
 	return value - step > target ? value - step : target;
 }
+
+void warp_overlay_rgba(struct vec4 *out, uint32_t color)
+{
+	vec4_from_rgba(out, color);
+}
+
+static void warp_overlay_set_float(gs_effect_t *effect, const char *name, float value)
+{
+	gs_effect_set_float(gs_effect_get_param_by_name(effect, name), value);
+}
+
+static void warp_overlay_set_color(gs_effect_t *effect, const char *name, const struct vec4 *srgb)
+{
+	struct vec4 v;
+
+	warp_overlay_color_for_render(&v, srgb);
+	gs_effect_set_vec4(gs_effect_get_param_by_name(effect, name), &v);
+}
+
+void warp_overlay_draw_bar(gs_effect_t *effect, const struct warp_overlay_bar *b, float x, float y)
+{
+	if (b->w < 1.0f || b->h < 1.0f || b->opacity <= 0.0f)
+		return;
+
+	struct vec2 size;
+
+	vec2_set(&size, b->w, b->h);
+	gs_effect_set_vec2(gs_effect_get_param_by_name(effect, "size"), &size);
+	warp_overlay_set_float(effect, "opacity", b->opacity);
+	warp_overlay_set_float(effect, "pad", b->pad);
+	warp_overlay_set_float(effect, "mode", b->mode);
+	warp_overlay_set_float(effect, "progress", b->progress);
+	warp_overlay_set_float(effect, "radius", b->radius);
+	warp_overlay_set_float(effect, "border", b->border);
+	warp_overlay_set_float(effect, "ring_thickness", b->ring_thickness);
+	warp_overlay_set_float(effect, "slant", b->slant);
+	warp_overlay_set_float(effect, "segments", b->segments);
+	warp_overlay_set_float(effect, "segment_gap", b->segment_gap);
+	warp_overlay_set_float(effect, "sheen", b->sheen);
+	warp_overlay_set_float(effect, "glow", b->glow);
+	warp_overlay_set_float(effect, "bshadow", b->shadow ? 1.0f : 0.0f);
+	warp_overlay_set_float(effect, "bshadow_blur", b->shadow_blur);
+	warp_overlay_set_float(effect, "bshadow_y", b->shadow_y);
+	warp_overlay_set_float(effect, "knob", b->knob);
+	warp_overlay_set_float(effect, "head_width", b->head_width);
+	warp_overlay_set_color(effect, "track_color", &b->track);
+	warp_overlay_set_color(effect, "fill_color", &b->fill);
+	warp_overlay_set_color(effect, "fill_color2", &b->fill2);
+	warp_overlay_set_color(effect, "border_color", &b->border_color);
+	warp_overlay_set_color(effect, "head_color", &b->head);
+	warp_overlay_set_color(effect, "shadow_color", &b->shadow_color);
+
+	uint32_t qw = (uint32_t)(b->w + b->pad * 2.0f + 0.5f);
+	uint32_t qh = (uint32_t)(b->h + b->pad * 2.0f + 0.5f);
+
+	gs_matrix_push();
+	gs_matrix_translate3f(x - b->pad, y - b->pad, 0.0f);
+
+	gs_technique_t *tech = gs_effect_get_technique(effect, "Bar");
+	size_t passes = gs_technique_begin(tech);
+
+	for (size_t i = 0; i < passes; i++) {
+		if (gs_technique_begin_pass(tech, i)) {
+			gs_draw_sprite(NULL, 0, qw, qh);
+			gs_technique_end_pass(tech);
+		}
+	}
+
+	gs_technique_end(tech);
+	gs_matrix_pop();
+}

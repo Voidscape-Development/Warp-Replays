@@ -10,19 +10,36 @@ texture to scale.
 
 uniform float4x4 ViewProj;
 
-/* the size of the quad being drawn, in pixels */
+/* the size of the shape being drawn, in pixels */
 uniform float2 size;
 uniform float opacity;
 
 /* the bar ------------------------------------------------------------------ */
 
+/* The quad is drawn 'pad' pixels bigger than the bar all round, so the
+ * shadow, the glow and a knob bigger than the bar have room to spill into. */
+uniform float pad;
 /* 0 left to right, 1 right to left, 2 bottom to top, 3 top to bottom, 4 ring */
 uniform float mode;
 uniform float progress;
 uniform float radius;
 uniform float border;
 uniform float ring_thickness;
-uniform float gradient;
+/* how far the ends of a horizontal bar lean, in pixels */
+uniform float slant;
+/* the track cut into this many segments, with gaps this wide; 0 for none */
+uniform float segments;
+uniform float segment_gap;
+/* the light along the top of the fill, from 0 to 1 */
+uniform float sheen;
+/* how far the glow round the leading edge reaches, in pixels; 0 for none */
+uniform float glow;
+/* a drop shadow under the whole bar */
+uniform float bshadow;
+uniform float bshadow_blur;
+uniform float bshadow_y;
+/* 0 none, 1 a line, 2 a round knob; head_width is its width or diameter */
+uniform float knob;
 uniform float head_width;
 uniform float4 track_color;
 uniform float4 fill_color;
@@ -37,6 +54,8 @@ uniform float glyph;
 /* 0 none, 1 circle, 2 rounded square */
 uniform float plate_shape;
 uniform float glyph_scale;
+/* how far the glyph's corners are rounded off, in glyph units */
+uniform float glyph_round;
 uniform float shadow;
 uniform float2 shadow_offset;
 uniform float shadow_soft;
@@ -120,6 +139,14 @@ float cover(float d, float px)
 	return saturate(0.5 - d / px);
 }
 
+/* a soft falloff outside a shape, 1 at its edge and 0 'reach' away */
+float falloff(float d, float reach)
+{
+	float t = saturate(d / max(reach, 0.001));
+
+	return (1.0 - t) * (1.0 - t);
+}
+
 /* straight color 'src' laid over premultiplied 'dst' */
 float4 over(float4 dst, float4 src, float a)
 {
@@ -136,43 +163,123 @@ float4 unpremultiply(float4 c)
 	return float4(c.rgb / c.a, c.a * opacity);
 }
 
+/* the fill's color at 'along' (0 to 1 down the bar), lit by the sheen at
+ * 'across' (0 at the top edge, 1 at the bottom) */
+float4 lit_fill(float along, float across)
+{
+	float4 c = lerp(fill_color, fill_color2, saturate(along));
+	float top = sheen * 0.5 * (1.0 - smoothstep(0.0, 0.6, across));
+	float bottom = sheen * 0.2 * smoothstep(0.55, 1.0, across);
+
+	c.rgb = lerp(c.rgb, float3(1.0, 1.0, 1.0), top) * (1.0 - bottom);
+	return c;
+}
+
+/* a segment gap at 'along' pixels down a track 'len' long: 0 in a gap, 1
+ * outside one, with no gap at either end */
+float segment_mask(float along, float len)
+{
+	if (segments < 1.5)
+		return 1.0;
+
+	float seg = len / segments;
+	float k = floor(along / seg + 0.5);
+
+	if (k < 0.5 || k > segments - 0.5)
+		return 1.0;
+
+	return saturate(abs(along - k * seg) - segment_gap * 0.5 + 0.5);
+}
+
 /* the bar ------------------------------------------------------------------ */
 
 float4 bar_linear(float2 p)
 {
 	float2 c = size * 0.5;
-	float r = min(radius, min(c.x, c.y));
-	float d_outer = sd_box(p - c, c, r);
+	bool horizontal = mode < 1.5;
+	float lean = horizontal ? abs(slant) : 0.0;
+	float2 half_size = float2(c.x - lean * 0.5, c.y);
+	float r = min(radius, min(half_size.x, half_size.y));
+
+	/* a slanted bar is a straight one with its rows slid sideways */
+	float2 q = p - c;
+
+	if (horizontal)
+		q.x += q.y / max(size.y, 1.0) * slant;
+
+	float d_outer = sd_box(q, half_size, r);
 	float d_inner = d_outer + border;
 
-	float horizontal = mode < 1.5 ? 1.0 : 0.0;
-	float length_px = horizontal > 0.5 ? size.x : size.y;
-	/* how far along the bar this pixel is, in the direction it fills */
-	float along = p.x;
+	float length_px = horizontal ? half_size.x * 2.0 : size.y;
+	float along;
+	float across;
 
-	if (mode > 0.5 && mode < 1.5)
-		along = size.x - p.x;
-	else if (mode > 1.5 && mode < 2.5)
-		along = size.y - p.y;
-	else if (mode > 2.5)
-		along = p.y;
+	if (mode < 0.5) {
+		along = q.x + half_size.x;
+		across = (q.y + c.y) / size.y;
+	} else if (mode < 1.5) {
+		along = half_size.x - q.x;
+		across = (q.y + c.y) / size.y;
+	} else if (mode < 2.5) {
+		along = c.y - q.y;
+		across = (q.x + c.x) / size.x;
+	} else {
+		along = q.y + c.y;
+		across = (q.x + c.x) / size.x;
+	}
 
 	float head = progress * length_px;
 	float fill_mask = saturate(head - along + 0.5);
-	float4 fill = lerp(fill_color, fill_color2, gradient * saturate(along / length_px));
+	float seg = segment_mask(along, length_px);
 
-	float inner = cover(d_inner, 1.0);
+	float inner = cover(d_inner, 1.0) * seg;
 	float outer = cover(d_outer, 1.0);
+	float4 head_fill = lerp(fill_color, fill_color2, progress);
 	float4 acc = float4(0.0, 0.0, 0.0, 0.0);
 
-	acc = over(acc, track_color, inner);
-	acc = over(acc, fill, inner * fill_mask);
+	/* under everything, the bar's shadow, falling only outside it: a
+	 * track that lets the picture through must not show it darkened */
+	if (bshadow > 0.5) {
+		float2 qs = q - float2(0.0, bshadow_y);
+		float d_shadow = sd_box(qs, half_size, r);
+
+		acc = over(acc, shadow_color, falloff(d_shadow + 1.0, bshadow_blur + 1.0) * (1.0 - outer));
+	}
+
+	/* the glow off the fill, strongest at its leading edge */
+	if (glow > 0.0 && progress > 0.0) {
+		float d_fill = max(d_outer, along - head);
+		float2 at = horizontal ? float2(along - head, q.y) : float2(q.x, along - head);
+		float edge = falloff(length(at), glow * 1.6);
+		float body = falloff(max(d_fill, 0.0), glow) * 0.45;
+
+		acc = over(acc, head_fill, max(edge * 0.8, body));
+	}
+
+	/* the track, a little darker along its top as if set into the picture */
+	float4 track = track_color;
+	track.rgb *= 0.82 + 0.18 * across;
+	acc = over(acc, track, inner);
+
+	acc = over(acc, lit_fill(along / length_px, across), inner * fill_mask);
 
 	if (border > 0.0)
-		acc = over(acc, border_color, saturate(outer - inner));
+		acc = over(acc, border_color, saturate(outer - cover(d_inner, 1.0)));
 
-	if (head_width > 0.0)
+	if (knob > 0.5 && knob < 1.5) {
 		acc = over(acc, head_color, outer * saturate(head_width * 0.5 + 0.5 - abs(along - head)));
+	} else if (knob > 1.5) {
+		float2 at = horizontal ? float2(along - head, q.y) : float2(q.x, along - head);
+		float kr = head_width * 0.5;
+		float d_knob = length(at) - kr;
+		float d_knob_shadow = length(at - float2(0.0, 1.5)) - kr;
+
+		acc = over(acc, float4(0.0, 0.0, 0.0, 0.45), falloff(d_knob_shadow + 1.0, 4.0));
+
+		float4 kc = head_color;
+		kc.rgb *= 0.88 + 0.12 * saturate(-at.y / max(kr, 1.0) * 0.5 + 0.5);
+		acc = over(acc, kc, cover(d_knob, 1.0));
+	}
 
 	return acc;
 }
@@ -194,7 +301,8 @@ float4 bar_ring(float2 p)
 	float arc = (progress - turn) * TAU * mid_r;
 	float fill_mask = progress >= 1.0 ? 1.0 : saturate(arc + 0.5);
 	float end = progress * TAU;
-	float2 end_at = float2(sin(end), -cos(end)) * mid_r;
+	float2 end_dir = float2(sin(end), -cos(end));
+	float2 end_at = end_dir * mid_r;
 	float half_w = max(th * 0.5 - border, 0.0);
 
 	if (radius > 0.0 && progress > 0.0 && progress < 1.0) {
@@ -204,24 +312,55 @@ float4 bar_ring(float2 p)
 		fill_mask = max(fill_mask, cover(caps, 1.0));
 	}
 
-	float4 fill = lerp(fill_color, fill_color2, gradient * turn);
-	float inner = cover(d_inner, 1.0);
+	/* segments round the ring, the gaps measured along it */
+	float seg = 1.0;
+
+	if (segments > 1.5) {
+		float k = floor(turn * segments + 0.5);
+		seg = saturate(abs(turn * segments - k) * TAU * mid_r / segments - segment_gap * 0.5 + 0.5);
+	}
+
+	/* across the ring from its outside edge in */
+	float across = saturate((outer_r - length(v)) / max(th, 1.0));
+	float inner = cover(d_inner, 1.0) * seg;
 	float outer = cover(d_outer, 1.0);
+	float4 head_fill = lerp(fill_color, fill_color2, progress);
 	float4 acc = float4(0.0, 0.0, 0.0, 0.0);
 
-	acc = over(acc, track_color, inner);
-	acc = over(acc, fill, inner * fill_mask);
+	if (bshadow > 0.5) {
+		float d_shadow = sd_ring(v - float2(0.0, bshadow_y), mid_r, th);
+
+		acc = over(acc, shadow_color, falloff(d_shadow + 1.0, bshadow_blur + 1.0) * (1.0 - outer));
+	}
+
+	if (glow > 0.0 && progress > 0.0) {
+		float edge = falloff(length(v - end_at), glow * 1.6 + half_w);
+		float body = arc > 0.0 ? falloff(max(d_outer, 0.0), glow) * 0.45 : 0.0;
+
+		acc = over(acc, head_fill, max(edge * 0.8, body));
+	}
+
+	float4 track = track_color;
+	track.rgb *= 0.82 + 0.18 * across;
+	acc = over(acc, track, inner);
+	acc = over(acc, lit_fill(turn, across), inner * fill_mask);
 
 	if (border > 0.0)
-		acc = over(acc, border_color, saturate(outer - inner));
+		acc = over(acc, border_color, saturate(outer - cover(d_inner, 1.0)));
 
-	if (head_width > 0.0) {
+	if (knob > 0.5 && knob < 1.5) {
 		/* a line out from the centre through the end of the arc */
-		float2 dir = float2(sin(end), -cos(end));
-		float across = abs(v.x * dir.y - v.y * dir.x);
-		float facing = dot(v, dir) > 0.0 ? 1.0 : 0.0;
+		float along_line = abs(v.x * end_dir.y - v.y * end_dir.x);
+		float facing = dot(v, end_dir) > 0.0 ? 1.0 : 0.0;
 
-		acc = over(acc, head_color, outer * facing * saturate(head_width * 0.5 + 0.5 - across));
+		acc = over(acc, head_color, outer * facing * saturate(head_width * 0.5 + 0.5 - along_line));
+	} else if (knob > 1.5) {
+		float kr = head_width * 0.5;
+		float d_knob = length(v - end_at) - kr;
+		float d_knob_shadow = length(v - end_at - float2(0.0, 1.5)) - kr;
+
+		acc = over(acc, float4(0.0, 0.0, 0.0, 0.45), falloff(d_knob_shadow + 1.0, 4.0));
+		acc = over(acc, head_color, cover(d_knob, 1.0));
 	}
 
 	return acc;
@@ -229,7 +368,7 @@ float4 bar_ring(float2 p)
 
 float4 PSBar(VertData v_in) : TARGET
 {
-	float2 p = v_in.uv * size;
+	float2 p = v_in.uv * (size + float2(pad, pad) * 2.0) - float2(pad, pad);
 
 	if (mode > 3.5)
 		return unpremultiply(bar_ring(p));
@@ -317,7 +456,7 @@ float sd_restart(float2 p)
 }
 
 /* the distance to glyph number 'g' at p; see warp-status-icon.c */
-float sd_glyph(float2 p, float g)
+float sd_glyph_sharp(float2 p, float g)
 {
 	if (g < 1.5)
 		return sd_play(p);
@@ -341,6 +480,15 @@ float sd_glyph(float2 p, float g)
 		return sd_fast(p);
 
 	return sd_slow(p);
+}
+
+/* the glyph with its corners rounded off: drawn a touch smaller and grown back
+ * out by the rounding, so it keeps its size */
+float sd_glyph(float2 p, float g)
+{
+	float k = 1.0 + glyph_round;
+
+	return sd_glyph_sharp(p * k, g) / k - glyph_round * 0.85;
 }
 
 float sd_plate(float2 q)
