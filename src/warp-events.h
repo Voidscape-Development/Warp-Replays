@@ -99,6 +99,29 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define WARP_MEDIA_ACTION_RESTART "restart"
 #define WARP_MEDIA_ACTION_LOADED "loaded"
 
+/* Emitted by a Warp Playlist as a file goes up in place of the one before it:
+ *
+ *   warp_playlist_switched(ptr source, string reason, int transition_ms)
+ *
+ * 'reason' says what asked for the switch (one of the words below), and
+ * 'transition_ms' is how long the transition the switch runs through takes, or
+ * 0 for a cut or a switch made without one. The file going up is the one the
+ * media controls report from the moment this is emitted, while the one going
+ * out is still on screen under the transition for that long. */
+#define WARP_SIGNAL_PLAYLIST_SWITCHED "warp_playlist_switched"
+#define WARP_SIGNAL_DECL_PLAYLIST_SWITCHED \
+	"void warp_playlist_switched(ptr source, string reason, int transition_ms)"
+
+/* values of the 'reason' field: Next or Previous was asked for (a hotkey, the
+ * media controls, obs-websocket); the playlist was sent back to its first file;
+ * it was started up (loaded, activated, or played after a stop); or it moved on
+ * by itself as a file ran out */
+#define WARP_SWITCH_NEXT "next"
+#define WARP_SWITCH_PREVIOUS "previous"
+#define WARP_SWITCH_FIRST "first"
+#define WARP_SWITCH_START "start"
+#define WARP_SWITCH_AUTO "auto"
+
 /* Puts a clip in a Warp Media source, as a proc on the source itself:
  *
  *   warp_media_load(string path, int speed, string playback,
@@ -172,6 +195,23 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define WARP_CD_MEDIA_ACTION \
 	WARP_CD_STACK(WARP_CD_PARAM("source", sizeof(void *)) + \
 		      WARP_CD_PARAM("action", sizeof(WARP_MEDIA_ACTION_RESTART)))
+
+#define WARP_CD_PLAYLIST_SWITCHED \
+	WARP_CD_STACK(WARP_CD_PARAM("source", sizeof(void *)) + WARP_CD_PARAM("reason", sizeof(WARP_SWITCH_PREVIOUS)) + \
+		      WARP_CD_PARAM("transition_ms", sizeof(long long)))
+
+static inline void warp_signal_playlist_switched(obs_source_t *source, const char *reason, int transition_ms)
+{
+	struct calldata cd;
+	uint8_t stack[WARP_CD_PLAYLIST_SWITCHED];
+
+	calldata_init_fixed(&cd, stack, sizeof(stack));
+	calldata_set_ptr(&cd, "source", source);
+	calldata_set_string(&cd, "reason", reason);
+	calldata_set_int(&cd, "transition_ms", transition_ms);
+
+	signal_handler_signal(obs_source_get_signal_handler(source), WARP_SIGNAL_PLAYLIST_SWITCHED, &cd);
+}
 
 static inline void warp_signal_speed_changed(obs_source_t *source, int speed, int prev_speed, const char *change)
 {

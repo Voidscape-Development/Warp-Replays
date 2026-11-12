@@ -425,6 +425,15 @@ struct warp_playlist_source {
 	bool pending_transition;
 	size_t pending_dir;
 	float pending_age;
+	/* what asked for the switch the pending item is waiting on; one of the
+	 * WARP_SWITCH_* words, reported as it goes up */
+	const char *pending_reason;
+
+	/* What is asking for the switch that is being made right now, set
+	 * around a call that may make one (warp_pl_advance_for() and friends)
+	 * and taken up by warp_pl_play_pos(); NULL is the playlist moving on by
+	 * itself. */
+	const char *switch_reason;
 
 	/* ----------------------------------------------------------------- */
 	/* Threads. Everything in this struct belongs to the graphics thread,
@@ -463,6 +472,7 @@ struct warp_playlist_source {
 	size_t play_order_pos;
 	bool play_transition;
 	size_t play_dir;
+	const char *play_reason;
 	/* an item to open ahead of the switch point */
 	bool preload_requested;
 	size_t preload_order_pos;
@@ -482,6 +492,10 @@ struct warp_playlist_source {
 	 * straight back, so they are never emitted under the lock */
 	bool signal_started;
 	bool signal_ended;
+	/* a file went up: why, and how long its transition runs */
+	bool signal_switched;
+	const char *switched_reason;
+	uint32_t switched_ms;
 	/* set while the outermost warp_pl_flush() works through the above */
 	bool deferring;
 
@@ -567,7 +581,7 @@ static const char *warp_playlist_getname(void *unused)
  * thread reads, never held across a call into libobs. */
 
 static void warp_pl_start(struct warp_playlist_source *s, size_t order_pos, bool use_transition, size_t dir,
-			  uint64_t gen);
+			  const char *reason, uint64_t gen);
 static void warp_pl_open_preload(struct warp_playlist_source *s, size_t order_pos, uint64_t gen);
 static void warp_pl_end(struct warp_playlist_source *s);
 static void warp_pl_advance(struct warp_playlist_source *s, int dir);
@@ -697,6 +711,7 @@ static void warp_pl_flush(struct warp_playlist_source *s)
 		size_t play_order_pos = s->play_order_pos;
 		bool play_transition = s->play_transition;
 		size_t play_dir = s->play_dir;
+		const char *play_reason = s->play_reason;
 
 		bool preload = s->preload_requested;
 		size_t preload_order_pos = s->preload_order_pos;
@@ -704,6 +719,9 @@ static void warp_pl_flush(struct warp_playlist_source *s)
 
 		bool started = s->signal_started;
 		bool ended = s->signal_ended;
+		bool switched = s->signal_switched;
+		const char *switched_reason = s->switched_reason;
+		uint32_t switched_ms = s->switched_ms;
 
 		retired.da = s->retired.da;
 		da_init(s->retired);
@@ -735,8 +753,9 @@ static void warp_pl_flush(struct warp_playlist_source *s)
 		s->preload_requested = false;
 		s->signal_started = false;
 		s->signal_ended = false;
+		s->signal_switched = false;
 
-		if (!retired.num && !transition_armed && !play && !preload && !started && !ended) {
+		if (!retired.num && !transition_armed && !play && !preload && !started && !ended && !switched) {
 			s->deferring = false;
 			da_free(retired);
 			warp_pl_publish(s);
@@ -792,9 +811,12 @@ static void warp_pl_flush(struct warp_playlist_source *s)
 			obs_source_media_ended(s->source);
 		if (started)
 			obs_source_media_started(s->source);
+		if (switched)
+			warp_signal_playlist_switched(s->source, switched_reason ? switched_reason : WARP_SWITCH_AUTO,
+						      (int)switched_ms);
 
 		if (play)
-			warp_pl_start(s, play_order_pos, play_transition, play_dir, gen);
+			warp_pl_start(s, play_order_pos, play_transition, play_dir, play_reason, gen);
 		if (preload)
 			warp_pl_open_preload(s, preload_order_pos, gen);
 	}
@@ -1804,6 +1826,9 @@ static void warp_pl_promote_pending(struct warp_playlist_source *s)
 			WARP_PL_LOG(LOG_WARNING, "'%s' could not be opened, skipping it", path ? path : "");
 
 			int dir = s->pending_dir == WARP_PL_DIR_BACKWARD ? -1 : 1;
+			/* the file skipped to is going up for the same reason
+			 * the one that would not open was */
+			const char *reason = s->pending_reason;
 
 			warp_pl_drop_pending(s);
 
@@ -1815,7 +1840,9 @@ static void warp_pl_promote_pending(struct warp_playlist_source *s)
 			}
 
 			s->pos = order_pos;
+			s->switch_reason = reason;
 			warp_pl_advance(s, dir);
+			s->switch_reason = NULL;
 			return;
 		}
 
@@ -1849,6 +1876,12 @@ static void warp_pl_promote_pending(struct warp_playlist_source *s)
 
 	s->state = OBS_MEDIA_STATE_PLAYING;
 	s->signal_started = true;
+
+	/* say why it went up and how long the picture takes to get there, for
+	 * whatever is drawn alongside the playlist to follow it */
+	s->signal_switched = true;
+	s->switched_reason = s->pending_reason ? s->pending_reason : WARP_SWITCH_AUTO;
+	s->switched_ms = s->pending_transition ? warp_pl_transition_ms(s, warp_pl_dir_slot(s, s->pending_dir)) : 0;
 }
 
 /* Asks for the item at 'order_pos' to be played, switched to with the
@@ -1867,6 +1900,7 @@ static void warp_pl_play_pos(struct warp_playlist_source *s, size_t order_pos, b
 	s->play_order_pos = order_pos;
 	s->play_transition = use_transition;
 	s->play_dir = dir;
+	s->play_reason = s->switch_reason ? s->switch_reason : WARP_SWITCH_AUTO;
 }
 
 /* end of the playlist, or end of an item with auto advance turned off;
@@ -1972,6 +2006,15 @@ static void warp_pl_advance(struct warp_playlist_source *s, int dir)
 	warp_pl_play_pos(s, target, true, dir >= 0 ? WARP_PL_DIR_FORWARD : WARP_PL_DIR_BACKWARD);
 }
 
+/* warp_pl_advance(), asked for by 'reason' (a WARP_SWITCH_* word) rather than
+ * by the playlist moving on by itself.  Graphics thread. */
+static void warp_pl_advance_for(struct warp_playlist_source *s, int dir, const char *reason)
+{
+	s->switch_reason = reason;
+	warp_pl_advance(s, dir);
+	s->switch_reason = NULL;
+}
+
 /*  Graphics thread. */
 static void warp_pl_stop(struct warp_playlist_source *s)
 {
@@ -2023,12 +2066,20 @@ static void warp_pl_restart_playlist(struct warp_playlist_source *s)
 	warp_pl_play_pos(s, 0, true, WARP_PL_DIR_FORWARD);
 }
 
+/* warp_pl_restart_playlist(), reported as 'reason'.  Graphics thread. */
+static void warp_pl_restart_playlist_for(struct warp_playlist_source *s, const char *reason)
+{
+	s->switch_reason = reason;
+	warp_pl_restart_playlist(s);
+	s->switch_reason = NULL;
+}
+
 /* restarts the item that is playing right now, at the configured speed;
  * Graphics thread. */
 static void warp_pl_restart_current(struct warp_playlist_source *s)
 {
 	if (!s->current) {
-		warp_pl_restart_playlist(s);
+		warp_pl_restart_playlist_for(s, WARP_SWITCH_FIRST);
 		return;
 	}
 
@@ -2098,7 +2149,7 @@ static obs_source_t *warp_pl_take_parked(struct warp_playlist_source *s, const c
  * started where it sits; anything else is loaded into a kept item, or a new
  * one. Graphics thread. */
 static void warp_pl_start(struct warp_playlist_source *s, size_t order_pos, bool use_transition, size_t dir,
-			  uint64_t gen)
+			  const char *reason, uint64_t gen)
 {
 	struct warp_pl_item_config cfg;
 	obs_source_t *item = NULL;
@@ -2162,6 +2213,7 @@ static void warp_pl_start(struct warp_playlist_source *s, size_t order_pos, bool
 	s->pending_transition = use_transition;
 	s->pending_dir = dir;
 	s->pending_age = 0.0f;
+	s->pending_reason = reason;
 
 	warp_pl_promote_pending(s);
 
@@ -3344,8 +3396,11 @@ static void warp_playlist_update(void *data, obs_data_t *settings)
 
 	/* start at the top when nothing is playing: either the source was just
 	 * created, or the file that was playing is no longer in the list */
-	if (s->order.num && s->pos >= s->order.num && !s->pending && (!s->restart_on_activate || active))
+	if (s->order.num && s->pos >= s->order.num && !s->pending && (!s->restart_on_activate || active)) {
+		s->switch_reason = WARP_SWITCH_START;
 		warp_pl_play_pos(s, 0, false, WARP_PL_DIR_FORWARD);
+		s->switch_reason = NULL;
+	}
 
 	int speed_now = s->speed;
 
@@ -3484,15 +3539,15 @@ static void warp_pl_run_commands(struct warp_playlist_source *s)
 
 		switch (cmd.type) {
 		case WARP_PL_CMD_NEXT:
-			warp_pl_advance(s, 1);
+			warp_pl_advance_for(s, 1, WARP_SWITCH_NEXT);
 			warp_pl_flush(s);
 			break;
 		case WARP_PL_CMD_PREVIOUS:
-			warp_pl_advance(s, -1);
+			warp_pl_advance_for(s, -1, WARP_SWITCH_PREVIOUS);
 			warp_pl_flush(s);
 			break;
 		case WARP_PL_CMD_FIRST:
-			warp_pl_restart_playlist(s);
+			warp_pl_restart_playlist_for(s, WARP_SWITCH_FIRST);
 			warp_pl_flush(s);
 			break;
 		case WARP_PL_CMD_RESTART_CURRENT:
@@ -4039,9 +4094,13 @@ static void warp_playlist_register_procs(struct warp_playlist_source *s, obs_sou
 
 static void *warp_playlist_create(obs_data_t *settings, obs_source_t *source)
 {
-	static const char *signals[] = {WARP_SIGNAL_DECL_SPEED_CHANGED, WARP_SIGNAL_DECL_FRAMES_STEPPED,
-					WARP_SIGNAL_DECL_MEDIA_ACTION,  WARP_SIGNAL_DECL_ZOOM_CHANGED,
-					WARP_SIGNAL_DECL_ZOOM_STAGED,   NULL};
+	static const char *signals[] = {WARP_SIGNAL_DECL_SPEED_CHANGED,
+					WARP_SIGNAL_DECL_FRAMES_STEPPED,
+					WARP_SIGNAL_DECL_MEDIA_ACTION,
+					WARP_SIGNAL_DECL_ZOOM_CHANGED,
+					WARP_SIGNAL_DECL_ZOOM_STAGED,
+					WARP_SIGNAL_DECL_PLAYLIST_SWITCHED,
+					NULL};
 
 	struct warp_playlist_source *s = bzalloc(sizeof(struct warp_playlist_source));
 
@@ -4484,7 +4543,7 @@ static void warp_playlist_activate(void *data)
 	struct warp_playlist_source *s = data;
 
 	if (s->restart_on_activate)
-		warp_pl_restart_playlist(s);
+		warp_pl_restart_playlist_for(s, WARP_SWITCH_START);
 	warp_pl_flush(s);
 }
 
@@ -4510,7 +4569,7 @@ static void warp_playlist_play_pause(void *data, bool pause)
 		if (s->current && s->state == OBS_MEDIA_STATE_ENDED)
 			warp_pl_restart_current(s);
 		else
-			warp_pl_restart_playlist(s);
+			warp_pl_restart_playlist_for(s, WARP_SWITCH_START);
 
 		/* an empty playlist has nothing to play, so nothing happened */
 		acted = s->current || s->pending || s->play_armed;
@@ -4538,7 +4597,7 @@ static void warp_playlist_restart(void *data)
 	struct warp_playlist_source *s = data;
 	bool restarted;
 
-	warp_pl_restart_playlist(s);
+	warp_pl_restart_playlist_for(s, WARP_SWITCH_FIRST);
 	restarted = s->play_armed;
 	warp_pl_flush(s);
 
@@ -4558,7 +4617,7 @@ static void warp_playlist_next(void *data)
 {
 	struct warp_playlist_source *s = data;
 
-	warp_pl_advance(s, 1);
+	warp_pl_advance_for(s, 1, WARP_SWITCH_NEXT);
 	warp_pl_flush(s);
 }
 
@@ -4566,7 +4625,7 @@ static void warp_playlist_previous(void *data)
 {
 	struct warp_playlist_source *s = data;
 
-	warp_pl_advance(s, -1);
+	warp_pl_advance_for(s, -1, WARP_SWITCH_PREVIOUS);
 	warp_pl_flush(s);
 }
 

@@ -142,11 +142,15 @@ struct warp_source {
 	 * operator put on it themselves */
 	bool zoom_yielded;
 
-	/* Set while the source drives its own playback instead of carrying out
-	 * a command someone sent: restarting as it goes on screen, and the
-	 * pause a frame step does first. The media action signal is about
-	 * commands, so those are not reported as ones. */
-	bool internal_command;
+	/* How many of the source's own pauses and restarts are still on their
+	 * way, as opposed to commands someone sent: the restart as it goes on
+	 * screen, and the pause a frame step does first. The media action
+	 * signal is about commands, so those are not reported as ones. They are
+	 * counted rather than flagged around the call because libobs queues a
+	 * media control for the source's next tick: by the time it is carried
+	 * out, a flag set around asking for it is long cleared. */
+	volatile long internal_pauses;
+	volatile long internal_restarts;
 
 	struct warp_hotkey_binding speed_bindings[WARP_NUM_SPEED_PRESETS];
 	struct warp_hotkey_binding step_bindings[WARP_NUM_STEP_HOTKEYS];
@@ -1115,9 +1119,8 @@ static void warp_source_do_step(struct warp_source *s, int frames)
 	 * seen like any other. A clip that is stopped or has ended steps from
 	 * the start of the clip. */
 	if (state == OBS_MEDIA_STATE_PLAYING) {
-		s->internal_command = true;
+		os_atomic_inc_long(&s->internal_pauses);
 		obs_source_media_play_pause(s->source, true);
-		s->internal_command = false;
 	} else if (state != OBS_MEDIA_STATE_PAUSED && state != OBS_MEDIA_STATE_STOPPED &&
 		   state != OBS_MEDIA_STATE_ENDED) {
 		return;
@@ -1515,9 +1518,8 @@ static void warp_source_activate(void *data)
 	/* going on screen restarts playback by itself; obs_source_media_restart
 	 * is still what does it, so OBS's own media_restart signal is emitted
 	 * the way it is for any media source */
-	s->internal_command = true;
+	os_atomic_inc_long(&s->internal_restarts);
 	obs_source_media_restart(s->source);
-	s->internal_command = false;
 }
 
 static void warp_source_deactivate(void *data)
@@ -1542,6 +1544,20 @@ static void warp_source_deactivate(void *data)
 /* ------------------------------------------------------------------------- */
 /* media controls */
 
+/* whether the control being carried out is one the source asked for itself
+ * (see internal_pauses), counting it off if it is */
+static bool warp_source_take_internal(volatile long *count)
+{
+	long n = os_atomic_load_long(count);
+
+	while (n > 0) {
+		if (os_atomic_compare_exchange_long(count, &n, n - 1))
+			return true;
+	}
+
+	return false;
+}
+
 static void warp_source_play_pause(void *data, bool pause)
 {
 	struct warp_source *s = data;
@@ -1561,7 +1577,7 @@ static void warp_source_play_pause(void *data, bool pause)
 		obs_source_media_started(s->source);
 	}
 
-	if (!s->internal_command)
+	if (!(pause && warp_source_take_internal(&s->internal_pauses)))
 		warp_signal_media_action(s->source, pause ? WARP_MEDIA_ACTION_PAUSE : WARP_MEDIA_ACTION_PLAY);
 }
 
@@ -1583,7 +1599,7 @@ static void warp_source_restart(void *data)
 
 	set_state(s, OBS_MEDIA_STATE_PLAYING);
 
-	if (!s->internal_command)
+	if (!warp_source_take_internal(&s->internal_restarts))
 		warp_signal_media_action(s->source, WARP_MEDIA_ACTION_RESTART);
 }
 
