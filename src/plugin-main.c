@@ -19,6 +19,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <obs-module.h>
 #include <plugin-support.h>
 
+#include "warp-overlay.h"
 #include "warp-status.h"
 #include "warp-websocket.h"
 
@@ -33,6 +34,7 @@ extern struct obs_source_info warp_media_source_info;
 extern struct obs_source_info warp_playlist_source_info;
 extern struct obs_source_info warp_detection_filter_info;
 extern struct obs_source_info warp_zoom_filter_info;
+extern struct obs_source_info warp_progress_source_info;
 
 #ifdef WARP_HAVE_FRONTEND
 extern void warp_register_tools_menu(void);
@@ -45,6 +47,7 @@ bool obs_module_load(void)
 	obs_register_source(&warp_playlist_source_info);
 	obs_register_source(&warp_detection_filter_info);
 	obs_register_source(&warp_zoom_filter_info);
+	obs_register_source(&warp_progress_source_info);
 
 #ifdef WARP_HAVE_FRONTEND
 	warp_register_tools_menu();
@@ -72,6 +75,7 @@ void obs_module_post_load(void)
 void obs_module_unload(void)
 {
 	warp_status_set_sink(NULL);
+	warp_overlay_effect_free();
 
 #ifdef WARP_HAVE_FRONTEND_API
 	warp_flow_shutdown();

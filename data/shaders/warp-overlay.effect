@@ -1,0 +1,425 @@
+/*
+Warp
+Copyright (C) 2026 Voidscape Development
+
+Draws the Warp Progress Bar and the Warp Status Icon. Everything is worked out
+per pixel from the distance to the edge of a shape, so a bar, a ring and every
+glyph stay sharp and antialiased at whatever size they are drawn, with no
+texture to scale.
+*/
+
+uniform float4x4 ViewProj;
+
+/* the size of the quad being drawn, in pixels */
+uniform float2 size;
+uniform float opacity;
+
+/* the bar ------------------------------------------------------------------ */
+
+/* 0 left to right, 1 right to left, 2 bottom to top, 3 top to bottom, 4 ring */
+uniform float mode;
+uniform float progress;
+uniform float radius;
+uniform float border;
+uniform float ring_thickness;
+uniform float gradient;
+uniform float head_width;
+uniform float4 track_color;
+uniform float4 fill_color;
+uniform float4 fill_color2;
+uniform float4 border_color;
+uniform float4 head_color;
+
+/* the icon ----------------------------------------------------------------- */
+
+/* which glyph: see warp-status-icon.c */
+uniform float glyph;
+/* 0 none, 1 circle, 2 rounded square */
+uniform float plate_shape;
+uniform float glyph_scale;
+uniform float shadow;
+uniform float2 shadow_offset;
+uniform float shadow_soft;
+uniform float4 glyph_color;
+uniform float4 plate_color;
+uniform float4 shadow_color;
+
+/* a picture of the operator's own, in place of a glyph */
+uniform texture2d image;
+
+sampler_state textureSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv = v_in.uv;
+
+	return vert_out;
+}
+
+/* shapes ------------------------------------------------------------------- */
+
+#define PI 3.14159265
+#define TAU 6.2831853
+
+float sd_box(float2 p, float2 half_size, float r)
+{
+	float2 q = abs(p) - half_size + float2(r, r);
+
+	return length(max(q, float2(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
+float sd_triangle(float2 p, float2 p0, float2 p1, float2 p2)
+{
+	float2 e0 = p1 - p0;
+	float2 e1 = p2 - p1;
+	float2 e2 = p0 - p2;
+	float2 v0 = p - p0;
+	float2 v1 = p - p1;
+	float2 v2 = p - p2;
+	float2 pq0 = v0 - e0 * saturate(dot(v0, e0) / dot(e0, e0));
+	float2 pq1 = v1 - e1 * saturate(dot(v1, e1) / dot(e1, e1));
+	float2 pq2 = v2 - e2 * saturate(dot(v2, e2) / dot(e2, e2));
+	float s = sign(e0.x * e2.y - e0.y * e2.x);
+	float2 d0 = float2(dot(pq0, pq0), s * (v0.x * e0.y - v0.y * e0.x));
+	float2 d1 = float2(dot(pq1, pq1), s * (v1.x * e1.y - v1.y * e1.x));
+	float2 d2 = float2(dot(pq2, pq2), s * (v2.x * e2.y - v2.y * e2.x));
+	float2 d = min(min(d0, d1), d2);
+
+	return -sqrt(d.x) * sign(d.y);
+}
+
+/* a ring of radius r and thickness th */
+float sd_ring(float2 p, float r, float th)
+{
+	return abs(length(p) - r) - th * 0.5;
+}
+
+/* how far round from the top p is, clockwise, from 0 to 1; y runs down */
+float turn_of(float2 p)
+{
+	float a = atan2(p.x, -p.y) / TAU;
+
+	return a - floor(a);
+}
+
+/* coverage of a shape at distance d, with the edge 'px' wide */
+float cover(float d, float px)
+{
+	return saturate(0.5 - d / px);
+}
+
+/* straight color 'src' laid over premultiplied 'dst' */
+float4 over(float4 dst, float4 src, float a)
+{
+	float sa = src.a * a;
+
+	return float4(src.rgb * sa + dst.rgb * (1.0 - sa), sa + dst.a * (1.0 - sa));
+}
+
+float4 unpremultiply(float4 c)
+{
+	if (c.a <= 0.0)
+		return float4(0.0, 0.0, 0.0, 0.0);
+
+	return float4(c.rgb / c.a, c.a * opacity);
+}
+
+/* the bar ------------------------------------------------------------------ */
+
+float4 bar_linear(float2 p)
+{
+	float2 c = size * 0.5;
+	float r = min(radius, min(c.x, c.y));
+	float d_outer = sd_box(p - c, c, r);
+	float d_inner = d_outer + border;
+
+	float horizontal = mode < 1.5 ? 1.0 : 0.0;
+	float length_px = horizontal > 0.5 ? size.x : size.y;
+	/* how far along the bar this pixel is, in the direction it fills */
+	float along = p.x;
+
+	if (mode > 0.5 && mode < 1.5)
+		along = size.x - p.x;
+	else if (mode > 1.5 && mode < 2.5)
+		along = size.y - p.y;
+	else if (mode > 2.5)
+		along = p.y;
+
+	float head = progress * length_px;
+	float fill_mask = saturate(head - along + 0.5);
+	float4 fill = lerp(fill_color, fill_color2, gradient * saturate(along / length_px));
+
+	float inner = cover(d_inner, 1.0);
+	float outer = cover(d_outer, 1.0);
+	float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+
+	acc = over(acc, track_color, inner);
+	acc = over(acc, fill, inner * fill_mask);
+
+	if (border > 0.0)
+		acc = over(acc, border_color, saturate(outer - inner));
+
+	if (head_width > 0.0)
+		acc = over(acc, head_color, outer * saturate(head_width * 0.5 + 0.5 - abs(along - head)));
+
+	return acc;
+}
+
+float4 bar_ring(float2 p)
+{
+	float2 c = size * 0.5;
+	float outer_r = min(c.x, c.y) - 0.5;
+	float th = min(ring_thickness, outer_r);
+	float mid_r = outer_r - th * 0.5;
+	float2 v = p - c;
+
+	float d_outer = sd_ring(v, mid_r, th);
+	float d_inner = sd_ring(v, mid_r, max(th - border * 2.0, 0.0));
+
+	/* the filled arc: its far end is cut square, or rounded off with a cap
+	 * the width of the ring when the corners are rounded */
+	float turn = turn_of(v);
+	float arc = (progress - turn) * TAU * mid_r;
+	float fill_mask = progress >= 1.0 ? 1.0 : saturate(arc + 0.5);
+	float end = progress * TAU;
+	float2 end_at = float2(sin(end), -cos(end)) * mid_r;
+	float half_w = max(th * 0.5 - border, 0.0);
+
+	if (radius > 0.0 && progress > 0.0 && progress < 1.0) {
+		float2 start_at = float2(0.0, -mid_r);
+		float caps = min(length(v - end_at), length(v - start_at)) - half_w;
+
+		fill_mask = max(fill_mask, cover(caps, 1.0));
+	}
+
+	float4 fill = lerp(fill_color, fill_color2, gradient * turn);
+	float inner = cover(d_inner, 1.0);
+	float outer = cover(d_outer, 1.0);
+	float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+
+	acc = over(acc, track_color, inner);
+	acc = over(acc, fill, inner * fill_mask);
+
+	if (border > 0.0)
+		acc = over(acc, border_color, saturate(outer - inner));
+
+	if (head_width > 0.0) {
+		/* a line out from the centre through the end of the arc */
+		float2 dir = float2(sin(end), -cos(end));
+		float across = abs(v.x * dir.y - v.y * dir.x);
+		float facing = dot(v, dir) > 0.0 ? 1.0 : 0.0;
+
+		acc = over(acc, head_color, outer * facing * saturate(head_width * 0.5 + 0.5 - across));
+	}
+
+	return acc;
+}
+
+float4 PSBar(VertData v_in) : TARGET
+{
+	float2 p = v_in.uv * size;
+
+	if (mode > 3.5)
+		return unpremultiply(bar_ring(p));
+
+	return unpremultiply(bar_linear(p));
+}
+
+/* the icon ----------------------------------------------------------------- */
+
+float sd_play(float2 p)
+{
+	return sd_triangle(p, float2(-0.5, -0.8), float2(-0.5, 0.8), float2(0.85, 0.0));
+}
+
+float sd_pause(float2 p)
+{
+	float2 q = float2(abs(p.x) - 0.38, p.y);
+
+	return sd_box(q, float2(0.19, 0.78), 0.05);
+}
+
+float sd_stop(float2 p)
+{
+	return sd_box(p, float2(0.7, 0.7), 0.1);
+}
+
+float sd_ended(float2 p)
+{
+	return min(sd_ring(p, 0.86, 0.16), sd_box(p, float2(0.36, 0.36), 0.06));
+}
+
+float sd_step(float2 p)
+{
+	float tri = sd_triangle(p, float2(-0.75, -0.72), float2(-0.75, 0.72), float2(0.4, 0.0));
+	float bar = sd_box(p - float2(0.62, 0.0), float2(0.14, 0.72), 0.04);
+
+	return min(tri, bar);
+}
+
+float sd_skip(float2 p)
+{
+	float a = sd_triangle(p, float2(-0.9, -0.62), float2(-0.9, 0.62), float2(-0.15, 0.0));
+	float b = sd_triangle(p, float2(-0.18, -0.62), float2(-0.18, 0.62), float2(0.57, 0.0));
+	float bar = sd_box(p - float2(0.74, 0.0), float2(0.13, 0.62), 0.04);
+
+	return min(min(a, b), bar);
+}
+
+float sd_fast(float2 p)
+{
+	float a = sd_triangle(p, float2(-0.92, -0.66), float2(-0.92, 0.66), float2(0.0, 0.0));
+	float b = sd_triangle(p, float2(0.0, -0.66), float2(0.0, 0.66), float2(0.92, 0.0));
+
+	return min(a, b);
+}
+
+float sd_slow(float2 p)
+{
+	/* a play triangle inside a dashed circle */
+	float ring = sd_ring(p, 0.86, 0.14);
+	float n = turn_of(p) * 12.0;
+	float dash = (abs(n - floor(n) - 0.5) - 0.3) * (TAU * 0.86 / 12.0);
+	float tri = sd_triangle(p, float2(-0.28, -0.42), float2(-0.28, 0.42), float2(0.44, 0.0));
+
+	return min(max(ring, dash), tri);
+}
+
+float sd_restart(float2 p)
+{
+	/* a circle with a gap at the top, the arrow on its right-hand end
+	 * pointing back round anticlockwise */
+	float r = 0.68;
+	float gap = 0.09;
+	float turn = turn_of(p);
+	float from_top = min(turn, 1.0 - turn);
+	float arc = max(sd_ring(p, r, 0.2), (gap - from_top) * TAU * r);
+
+	float a = gap * TAU;
+	float2 at = float2(sin(a), -cos(a)) * r;
+	float2 radial = float2(sin(a), -cos(a));
+	float2 back = float2(-cos(a), -sin(a));
+	float head = sd_triangle(p, at + radial * 0.32, at - radial * 0.32, at + back * 0.38);
+
+	return min(arc, head);
+}
+
+/* the distance to glyph number 'g' at p; see warp-status-icon.c */
+float sd_glyph(float2 p, float g)
+{
+	if (g < 1.5)
+		return sd_play(p);
+	if (g < 2.5)
+		return sd_pause(p);
+	if (g < 3.5)
+		return sd_stop(p);
+	if (g < 4.5)
+		return sd_ended(p);
+	if (g < 5.5)
+		return sd_step(p);
+	if (g < 6.5)
+		return sd_step(float2(-p.x, p.y));
+	if (g < 7.5)
+		return sd_skip(p);
+	if (g < 8.5)
+		return sd_skip(float2(-p.x, p.y));
+	if (g < 9.5)
+		return sd_restart(p);
+	if (g < 10.5)
+		return sd_fast(p);
+
+	return sd_slow(p);
+}
+
+float sd_plate(float2 q)
+{
+	if (plate_shape < 1.5)
+		return length(q) - 1.0;
+
+	return sd_box(q, float2(1.0, 1.0), 0.3);
+}
+
+float4 PSIcon(VertData v_in) : TARGET
+{
+	/* -1 to 1 across the icon, y down, and how wide a pixel is in that */
+	float2 q = v_in.uv * 2.0 - float2(1.0, 1.0);
+	float px = 2.0 / min(size.x, size.y);
+	float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+
+	if (plate_shape > 0.5)
+		acc = over(acc, plate_color, cover(sd_plate(q), px));
+
+	if (glyph > 0.5) {
+		float2 g = q / glyph_scale;
+		float gpx = px / glyph_scale;
+
+		if (shadow > 0.5) {
+			float d_shadow = sd_glyph(g - shadow_offset / glyph_scale, glyph);
+			float soft = max(shadow_soft / glyph_scale, gpx);
+
+			acc = over(acc, shadow_color, saturate(0.5 - d_shadow / soft));
+		}
+
+		acc = over(acc, glyph_color, cover(sd_glyph(g, glyph), gpx));
+	}
+
+	return unpremultiply(acc);
+}
+
+/* an image of the operator's own, faded by 'opacity' */
+float4 PSImage(VertData v_in) : TARGET
+{
+	float4 c = image.Sample(textureSampler, v_in.uv);
+
+	return float4(c.rgb, c.a * opacity);
+}
+
+/* the same, for a picture whose colors are already multiplied by its alpha */
+float4 PSImagePremultiplied(VertData v_in) : TARGET
+{
+	return image.Sample(textureSampler, v_in.uv) * opacity;
+}
+
+technique Bar
+{
+	pass {
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSBar(v_in);
+	}
+}
+
+technique Icon
+{
+	pass {
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSIcon(v_in);
+	}
+}
+
+technique Image
+{
+	pass {
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSImage(v_in);
+	}
+}
+
+technique ImagePremultiplied
+{
+	pass {
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSImagePremultiplied(v_in);
+	}
+}
