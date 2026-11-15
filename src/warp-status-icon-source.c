@@ -28,7 +28,6 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <string.h>
 
 #include <obs-module.h>
-#include <graphics/image-file.h>
 #include <graphics/vec2.h>
 #include <graphics/vec4.h>
 #include <util/bmem.h>
@@ -215,9 +214,14 @@ struct warp_icon_look {
 	char text[96];
 };
 
+/* Loaded straight into a texture rather than through gs_image_file_t: that
+ * struct is laid out by the libobs it is compiled against and its functions
+ * are gone from OBS 33, so a plugin that held one would not load there. */
 struct warp_icon_image {
 	char *path;
-	gs_image_file_t image;
+	gs_texture_t *texture;
+	uint32_t cx;
+	uint32_t cy;
 	bool loaded;
 };
 
@@ -314,12 +318,16 @@ static void warp_icon_load_image(struct warp_icon_image *img, const char *path)
 	if ((img->path && strcmp(img->path, path) == 0) || (!img->path && !*path))
 		return;
 
-	if (img->loaded) {
+	if (img->texture) {
 		obs_enter_graphics();
-		gs_image_file_free(&img->image);
+		gs_texture_destroy(img->texture);
 		obs_leave_graphics();
-		img->loaded = false;
 	}
+
+	img->texture = NULL;
+	img->cx = 0;
+	img->cy = 0;
+	img->loaded = false;
 
 	bfree(img->path);
 	img->path = *path ? bstrdup(path) : NULL;
@@ -327,20 +335,18 @@ static void warp_icon_load_image(struct warp_icon_image *img, const char *path)
 	if (!img->path)
 		return;
 
-	gs_image_file_init(&img->image, img->path);
-
 	obs_enter_graphics();
-	gs_image_file_init_texture(&img->image);
+	img->texture = gs_texture_create_from_file(img->path);
+	if (img->texture) {
+		img->cx = gs_texture_get_width(img->texture);
+		img->cy = gs_texture_get_height(img->texture);
+	}
 	obs_leave_graphics();
 
-	img->loaded = img->image.texture != NULL;
+	img->loaded = img->texture != NULL;
 
-	if (!img->loaded) {
+	if (!img->loaded)
 		blog(LOG_WARNING, "[Warp Status Icon]: could not load '%s'", img->path);
-		obs_enter_graphics();
-		gs_image_file_free(&img->image);
-		obs_leave_graphics();
-	}
 }
 
 /* 'color' (0xAABBGGRR) taken 'percent' of the way to black, or to white when
@@ -1317,8 +1323,8 @@ static void warp_icon_draw_glyph(struct warp_icon_source *s, gs_effect_t *effect
 
 	/* the picture, fitted inside the glyph's room and kept to its shape */
 	float room = gsize * s->glyph_scale;
-	float iw = (float)img->image.cx;
-	float ih = (float)img->image.cy;
+	float iw = (float)img->cx;
+	float ih = (float)img->cy;
 
 	if (iw <= 0.0f || ih <= 0.0f)
 		return;
@@ -1327,13 +1333,13 @@ static void warp_icon_draw_glyph(struct warp_icon_source *s, gs_effect_t *effect
 	float w = iw * fit;
 	float h = ih * fit;
 
-	gs_effect_set_texture(gs_effect_get_param_by_name(effect, "image"), img->image.texture);
+	gs_effect_set_texture(gs_effect_get_param_by_name(effect, "image"), img->texture);
 	gs_effect_set_float(gs_effect_get_param_by_name(effect, "opacity"), opacity);
 
 	gs_matrix_push();
 	gs_matrix_translate3f(gx + (gsize - w) * 0.5f, gy + (gsize - h) * 0.5f, 0.0f);
 	gs_matrix_scale3f(fit, fit, 1.0f);
-	warp_icon_draw_tech(effect, "Image", img->image.texture, img->image.cx, img->image.cy);
+	warp_icon_draw_tech(effect, "Image", img->texture, img->cx, img->cy);
 	gs_matrix_pop();
 }
 
