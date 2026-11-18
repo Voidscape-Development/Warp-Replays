@@ -190,6 +190,14 @@ constexpr int WARP_ZOOM_PREVIEW_FLOOR = 64;
  * half of it. */
 constexpr int WARP_ZOOM_BAR_STEPS = 1000;
 
+/* How far a frame step goes: one a click, ten with Shift held, matching two of
+ * the step hotkeys. Held down, a step button repeats - a jog - after the wait
+ * and at the rate here. */
+constexpr int WARP_ZOOM_STEP_FINE = 1;
+constexpr int WARP_ZOOM_STEP_COARSE = 10;
+constexpr int WARP_ZOOM_JOG_WAIT_MS = 300;
+constexpr int WARP_ZOOM_JOG_MS = 66;
+
 /* the zooms the dock offers as buttons under the bar: each doubling there is */
 const float warpZoomStops[] = {1.0f, 2.0f, 4.0f, 8.0f};
 
@@ -213,6 +221,14 @@ inline QColor warpZoomStageColor()
 bool warpZoomSameView(const warp_zoom_view &a, const warp_zoom_view &b)
 {
 	return std::fabs(a.zoom - b.zoom) < 0.005f && std::fabs(a.x - b.x) < 0.002f && std::fabs(a.y - b.y) < 0.002f;
+}
+
+/* a time in a clip as an operator reads one: minutes, seconds and tenths */
+QString warpZoomClock(int64_t ms)
+{
+	ms = qMax<int64_t>(0, ms);
+
+	return QString("%1:%2.%3").arg(ms / 60000).arg(ms / 1000 % 60, 2, 10, QChar('0')).arg(ms / 100 % 10);
 }
 
 int warpZoomToBar(float zoom)
@@ -1586,7 +1602,24 @@ QPixmap warpZoomTinted(QSvgRenderer &glyph, int side, const QColor &ink, qreal r
  * from the same place the words on any other button take theirs. */
 class WarpZoomPadButton : public QPushButton {
 public:
-	WarpZoomPadButton(const QString &drawing, QWidget *parent = nullptr) : QPushButton(parent), glyph(drawing) {}
+	WarpZoomPadButton(const QString &drawing, QWidget *parent = nullptr)
+		: QPushButton(parent),
+		  glyph(drawing),
+		  drawingNow(drawing)
+	{
+	}
+
+	/* another drawing on the same button - play turning into pause */
+	void setDrawing(const QString &drawing)
+	{
+		if (drawing == drawingNow)
+			return;
+
+		drawingNow = drawing;
+		glyph.load(drawing);
+		sheet = QPixmap();
+		update();
+	}
 
 protected:
 	void paintEvent(QPaintEvent *event) override
@@ -1626,6 +1659,7 @@ private:
 	}
 
 	QSvgRenderer glyph;
+	QString drawingNow;
 	QPixmap sheet;
 	QColor sheetInk;
 	int sheetSide = 0;
@@ -2601,6 +2635,7 @@ private:
 
 		topBox->addLayout(sourceRow);
 		topBox->addWidget(preview, 1);
+		topBox->addWidget(buildTransport());
 		topBox->addLayout(stageRow);
 		/* takes up what the picture will not once it is as tall as its
 		 * shape allows, so the rows stay together at the top */
@@ -2641,6 +2676,200 @@ private:
 
 			refreshView();
 		});
+	}
+
+	/* The clip's timeline and transport, under the picture the way a
+	 * monitor's are: where in the clip it is with the time gone and the time
+	 * left either side, and one row of buttons the same size as each other -
+	 * back a clip, back a frame, play or pause, on a frame, on a clip, stop.
+	 * The set never changes shape; what a source cannot do is greyed, and a
+	 * source with no playback at all (a camera under a Warp Zoom filter)
+	 * puts the whole of it away. */
+	QWidget *buildTransport()
+	{
+		transport = new QWidget(blockTop);
+
+		auto *box = new QVBoxLayout(transport);
+		auto *scrubRow = new QHBoxLayout();
+		auto *buttonRow = new WarpZoomCells(0, 0, 2);
+
+		box->setContentsMargins(0, 0, 0, 0);
+		box->setSpacing(2);
+		scrubRow->setSpacing(6);
+
+		elapsedLabel = new QLabel(transport);
+		remainLabel = new QLabel(transport);
+		elapsedLabel->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Elapsed")));
+		remainLabel->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Remaining")));
+		remainLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+		/* as wide as the longest a time gets, so the bar between them
+		 * does not shift as the figures change */
+		for (QLabel *label : {elapsedLabel, remainLabel})
+			label->setMinimumWidth(
+				label->fontMetrics().horizontalAdvance(QString(QChar(0x2212)) + "88:88.8"));
+
+		scrubSlider = new QSlider(Qt::Horizontal, transport);
+		scrubSlider->setMinimumWidth(WARP_ZOOM_SLIDER_MIN);
+		scrubSlider->setSingleStep(100);
+		scrubSlider->setPageStep(1000);
+		scrubSlider->setAccessibleName(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Seek")));
+
+		scrubRow->addWidget(elapsedLabel);
+		scrubRow->addWidget(scrubSlider, 1);
+		scrubRow->addWidget(remainLabel);
+
+		auto add = [&](const char *drawing, const char *name, auto act) {
+			auto *button = new WarpZoomPadButton(warpZoomDrawing(drawing), transport);
+
+			warpZoomName(button, name);
+			button->setFocusPolicy(Qt::NoFocus);
+			button->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+			button->setStyleSheet(QString::fromUtf8("padding: 0px; min-width: 24px; min-height: 26px;"));
+			buttonRow->addWidget(button);
+			connect(button, &QPushButton::clicked, this, act);
+
+			return button;
+		};
+
+		prevButton = add("previous", "Warp.Zoom.Dock.Previous", [this]() {
+			/* back a clip, on a source that is one clip, is back to its top */
+			mediaDo([](obs_source_t *s) {
+				mediaKind(s) == List ? obs_source_media_previous(s) : obs_source_media_restart(s);
+			});
+		});
+		backButton = add("step-back", "Warp.Zoom.Dock.StepBack", [this]() { step(-1); });
+		playButton = add("play", "Warp.Zoom.Dock.Play", [this]() { playPause(); });
+		forwardButton = add("step-forward", "Warp.Zoom.Dock.StepForward", [this]() { step(1); });
+		nextButton = add("next", "Warp.Zoom.Dock.Next", [this]() { mediaDo(obs_source_media_next); });
+		stopButton = add("stop", "Warp.Zoom.Dock.StopPlayback", [this]() { mediaDo(obs_source_media_stop); });
+
+		/* held down, a step is a jog */
+		for (QPushButton *button : {backButton, forwardButton}) {
+			button->setAutoRepeat(true);
+			button->setAutoRepeatDelay(WARP_ZOOM_JOG_WAIT_MS);
+			button->setAutoRepeatInterval(WARP_ZOOM_JOG_MS);
+		}
+
+		box->addLayout(scrubRow);
+		box->addLayout(buttonRow);
+
+		/* a drag seeks as it goes and is watched at the riding rate, the
+		 * same as dragging the picture */
+		connect(scrubSlider, &QSlider::valueChanged, this, [this](int value) {
+			OBSSourceAutoRelease parent = loading ? nullptr : warpZoomParent(target);
+
+			if (parent)
+				obs_source_media_set_time(parent, value);
+		});
+		connect(scrubSlider, &QSlider::sliderPressed, this, [this]() { setRiding(true); });
+		connect(scrubSlider, &QSlider::sliderReleased, this, [this]() { setRiding(false); });
+
+		return transport;
+	}
+
+	/* What the source the picture comes from is, as far as playback goes. */
+	enum Media { NoMedia, Clip, Warp, List };
+
+	static Media mediaKind(obs_source_t *parent)
+	{
+		if (!parent || !(obs_source_get_output_flags(parent) & OBS_SOURCE_CONTROLLABLE_MEDIA))
+			return NoMedia;
+
+		QString id = QString::fromUtf8(obs_source_get_id(parent));
+
+		return id == "warp_playlist_source" ? List : id == "warp_media_source" ? Warp : Clip;
+	}
+
+	void mediaDo(const std::function<void(obs_source_t *)> &act)
+	{
+		OBSSourceAutoRelease parent = warpZoomParent(target);
+
+		if (parent)
+			act(parent);
+
+		refreshView();
+	}
+
+	/* Play from a clip that has run out is play it again; a playlist
+	 * works out for itself what play after its end means. */
+	void playPause()
+	{
+		OBSSourceAutoRelease parent = warpZoomParent(target);
+
+		if (!parent)
+			return;
+
+		obs_media_state state = obs_source_media_get_state(parent);
+
+		if (state == OBS_MEDIA_STATE_ENDED && mediaKind(parent) != List)
+			obs_source_media_restart(parent);
+		else
+			obs_source_media_play_pause(parent, state == OBS_MEDIA_STATE_PLAYING);
+
+		refreshView();
+	}
+
+	/* a frame either way, ten with Shift; stepping pauses a clip that is
+	 * playing, which the source sees to */
+	void step(int way)
+	{
+		OBSSourceAutoRelease parent = warpZoomParent(target);
+		calldata_t cd;
+
+		if (!parent)
+			return;
+
+		calldata_init(&cd);
+		calldata_set_int(&cd, "frames",
+				 way * ((QApplication::keyboardModifiers() & Qt::ShiftModifier) ? WARP_ZOOM_STEP_COARSE
+												: WARP_ZOOM_STEP_FINE));
+		proc_handler_call(obs_source_get_proc_handler(parent), "warp_step_frames", &cd);
+		calldata_free(&cd);
+		refreshView();
+	}
+
+	/* where the clip is and what can be done to it, read back every tick */
+	void refreshTransport(obs_source_t *parent)
+	{
+		Media kind = mediaKind(parent);
+
+		if ((kind != NoMedia) == transport->isHidden()) {
+			transport->setVisible(kind != NoMedia);
+			fitParts();
+		}
+
+		if (kind == NoMedia)
+			return;
+
+		obs_media_state state = obs_source_media_get_state(parent);
+		int64_t duration = obs_source_media_get_duration(parent);
+		int64_t time = obs_source_media_get_time(parent);
+		bool loaded = state != OBS_MEDIA_STATE_NONE && state != OBS_MEDIA_STATE_ERROR;
+		bool playing = state == OBS_MEDIA_STATE_PLAYING;
+
+		playButton->setDrawing(warpZoomDrawing(playing ? "pause" : "play"));
+		warpZoomName(playButton, playing ? "Warp.Zoom.Dock.Pause" : "Warp.Zoom.Dock.Play");
+
+		warpZoomName(prevButton, kind == List ? "Warp.Zoom.Dock.Previous" : "Warp.Zoom.Dock.Restart");
+		nextButton->setEnabled(kind == List);
+		backButton->setEnabled(loaded && kind != Clip);
+		forwardButton->setEnabled(loaded && kind != Clip);
+		stopButton->setEnabled(loaded && state != OBS_MEDIA_STATE_STOPPED);
+		scrubSlider->setEnabled(loaded && duration > 0);
+
+		if (!scrubSlider->isSliderDown()) {
+			scrubSlider->setRange(0, (int)qMax<int64_t>(0, duration));
+			scrubSlider->setValue((int)time);
+		} else {
+			time = scrubSlider->value();
+		}
+
+		bool timed = loaded && duration > 0;
+
+		elapsedLabel->setText(timed ? warpZoomClock(time) : QString::fromUtf8("-:--.-"));
+		remainLabel->setText(timed ? QString(QChar(0x2212)) + warpZoomClock(duration - time)
+					   : QString::fromUtf8("-:--.-"));
 	}
 
 	/* The framing controls: the pad, and the zoom beside it. */
@@ -3313,6 +3542,8 @@ private:
 		calldata_t cd;
 		long long speed = 0;
 
+		refreshTransport(parent);
+
 		calldata_init(&cd);
 
 		bool have_speed = parent &&
@@ -3408,6 +3639,16 @@ private:
 	QPushButton *follow = nullptr;
 	WarpZoomPadButton *pictureButton = nullptr;
 	WarpZoomPreview *preview = nullptr;
+	QWidget *transport = nullptr;
+	QSlider *scrubSlider = nullptr;
+	QLabel *elapsedLabel = nullptr;
+	QLabel *remainLabel = nullptr;
+	WarpZoomPadButton *playButton = nullptr;
+	QPushButton *prevButton = nullptr;
+	QPushButton *backButton = nullptr;
+	QPushButton *forwardButton = nullptr;
+	QPushButton *nextButton = nullptr;
+	QPushButton *stopButton = nullptr;
 	QPushButton *directButton = nullptr;
 	QPushButton *confirmButton = nullptr;
 	QLabel *directHint = nullptr;
