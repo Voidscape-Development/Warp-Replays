@@ -2841,10 +2841,11 @@ private:
 		 * button could, so a greyed step is a dead key. */
 		setFocusPolicy(Qt::ClickFocus);
 
-		for (auto [key, button] : {std::pair<int, QPushButton *>{Qt::Key_Space, playButton},
-					   {Qt::Key_Left, backButton},
-					   {Qt::Key_Right, forwardButton}}) {
-			auto *shortcut = new QShortcut(QKeySequence(key), this, nullptr, nullptr,
+		for (const auto &bound : {std::pair<int, QPushButton *>{Qt::Key_Space, playButton},
+					  {Qt::Key_Left, backButton},
+					  {Qt::Key_Right, forwardButton}}) {
+			QPushButton *button = bound.second;
+			auto *shortcut = new QShortcut(QKeySequence(bound.first), this, nullptr, nullptr,
 						       Qt::WidgetWithChildrenShortcut);
 
 			connect(shortcut, &QShortcut::activated, button, [this, button]() {
