@@ -16,6 +16,7 @@ You should have received a copy of the GNU General Public License along
 with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
+#include <algorithm>
 #include <cmath>
 #include <functional>
 
@@ -56,6 +57,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QScrollArea>
+#include <QShortcut>
 #include <QSizePolicy>
 #include <QSlider>
 #include <QSpinBox>
@@ -190,11 +192,10 @@ constexpr int WARP_ZOOM_PREVIEW_FLOOR = 64;
  * half of it. */
 constexpr int WARP_ZOOM_BAR_STEPS = 1000;
 
-/* How far a frame step goes: one a click, ten with Shift held, matching two of
- * the step hotkeys. Held down, a step button repeats - a jog - after the wait
- * and at the rate here. */
-constexpr int WARP_ZOOM_STEP_FINE = 1;
-constexpr int WARP_ZOOM_STEP_COARSE = 10;
+/* How far a frame step can go, which are the amounts the step hotkeys use; the
+ * one picked is what both step buttons do. Held down, a step button repeats - a
+ * jog - after the wait and at the rate here. */
+const int warpZoomStepCounts[] = {WARP_STEP_COUNT_LIST};
 constexpr int WARP_ZOOM_JOG_WAIT_MS = 300;
 constexpr int WARP_ZOOM_JOG_MS = 66;
 
@@ -718,6 +719,34 @@ void warpZoomSetMinimalSetting(bool minimal)
 		return;
 
 	config_set_bool(cfg, WARP_ZOOM_CFG_SECTION, WARP_ZOOM_CFG_MINIMAL, minimal);
+	config_save_safe(cfg, "tmp", nullptr);
+}
+
+/* the same, for the frames a step goes and whether the clock says the clip's
+ * length rather than the time left in it */
+constexpr const char *WARP_ZOOM_CFG_STEP = "StepFrames";
+constexpr const char *WARP_ZOOM_CFG_TOTAL = "ShowTotal";
+
+int warpZoomSetting(const char *key, int fallback)
+{
+	config_t *cfg = obs_frontend_get_user_config();
+
+	if (!cfg)
+		return fallback;
+
+	config_set_default_int(cfg, WARP_ZOOM_CFG_SECTION, key, fallback);
+
+	return (int)config_get_int(cfg, WARP_ZOOM_CFG_SECTION, key);
+}
+
+void warpZoomSaveSetting(const char *key, int value)
+{
+	config_t *cfg = obs_frontend_get_user_config();
+
+	if (!cfg)
+		return;
+
+	config_set_int(cfg, WARP_ZOOM_CFG_SECTION, key, value);
 	config_save_safe(cfg, "tmp", nullptr);
 }
 
@@ -2309,6 +2338,19 @@ protected:
 		fitParts();
 	}
 
+	/* a click on the clock at the end of the seek bar */
+	bool eventFilter(QObject *watched, QEvent *event) override
+	{
+		if (watched == remainLabel && event->type() == QEvent::MouseButtonPress) {
+			showTotal = !showTotal;
+			warpZoomSaveSetting(WARP_ZOOM_CFG_TOTAL, showTotal);
+			refreshView();
+			return true;
+		}
+
+		return QWidget::eventFilter(watched, event);
+	}
+
 	/* A theme or a font picked mid-show changes what every row in the dock
 	 * takes up, and with it how much height there is left for the picture. */
 	void changeEvent(QEvent *event) override
@@ -2700,8 +2742,12 @@ private:
 		elapsedLabel = new QLabel(transport);
 		remainLabel = new QLabel(transport);
 		elapsedLabel->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Elapsed")));
-		remainLabel->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Remaining")));
 		remainLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+		/* a click turns the time left into the clip's length and back,
+		 * which is caught in `eventFilter' */
+		remainLabel->setCursor(Qt::PointingHandCursor);
+		remainLabel->installEventFilter(this);
+		showTotal = warpZoomSetting(WARP_ZOOM_CFG_TOTAL, 0) != 0;
 
 		/* as wide as the longest a time gets, so the bar between them
 		 * does not shift as the figures change */
@@ -2751,8 +2797,47 @@ private:
 			button->setAutoRepeatInterval(WARP_ZOOM_JOG_MS);
 		}
 
+		/* How far a step goes, as a set the way the preset speeds are:
+		 * every amount the step hotkeys use, the one in use held down. */
+		auto *stepRow = new QHBoxLayout();
+		auto *stepCells = new WarpZoomCells(0, 0, 2);
+		auto *stepCaption = new QLabel(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.StepBy")), transport);
+
+		stepCaption->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.StepBy.Desc")));
+		stepRow->setSpacing(6);
+		stepRow->addWidget(stepCaption);
+		stepRow->addLayout(stepCells, 1);
+
+		for (int count : warpZoomStepCounts) {
+			QPushButton *chip = warpZoomChip(QString::number(count), transport);
+
+			chip->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.StepBy.Count")).arg(count));
+			chip->setAccessibleName(chip->toolTip());
+			stepCells->addWidget(chip);
+			stepButtons.append(chip);
+
+			connect(chip, &QPushButton::clicked, this, [this, count]() {
+				setStep(count);
+				warpZoomSaveSetting(WARP_ZOOM_CFG_STEP, count);
+			});
+		}
+
+		setStep(warpZoomSetting(WARP_ZOOM_CFG_STEP, warpZoomStepCounts[0]));
+
 		box->addLayout(scrubRow);
 		box->addLayout(buttonRow);
+		box->addLayout(stepRow);
+
+		/* Space plays and pauses while anything in the dock has the
+		 * keyboard - which clicking anywhere in it gives it */
+		setFocusPolicy(Qt::ClickFocus);
+		auto *space = new QShortcut(QKeySequence(Qt::Key_Space), this, nullptr, nullptr,
+					    Qt::WidgetWithChildrenShortcut);
+
+		connect(space, &QShortcut::activated, this, [this]() {
+			if (!transport->isHidden())
+				playPause();
+		});
 
 		/* a drag seeks as it goes and is watched at the riding rate, the
 		 * same as dragging the picture */
@@ -2766,6 +2851,27 @@ private:
 		connect(scrubSlider, &QSlider::sliderReleased, this, [this]() { setRiding(false); });
 
 		return transport;
+	}
+
+	/* the frames a step goes, said on the buttons that step and held down
+	 * on the one that picked it; an amount that is no longer offered falls
+	 * back to a single frame */
+	void setStep(int frames)
+	{
+		stepFrames = std::find(std::begin(warpZoomStepCounts), std::end(warpZoomStepCounts), frames) !=
+					     std::end(warpZoomStepCounts)
+				     ? frames
+				     : warpZoomStepCounts[0];
+
+		for (int i = 0; i < stepButtons.size(); i++)
+			stepButtons[i]->setChecked(warpZoomStepCounts[i] == stepFrames);
+
+		for (auto [button, key] :
+		     {std::pair<QPushButton *, const char *>{backButton, "Warp.Zoom.Dock.StepBack"},
+		      {forwardButton, "Warp.Zoom.Dock.StepForward"}}) {
+			button->setToolTip(QString::fromUtf8(obs_module_text(key)).arg(stepFrames));
+			button->setAccessibleName(button->toolTip());
+		}
 	}
 
 	/* What the source the picture comes from is, as far as playback goes. */
@@ -2810,8 +2916,8 @@ private:
 		refreshView();
 	}
 
-	/* a frame either way, ten with Shift; stepping pauses a clip that is
-	 * playing, which the source sees to */
+	/* the picked number of frames either way; stepping pauses a clip that
+	 * is playing, which the source sees to */
 	void step(int way)
 	{
 		OBSSourceAutoRelease parent = warpZoomParent(target);
@@ -2821,9 +2927,7 @@ private:
 			return;
 
 		calldata_init(&cd);
-		calldata_set_int(&cd, "frames",
-				 way * ((QApplication::keyboardModifiers() & Qt::ShiftModifier) ? WARP_ZOOM_STEP_COARSE
-												: WARP_ZOOM_STEP_FINE));
+		calldata_set_int(&cd, "frames", way * stepFrames);
 		proc_handler_call(obs_source_get_proc_handler(parent), "warp_step_frames", &cd);
 		calldata_free(&cd);
 		refreshView();
@@ -2855,6 +2959,9 @@ private:
 		nextButton->setEnabled(kind == List);
 		backButton->setEnabled(loaded && kind != Clip);
 		forwardButton->setEnabled(loaded && kind != Clip);
+
+		for (QPushButton *chip : stepButtons)
+			chip->setEnabled(loaded && kind != Clip);
 		stopButton->setEnabled(loaded && state != OBS_MEDIA_STATE_STOPPED);
 		scrubSlider->setEnabled(loaded && duration > 0);
 
@@ -2868,8 +2975,11 @@ private:
 		bool timed = loaded && duration > 0;
 
 		elapsedLabel->setText(timed ? warpZoomClock(time) : QString::fromUtf8("-:--.-"));
-		remainLabel->setText(timed ? QString(QChar(0x2212)) + warpZoomClock(duration - time)
-					   : QString::fromUtf8("-:--.-"));
+		remainLabel->setText(!timed      ? QString::fromUtf8("-:--.-")
+				     : showTotal ? warpZoomClock(duration)
+						 : QString(QChar(0x2212)) + warpZoomClock(duration - time));
+		remainLabel->setToolTip(QString::fromUtf8(
+			obs_module_text(showTotal ? "Warp.Zoom.Dock.Total" : "Warp.Zoom.Dock.Remaining")));
 	}
 
 	/* The framing controls: the pad, and the zoom beside it. */
@@ -3643,6 +3753,9 @@ private:
 	QSlider *scrubSlider = nullptr;
 	QLabel *elapsedLabel = nullptr;
 	QLabel *remainLabel = nullptr;
+	QVector<QPushButton *> stepButtons;
+	int stepFrames = 1;
+	bool showTotal = false;
 	WarpZoomPadButton *playButton = nullptr;
 	QPushButton *prevButton = nullptr;
 	QPushButton *backButton = nullptr;
