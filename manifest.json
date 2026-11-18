@@ -1,0 +1,18 @@
+{
+    "display_name": "Warp",
+    "id": "a2723627-1075-4b29-86fa-a0bd382db5cd",
+    "version": "0.1.0",
+    "authors": [
+        "Voidscape Development"
+    ],
+    "name": "Warp",
+    "description": "Warp is an OBS Studio plugin for handling replays at video game events and in any other situation that calls for instant-replay control.",
+    "long_description": "Warp is an OBS Studio plugin for handling replays at video game events and in any other situation that calls for instant-replay control.",
+    "urls": {
+        "repository": "https://github.com/Voidscape-Development/Warp-Replays",
+        "website": "https://github.com/Voidscape-Development/Warp-Replays",
+        "support": "https://github.com/Voidscape-Development/Warp-Replays/issues"
+    },
+    "has_banner": false,
+    "has_icon": false
+}
