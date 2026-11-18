@@ -2828,16 +2828,23 @@ private:
 		box->addLayout(buttonRow);
 		box->addLayout(stepRow);
 
-		/* Space plays and pauses while anything in the dock has the
-		 * keyboard - which clicking anywhere in it gives it */
+		/* Space plays and pauses, and Left and Right step by the amount
+		 * picked - held, they jog - while anything in the dock has the
+		 * keyboard, which clicking anywhere in it gives it. Each does
+		 * only what its button could, so a greyed step is a dead key. */
 		setFocusPolicy(Qt::ClickFocus);
-		auto *space = new QShortcut(QKeySequence(Qt::Key_Space), this, nullptr, nullptr,
-					    Qt::WidgetWithChildrenShortcut);
 
-		connect(space, &QShortcut::activated, this, [this]() {
-			if (!transport->isHidden())
-				playPause();
-		});
+		for (auto [key, button] : {std::pair<int, QPushButton *>{Qt::Key_Space, playButton},
+					   {Qt::Key_Left, backButton},
+					   {Qt::Key_Right, forwardButton}}) {
+			auto *shortcut = new QShortcut(QKeySequence(key), this, nullptr, nullptr,
+						       Qt::WidgetWithChildrenShortcut);
+
+			connect(shortcut, &QShortcut::activated, button, [this, button]() {
+				if (!transport->isHidden() && button->isEnabled())
+					button->click();
+			});
+		}
 
 		/* a drag seeks as it goes and is watched at the riding rate, the
 		 * same as dragging the picture */
