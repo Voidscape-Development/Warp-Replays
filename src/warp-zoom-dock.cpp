@@ -2889,7 +2889,11 @@ private:
 	void dressSteps()
 	{
 		QSvgRenderer glyph(warpZoomDrawing("frame-step"));
-		int side = qMax(8, fontMetrics().height() * 4 / 5);
+		/* The drawing stands 16 of its 24 units tall, and is sized so
+		 * that is the height of the figures beside it - cap line to
+		 * baseline - rather than a share of the whole line, which left
+		 * it short of the baseline and reading as sitting high. */
+		int side = qMax(8, qRound(fontMetrics().capHeight() * 1.5));
 
 		for (QPushButton *chip : stepButtons) {
 			QIcon icon;
