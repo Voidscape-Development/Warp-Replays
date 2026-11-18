@@ -672,8 +672,14 @@ public:
 		ensurePolished();
 		initStyleOption(&option);
 
-		return style()->sizeFromContents(QStyle::CT_PushButton, &option,
-						 fontMetrics().size(Qt::TextShowMnemonic, text()), this);
+		QSize contents = fontMetrics().size(Qt::TextShowMnemonic, text());
+
+		/* a drawing beside the words is room the words alone do not say */
+		if (!icon().isNull())
+			contents = QSize(contents.width() + iconSize().width() + 4,
+					 qMax(contents.height(), iconSize().height()));
+
+		return style()->sizeFromContents(QStyle::CT_PushButton, &option, contents, this);
 	}
 
 	QSize minimumSizeHint() const override { return sizeHint(); }
@@ -2359,6 +2365,10 @@ protected:
 	{
 		QWidget::changeEvent(event);
 
+		if (event->type() == QEvent::StyleChange || event->type() == QEvent::FontChange ||
+		    event->type() == QEvent::PaletteChange)
+			dressSteps();
+
 		if (event->type() == QEvent::StyleChange || event->type() == QEvent::FontChange)
 			fitParts();
 	}
@@ -2812,9 +2822,13 @@ private:
 		}
 
 		for (int frames : amounts) {
-			QPushButton *chip = warpZoomChip(frames < 0 ? QString(QChar(0x2212)) + QString::number(-frames)
-								    : QString("+%1").arg(frames),
-							 transport);
+			/* the frame-step drawing says which way, the figures how
+			 * far: pointing back for the left half, on for the right */
+			QPushButton *chip = warpZoomChip(
+				QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Frames.Short")).arg(std::abs(frames)),
+				transport);
+
+			chip->setProperty("warpBack", frames < 0);
 
 			chip->setCheckable(false);
 			chip->setAutoRepeat(true);
@@ -2834,6 +2848,7 @@ private:
 		box->addLayout(scrubRow);
 		box->addLayout(buttonRow);
 		box->addLayout(stepRow);
+		dressSteps();
 
 		/* Space plays and pauses, and Left and Right step a frame - held,
 		 * they jog - while anything in the dock has the keyboard, which
@@ -2866,6 +2881,39 @@ private:
 		connect(scrubSlider, &QSlider::sliderReleased, this, [this]() { setRiding(false); });
 
 		return transport;
+	}
+
+	/* The step buttons' drawing, in the theme's colour for words on a button
+	 * and its greyed one, and the height of a line of them - drawn again
+	 * when a theme or a font is picked mid-show. */
+	void dressSteps()
+	{
+		QSvgRenderer glyph(warpZoomDrawing("frame-step"));
+		int side = qMax(8, fontMetrics().height() * 4 / 5);
+
+		for (QPushButton *chip : stepButtons) {
+			QIcon icon;
+
+			for (QIcon::Mode mode : {QIcon::Normal, QIcon::Disabled}) {
+				QPalette::ColorGroup group = mode == QIcon::Disabled ? QPalette::Disabled
+										     : QPalette::Active;
+				QPixmap sheet = warpZoomTinted(glyph, side,
+							       chip->palette().color(group, QPalette::ButtonText),
+							       chip->devicePixelRatioF());
+
+				if (chip->property("warpBack").toBool()) {
+					qreal ratio = sheet.devicePixelRatio();
+
+					sheet = sheet.transformed(QTransform().scale(-1, 1));
+					sheet.setDevicePixelRatio(ratio);
+				}
+
+				icon.addPixmap(sheet, mode);
+			}
+
+			chip->setIconSize(QSize(side, side));
+			chip->setIcon(icon);
+		}
 	}
 
 	/* What the source the picture comes from is, as far as playback goes. */
