@@ -21,8 +21,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 class QWidget;
 
 /* The Warp Zoom dock: the panel an operator frames a replay from, with the
- * picture it is framing, the presets it can be sent to, and the speed it is
- * played at. Added to OBS as a dock of its own when the plugin loads. */
+ * picture it is framing and its transport, the presets it can be sent to, and
+ * the speed it is played at. Added to OBS as a dock of its own when the plugin loads. */
 extern "C" void warp_register_zoom_dock(void);
 
 /* Opens the window the zoom presets of a source are set up in, which is what
