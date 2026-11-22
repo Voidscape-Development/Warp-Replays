@@ -60,6 +60,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QResizeEvent>
 #include <QScrollArea>
 #include <QShortcut>
+#include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QSlider>
 #include <QSpinBox>
@@ -2335,15 +2336,10 @@ class WarpZoomArranger : public QWidget {
 public:
 	enum Zone { Above, Below, Left, Right };
 
-	struct Spot {
-		int section;
-		QRect rect;
-	};
-
-	std::function<QVector<Spot>()> spots;
 	std::function<void(int from, int onto, int zone)> onDrop;
 
-	explicit WarpZoomArranger(QWidget *parent) : QWidget(parent)
+	/* the dock's sections, in the order of their numbers */
+	WarpZoomArranger(const QVector<QWidget *> &sections, QWidget *parent) : QWidget(parent), blocks(sections)
 	{
 		done = new QPushButton(this);
 		connect(done, &QPushButton::clicked, this, &QWidget::hide);
@@ -2383,20 +2379,23 @@ protected:
 		font.setBold(true);
 		painter.setFont(font);
 
-		for (const Spot &spot : spots()) {
-			QRectF box = QRectF(spot.rect).adjusted(1.5, 1.5, -1.5, -1.5);
+		for (int section = 0; section < blocks.size(); section++) {
+			if (blocks[section]->isHidden())
+				continue;
+
+			QRectF box = QRectF(blocks[section]->geometry()).adjusted(1.5, 1.5, -1.5, -1.5);
 			QColor fill = mark;
 
-			fill.setAlpha(spot.section == held ? 70 : 25);
-			painter.setPen(QPen(mark, 2, spot.section == held ? Qt::SolidLine : Qt::DashLine));
+			fill.setAlpha(section == held ? 70 : 25);
+			painter.setPen(QPen(mark, 2, section == held ? Qt::SolidLine : Qt::DashLine));
 			painter.setBrush(fill);
 			painter.drawRoundedRect(box, 6, 6);
 			painter.setPen(palette().color(QPalette::WindowText));
 			painter.drawText(box, Qt::AlignCenter | Qt::TextWordWrap,
-					 QString::fromUtf8(obs_module_text(warpZoomSectionNames[spot.section])) + "\n" +
+					 QString::fromUtf8(obs_module_text(warpZoomSectionNames[section])) + "\n" +
 						 QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Arrange.Drag")));
 
-			if (spot.section != onto || held < 0 || onto == held)
+			if (section != onto || held < 0 || onto == held)
 				continue;
 
 			painter.fillRect(zone == Above   ? QRectF(box.left(), box.top(), box.width(), 5)
@@ -2442,23 +2441,26 @@ private:
 	/* the section under a point, and which side of it a drop there means */
 	int sectionAt(const QPoint &point)
 	{
-		for (const Spot &spot : spots()) {
-			if (!spot.rect.contains(point))
+		for (int section = 0; section < blocks.size(); section++) {
+			QRect box = blocks[section]->geometry();
+
+			if (blocks[section]->isHidden() || !box.contains(point))
 				continue;
 
-			qreal across = (point.x() - spot.rect.x()) / (qreal)qMax(1, spot.rect.width());
-			qreal down = (point.y() - spot.rect.y()) / (qreal)qMax(1, spot.rect.height());
+			qreal across = (point.x() - box.x()) / (qreal)qMax(1, box.width());
+			qreal down = (point.y() - box.y()) / (qreal)qMax(1, box.height());
 
 			zone = sideways && across < 0.25   ? Left
 			       : sideways && across > 0.75 ? Right
 			       : down < 0.5                ? Above
 							   : Below;
-			return spot.section;
+			return section;
 		}
 
 		return -1;
 	}
 
+	QVector<QWidget *> blocks;
 	QPushButton *done = nullptr;
 	bool sideways = false;
 	int held = -1;
@@ -2688,7 +2690,7 @@ private:
 		while (QLayoutItem *item = grid->takeAt(0))
 			delete item;
 
-		for (int c = 0; c <= WARP_ZOOM_SECTIONS; c++)
+		for (int c = 0; c < WARP_ZOOM_SECTIONS; c++)
 			grid->setColumnStretch(c, 0);
 
 		const WarpZoomOrder &columns = order[wide];
@@ -2714,7 +2716,7 @@ private:
 
 			/* with nothing in a column to take what is left over, it
 			 * goes under it */
-			if (!filled)
+			if (!filled && stretch)
 				column->addStretch(1);
 
 			grid->addLayout(column, 0, c);
@@ -2751,6 +2753,9 @@ private:
 
 		for (int section = 0; section < WARP_ZOOM_SECTIONS; section++)
 			blockOf(section)->setVisible(any[section]);
+
+		/* Full and Minimal mean nothing where the picture is put away */
+		pictureButton->setVisible(on(WARP_ZOOM_PART_PICTURE));
 	}
 
 	/* everything laid out again after the operator has changed it */
@@ -3754,10 +3759,15 @@ private:
 		});
 		connect(buttons->button(QDialogButtonBox::RestoreDefaults), &QPushButton::clicked, this,
 			[this, ticks]() {
-				for (QCheckBox *tick : ticks)
+				/* the ticks quietly, and the dock laid out once for all of them */
+				for (QCheckBox *tick : ticks) {
+					QSignalBlocker quiet(tick);
 					tick->setChecked(true);
+				}
 
 				for (int shape : {0, 1}) {
+					hidden[shape] = 0;
+					warpZoomSaveSetting(warpZoomHiddenKeys[shape], 0);
 					order[shape] = warpZoomOrderFrom(warpZoomDefaultOrder[shape], shape);
 					warpZoomSaveSetting(warpZoomOrderKeys[shape], warpZoomDefaultOrder[shape]);
 				}
@@ -3779,17 +3789,7 @@ private:
 	void arrange()
 	{
 		if (!arranger) {
-			arranger = new WarpZoomArranger(this);
-			arranger->spots = [this]() {
-				QVector<WarpZoomArranger::Spot> spots;
-
-				for (int section = 0; section < WARP_ZOOM_SECTIONS; section++) {
-					if (!blockOf(section)->isHidden())
-						spots.append({section, blockOf(section)->geometry()});
-				}
-
-				return spots;
-			};
+			arranger = new WarpZoomArranger({blockTop, blockFrame, blockPresets, blockSpeed}, this);
 			arranger->onDrop = [this](int from, int onto, int zone) {
 				moveSection(from, onto, zone);
 			};
