@@ -31,6 +31,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QApplication>
 #include <QAbstractButton>
 #include <QBoxLayout>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -54,10 +55,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPalette>
+#include <QPointer>
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QScrollArea>
 #include <QShortcut>
+#include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QSlider>
 #include <QSpinBox>
@@ -756,6 +759,108 @@ void warpZoomSaveSetting(const char *key, int value)
 
 	config_set_int(cfg, WARP_ZOOM_CFG_SECTION, key, value);
 	config_save_safe(cfg, "tmp", nullptr);
+}
+
+/* ------------------------------------------------------------------------- */
+/* what an operator can put away and move about
+ *
+ * The dock's two shapes - one column down the side of the window, columns side
+ * by side along the bottom of it - are each set up on their own: which parts of
+ * the dock are there, and where its sections stand. Everything is there to
+ * begin with; a part is put away by its bit in that shape's mask. */
+enum WarpZoomSection { WARP_ZOOM_TOP, WARP_ZOOM_FRAME, WARP_ZOOM_PRESETS, WARP_ZOOM_SPEED, WARP_ZOOM_SECTIONS };
+
+enum WarpZoomPart {
+	WARP_ZOOM_PART_SOURCE,
+	WARP_ZOOM_PART_PICTURE,
+	WARP_ZOOM_PART_TRANSPORT,
+	WARP_ZOOM_PART_STEPS,
+	WARP_ZOOM_PART_STAGE,
+	WARP_ZOOM_PART_PAD,
+	WARP_ZOOM_PART_ROCKER,
+	WARP_ZOOM_PART_ZOOMBAR,
+	WARP_ZOOM_PART_STOPS,
+	WARP_ZOOM_PART_PRESETTOOLS,
+	WARP_ZOOM_PART_TILES,
+	WARP_ZOOM_PART_SPEEDBUTTONS,
+	WARP_ZOOM_PART_SPEEDBAR,
+	WARP_ZOOM_PARTS
+};
+
+const struct {
+	int section;
+	const char *name;
+} warpZoomParts[WARP_ZOOM_PARTS] = {
+	{WARP_ZOOM_TOP, "Warp.Zoom.Dock.Part.Source"},     {WARP_ZOOM_TOP, "Warp.Zoom.Dock.Part.Picture"},
+	{WARP_ZOOM_TOP, "Warp.Zoom.Dock.Part.Transport"},  {WARP_ZOOM_TOP, "Warp.Zoom.Dock.Part.Steps"},
+	{WARP_ZOOM_TOP, "Warp.Zoom.Dock.Part.Stage"},      {WARP_ZOOM_FRAME, "Warp.Zoom.Dock.Part.Pad"},
+	{WARP_ZOOM_FRAME, "Warp.Zoom.Dock.Part.Rocker"},   {WARP_ZOOM_FRAME, "Warp.Zoom.Dock.Part.ZoomBar"},
+	{WARP_ZOOM_FRAME, "Warp.Zoom.Dock.Part.Stops"},    {WARP_ZOOM_PRESETS, "Warp.Zoom.Dock.Part.PresetTools"},
+	{WARP_ZOOM_PRESETS, "Warp.Zoom.Dock.Part.Tiles"},  {WARP_ZOOM_SPEED, "Warp.Zoom.Dock.Part.SpeedButtons"},
+	{WARP_ZOOM_SPEED, "Warp.Zoom.Dock.Part.SpeedBar"},
+};
+
+const char *const warpZoomSectionNames[WARP_ZOOM_SECTIONS] = {"Warp.Zoom.Dock.Section.Top", "Warp.Zoom.Dock.Frame",
+							      "Warp.Zoom.Dock.Presets", "Warp.Video.Speed"};
+
+/* per shape: [0] the column, [1] side by side */
+const char *const warpZoomHiddenKeys[] = {"HiddenColumn", "HiddenWide"};
+const char *const warpZoomOrderKeys[] = {"OrderColumn", "OrderWide"};
+
+/* Where the sections stand, as columns from the left and sections from the top
+ * of each. Kept in the config as the digits of a number - a section's number
+ * plus one, and a 0 between columns - so 102403 is the picture, then the frame
+ * over the speed, then the presets. Anything else read back is the default. */
+using WarpZoomOrder = QVector<QVector<int>>;
+const int warpZoomDefaultOrder[] = {1234, 102403};
+
+WarpZoomOrder warpZoomOrderFrom(int code, bool wide)
+{
+	WarpZoomOrder order{{}};
+	int seen = 0;
+
+	for (QChar digit : QString::number(code)) {
+		int d = digit.digitValue();
+
+		if (d == 0 && wide && !order.last().isEmpty())
+			order.append(QVector<int>());
+		else if (d >= 1 && d <= WARP_ZOOM_SECTIONS && !(seen & (1 << (d - 1))))
+			order.last().append(d - 1), seen |= 1 << (d - 1);
+		else
+			return warpZoomOrderFrom(warpZoomDefaultOrder[wide], wide);
+	}
+
+	if (seen != (1 << WARP_ZOOM_SECTIONS) - 1 || order.last().isEmpty())
+		return warpZoomOrderFrom(warpZoomDefaultOrder[wide], wide);
+
+	return order;
+}
+
+int warpZoomOrderCode(const WarpZoomOrder &order)
+{
+	QString digits;
+
+	for (const QVector<int> &column : order) {
+		if (!digits.isEmpty())
+			digits += '0';
+
+		for (int section : column)
+			digits += QString::number(section + 1);
+	}
+
+	return digits.toInt();
+}
+
+/* a row of the dock as a widget of its own, so it can be put away and brought
+ * back without touching what its own controls are showing */
+QWidget *warpZoomRow(QLayout *layout, QWidget *parent)
+{
+	auto *row = new QWidget(parent);
+
+	layout->setContentsMargins(0, 0, 0, 0);
+	row->setLayout(layout);
+
+	return row;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2219,10 +2324,160 @@ private:
 /* ------------------------------------------------------------------------- */
 /* the dock */
 
+/* ------------------------------------------------------------------------- */
+/* moving the sections about
+ *
+ * Laid over the whole dock while its sections are being arranged, so a press
+ * anywhere picks a section up rather than working the control under it. Each
+ * section is outlined and named where it stands; one is dragged onto another
+ * and dropped above or below it or, side by side, into a column of its own to
+ * the left or right of it. */
+class WarpZoomArranger : public QWidget {
+public:
+	enum Zone { Above, Below, Left, Right };
+
+	std::function<void(int from, int onto, int zone)> onDrop;
+
+	/* the dock's sections, in the order of their numbers */
+	WarpZoomArranger(const QVector<QWidget *> &sections, QWidget *parent) : QWidget(parent), blocks(sections)
+	{
+		done = new QPushButton(this);
+		connect(done, &QPushButton::clicked, this, &QWidget::hide);
+		setCursor(Qt::OpenHandCursor);
+		hide();
+	}
+
+	/* the shape being arranged, which is the one the dock is in */
+	void setShape(bool wide)
+	{
+		sideways = wide;
+		done->setText(QString::fromUtf8(obs_module_text(wide ? "Warp.Zoom.Dock.Arrange.Done.Wide"
+								     : "Warp.Zoom.Dock.Arrange.Done.Column")));
+		resizeEvent(nullptr);
+		update();
+	}
+
+protected:
+	void resizeEvent(QResizeEvent *) override
+	{
+		QSize size = done->sizeHint();
+
+		done->setGeometry((width() - size.width()) / 2, height() - size.height() - 6, size.width(),
+				  size.height());
+	}
+
+	void paintEvent(QPaintEvent *) override
+	{
+		QPainter painter(this);
+		QColor back = palette().color(QPalette::Window);
+		QColor mark = palette().color(QPalette::Highlight);
+		QFont font = painter.font();
+
+		back.setAlpha(215);
+		painter.fillRect(rect(), back);
+		painter.setRenderHint(QPainter::Antialiasing);
+		font.setBold(true);
+		painter.setFont(font);
+
+		for (int section = 0; section < blocks.size(); section++) {
+			if (blocks[section]->isHidden())
+				continue;
+
+			QRectF box = QRectF(blocks[section]->geometry()).adjusted(1.5, 1.5, -1.5, -1.5);
+			QColor fill = mark;
+
+			fill.setAlpha(section == held ? 70 : 25);
+			painter.setPen(QPen(mark, 2, section == held ? Qt::SolidLine : Qt::DashLine));
+			painter.setBrush(fill);
+			painter.drawRoundedRect(box, 6, 6);
+			painter.setPen(palette().color(QPalette::WindowText));
+			painter.drawText(box, Qt::AlignCenter | Qt::TextWordWrap,
+					 QString::fromUtf8(obs_module_text(warpZoomSectionNames[section])) + "\n" +
+						 QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Arrange.Drag")));
+
+			if (section != onto || held < 0 || onto == held)
+				continue;
+
+			painter.fillRect(zone == Above   ? QRectF(box.left(), box.top(), box.width(), 5)
+					 : zone == Below ? QRectF(box.left(), box.bottom() - 5, box.width(), 5)
+					 : zone == Left  ? QRectF(box.left(), box.top(), 5, box.height())
+							 : QRectF(box.right() - 5, box.top(), 5, box.height()),
+					 mark);
+		}
+	}
+
+	void mousePressEvent(QMouseEvent *event) override
+	{
+		held = sectionAt(event->pos());
+		onto = -1;
+		setCursor(held >= 0 ? Qt::ClosedHandCursor : Qt::OpenHandCursor);
+		update();
+	}
+
+	void mouseMoveEvent(QMouseEvent *event) override
+	{
+		if (held < 0)
+			return;
+
+		onto = sectionAt(event->pos());
+		update();
+	}
+
+	void mouseReleaseEvent(QMouseEvent *) override
+	{
+		int from = held;
+
+		held = -1;
+		setCursor(Qt::OpenHandCursor);
+
+		if (from >= 0 && onto >= 0 && onto != from)
+			onDrop(from, onto, zone);
+
+		onto = -1;
+		update();
+	}
+
+private:
+	/* the section under a point, and which side of it a drop there means */
+	int sectionAt(const QPoint &point)
+	{
+		for (int section = 0; section < blocks.size(); section++) {
+			QRect box = blocks[section]->geometry();
+
+			if (blocks[section]->isHidden() || !box.contains(point))
+				continue;
+
+			qreal across = (point.x() - box.x()) / (qreal)qMax(1, box.width());
+			qreal down = (point.y() - box.y()) / (qreal)qMax(1, box.height());
+
+			zone = sideways && across < 0.25   ? Left
+			       : sideways && across > 0.75 ? Right
+			       : down < 0.5                ? Above
+							   : Below;
+			return section;
+		}
+
+		return -1;
+	}
+
+	QVector<QWidget *> blocks;
+	QPushButton *done = nullptr;
+	bool sideways = false;
+	int held = -1;
+	int onto = -1;
+	Zone zone = Above;
+};
+
 class WarpZoomDock : public QWidget {
 public:
 	explicit WarpZoomDock(QWidget *parent = nullptr) : QWidget(parent)
 	{
+		for (int shape : {0, 1}) {
+			hidden[shape] = warpZoomSetting(warpZoomHiddenKeys[shape], 0);
+			order[shape] = warpZoomOrderFrom(
+				warpZoomSetting(warpZoomOrderKeys[shape], warpZoomDefaultOrder[shape]), shape);
+		}
+
 		build();
 
 		previewTimer = new QTimer(this);
@@ -2304,6 +2559,12 @@ protected:
 		confirmAction->setEnabled(canConfirm);
 		confirmAction->setToolTip(QString::fromUtf8(obs_module_text("Warp.Zoom.Confirm.Desc")));
 
+		menu.addSeparator();
+
+		QAction *customizeAction =
+			menu.addAction(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Customize")));
+		QAction *arrangeAction = menu.addAction(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Arrange")));
+
 		/* a menu says nothing in a tooltip unless it is asked to */
 		menu.setToolTipsVisible(true);
 
@@ -2329,6 +2590,10 @@ protected:
 			refreshLists();
 		} else if (picked == confirmAction) {
 			setConfirm(confirmAction->isChecked());
+		} else if (picked == customizeAction) {
+			customize();
+		} else if (picked == arrangeAction) {
+			arrange();
 		} else {
 			bool wanted = picked == small;
 
@@ -2344,6 +2609,9 @@ protected:
 	{
 		QWidget::resizeEvent(event);
 		fitParts();
+
+		if (arranger)
+			arranger->setGeometry(rect());
 	}
 
 	/* a click on the clock at the end of the seek bar */
@@ -2396,7 +2664,13 @@ private:
 	 * and stacked the same way it has room for the first of those and none
 	 * of the rest. So there the parts stand side by side instead - the
 	 * picture, then the controls, then the presets - each with the dock's
-	 * whole height to itself. */
+	 * whole height to itself.
+	 *
+	 * Which parts are there and where each section stands is the operator's,
+	 * set for each shape on its own: see `customize' and `arrange'. Each
+	 * column is a stack of its own, where the presets - and side by side the
+	 * picture too - take what height is left, and the frame and the speed
+	 * keep to the height they need. */
 	void fitShape()
 	{
 		bool wanted = width() >= WARP_ZOOM_WIDE_MIN && width() * 10 >= height() * 16;
@@ -2406,28 +2680,93 @@ private:
 
 		wide = wanted;
 		placed = true;
+		applyParts();
 
-		for (QWidget *block : {blockTop, blockFrame, blockPresets, blockSpeed})
-			grid->removeWidget(block);
+		if (arranger)
+			arranger->setShape(wide);
 
-		if (wide) {
-			grid->addWidget(blockTop, 0, 0, 2, 1);
-			grid->addWidget(blockFrame, 0, 1);
-			grid->addWidget(blockSpeed, 1, 1, Qt::AlignTop);
-			grid->addWidget(blockPresets, 0, 2, 2, 1);
-		} else {
-			grid->addWidget(blockTop, 0, 0);
-			grid->addWidget(blockFrame, 1, 0);
-			grid->addWidget(blockPresets, 2, 0);
-			grid->addWidget(blockSpeed, 3, 0);
+		/* the columns as they were go, the blocks in them staying the
+		 * dock's, and are built again as they are now */
+		while (QLayoutItem *item = grid->takeAt(0))
+			delete item;
+
+		for (int c = 0; c < WARP_ZOOM_SECTIONS; c++)
+			grid->setColumnStretch(c, 0);
+
+		const WarpZoomOrder &columns = order[wide];
+
+		for (int c = 0; c < columns.size(); c++) {
+			auto *column = new QVBoxLayout();
+			int stretch = 0;
+			bool filled = false;
+
+			column->setSpacing(grid->verticalSpacing());
+
+			for (int section : columns[c]) {
+				QWidget *block = blockOf(section);
+				bool big = section == WARP_ZOOM_TOP || section == WARP_ZOOM_PRESETS;
+				bool fills = !block->isHidden() && (section == WARP_ZOOM_PRESETS || (wide && big));
+
+				column->addWidget(block, fills ? 1 : 0);
+				filled |= fills;
+
+				if (!block->isHidden())
+					stretch = qMax(stretch, big ? 4 : 3);
+			}
+
+			/* with nothing in a column to take what is left over, it
+			 * goes under it */
+			if (!filled && stretch)
+				column->addStretch(1);
+
+			grid->addLayout(column, 0, c);
+			grid->setColumnStretch(c, wide ? stretch : 1);
+		}
+	}
+
+	QWidget *blockOf(int section) const
+	{
+		QWidget *const blocks[] = {blockTop, blockFrame, blockPresets, blockSpeed};
+
+		return blocks[section];
+	}
+
+	/* whether a part is there in the shape the dock is in */
+	bool on(int part) const { return !(hidden[wide] & (1 << part)); }
+
+	/* Puts away what the operator has put away in this shape, and a whole
+	 * section with it once nothing of it is left. The picture and the
+	 * transport have more to them than this - room, and a source that plays -
+	 * so they are left to `fitPreview' and `refreshTransport', which ask. */
+	void applyParts()
+	{
+		bool any[WARP_ZOOM_SECTIONS] = {};
+
+		for (int part = 0; part < WARP_ZOOM_PARTS; part++) {
+			any[warpZoomParts[part].section] |= on(part);
+
+			if (parts[part] && parts[part]->isHidden() == on(part))
+				parts[part]->setVisible(on(part));
 		}
 
-		grid->setColumnStretch(0, wide ? 4 : 1);
-		grid->setColumnStretch(1, wide ? 3 : 0);
-		grid->setColumnStretch(2, wide ? 4 : 0);
-		grid->setRowStretch(1, wide ? 1 : 0);
-		grid->setRowStretch(2, wide ? 0 : 1);
-		grid->setRowStretch(3, 0);
+		transport->setVisible(media && (on(WARP_ZOOM_PART_TRANSPORT) || on(WARP_ZOOM_PART_STEPS)));
+
+		for (int section = 0; section < WARP_ZOOM_SECTIONS; section++)
+			blockOf(section)->setVisible(any[section]);
+
+		/* Full and Minimal mean nothing where the picture is put away */
+		pictureButton->setVisible(on(WARP_ZOOM_PART_PICTURE));
+	}
+
+	/* everything laid out again after the operator has changed it */
+	void relayout()
+	{
+		placed = false;
+		fitParts();
+		grid->activate();
+
+		if (arranger)
+			arranger->update();
 	}
 
 	/* the height a column of rows holds at a width, leaving out whatever is
@@ -2461,25 +2800,34 @@ private:
 	 * stands rather than against a number written down when this was
 	 * written. The picture is left out of it - it is the one being placed -
 	 * and so is anything hidden, since a row that is not there holds
-	 * nothing. Side by side, the picture only shares its height with the
-	 * rows of its own column. */
+	 * nothing. The picture only shares its height with the sections of its
+	 * own column, which in one column is all of them. */
 	int restHeight() const
 	{
 		QMargins margins = grid->contentsMargins();
 		int across = width() - margins.left() - margins.right();
 		int total = margins.top() + margins.bottom();
 
-		if (wide)
-			return total + heightOf(topBox, blockTop->width() > 0 ? blockTop->width() : across, preview);
+		for (const QVector<int> &column : order[wide]) {
+			if (!column.contains(WARP_ZOOM_TOP))
+				continue;
 
-		total += heightOf(topBox, across, preview);
+			for (int section : column) {
+				QWidget *block = blockOf(section);
+				int at = wide && block->width() > 0 ? block->width() : across;
 
-		for (QWidget *block : {blockFrame, blockPresets, blockSpeed})
-			total += heightOf(block->layout(), across, nullptr) + grid->verticalSpacing();
+				if (block->isHidden())
+					continue;
 
-		/* a row of presets is worth more than a sliver of picture */
-		if (!tiles.isEmpty())
-			total += tiles.first()->sizeHint().height();
+				total += section == WARP_ZOOM_TOP
+						 ? heightOf(topBox, at, preview)
+						 : heightOf(block->layout(), at, nullptr) + grid->verticalSpacing();
+
+				/* a row of presets is worth more than a sliver of picture */
+				if (section == WARP_ZOOM_PRESETS && !tileScroll->isHidden() && !tiles.isEmpty())
+					total += tiles.first()->sizeHint().height();
+			}
+		}
 
 		return total;
 	}
@@ -2494,7 +2842,8 @@ private:
 	 * bars above and below itself, and that height is the presets'. */
 	void fitPreview()
 	{
-		bool room = !minimal && height() - restHeight() >= WARP_ZOOM_PREVIEW_FLOOR;
+		bool room = !minimal && on(WARP_ZOOM_PART_PICTURE) &&
+			    height() - restHeight() >= WARP_ZOOM_PREVIEW_FLOOR;
 
 		/* asked of what the dock was told rather than of what is on
 		 * screen: a child of a panel that has not been shown yet is not
@@ -2626,12 +2975,23 @@ private:
 			QString::fromUtf8("padding-left: 8px; padding-right: 8px; min-width: 16px;"));
 		warpZoomName(pictureButton, "Warp.Zoom.Dock.Picture");
 
+		/* which parts of the dock are there and where they stand */
+		auto *customizeButton = new WarpZoomPadButton(warpZoomDrawing("customize"), blockTop);
+
+		customizeButton->setFocusPolicy(Qt::NoFocus);
+		customizeButton->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+		customizeButton->setStyleSheet(pictureButton->styleSheet());
+		warpZoomName(customizeButton, "Warp.Zoom.Dock.Customize");
+		connect(customizeButton, &QPushButton::clicked, this, [this]() { customize(); });
+
 		auto *sourceRow = new QHBoxLayout();
 
 		sourceRow->setSpacing(4);
 		sourceRow->addWidget(targets, 1);
 		sourceRow->addWidget(follow);
 		sourceRow->addWidget(pictureButton);
+		sourceRow->addWidget(customizeButton);
+		parts[WARP_ZOOM_PART_SOURCE] = warpZoomRow(sourceRow, blockTop);
 
 		preview = new WarpZoomPreview(blockTop);
 		preview->onPan = [this](float dx, float dy) {
@@ -2687,10 +3047,12 @@ private:
 		stageRow->addWidget(dropButton);
 		stageRow->addWidget(takeButton);
 
-		topBox->addLayout(sourceRow);
+		parts[WARP_ZOOM_PART_STAGE] = warpZoomRow(stageRow, blockTop);
+
+		topBox->addWidget(parts[WARP_ZOOM_PART_SOURCE]);
 		topBox->addWidget(preview, 1);
 		topBox->addWidget(buildTransport());
-		topBox->addLayout(stageRow);
+		topBox->addWidget(parts[WARP_ZOOM_PART_STAGE]);
 		/* takes up what the picture will not once it is as tall as its
 		 * shape allows, so the rows stay together at the top */
 		topBox->addStretch(0);
@@ -2845,9 +3207,16 @@ private:
 			connect(chip, &QPushButton::clicked, this, [this, frames]() { step(frames); });
 		}
 
-		box->addLayout(scrubRow);
-		box->addLayout(buttonRow);
-		box->addLayout(stepRow);
+		auto *playBox = new QVBoxLayout();
+
+		playBox->setSpacing(2);
+		playBox->addLayout(scrubRow);
+		playBox->addLayout(buttonRow);
+		parts[WARP_ZOOM_PART_TRANSPORT] = warpZoomRow(playBox, transport);
+		parts[WARP_ZOOM_PART_STEPS] = warpZoomRow(stepRow, transport);
+
+		box->addWidget(parts[WARP_ZOOM_PART_TRANSPORT]);
+		box->addWidget(parts[WARP_ZOOM_PART_STEPS]);
 		dressSteps();
 
 		/* Space plays and pauses, and Left and Right step a frame - held,
@@ -2864,7 +3233,7 @@ private:
 						       Qt::WidgetWithChildrenShortcut);
 
 			connect(shortcut, &QShortcut::activated, button, [this, button]() {
-				if (!transport->isHidden() && button->isEnabled())
+				if (button->isVisibleTo(this) && button->isEnabled())
 					button->click();
 			});
 		}
@@ -2984,9 +3353,9 @@ private:
 	{
 		Media kind = mediaKind(parent);
 
-		if ((kind != NoMedia) == transport->isHidden()) {
-			transport->setVisible(kind != NoMedia);
-			fitParts();
+		if ((kind != NoMedia) != media) {
+			media = kind != NoMedia;
+			relayout();
 		}
 
 		if (kind == NoMedia)
@@ -3142,12 +3511,17 @@ private:
 
 		auto *zoomBox = new QVBoxLayout();
 
+		parts[WARP_ZOOM_PART_PAD] = pad;
+		parts[WARP_ZOOM_PART_ROCKER] = rocker;
+		parts[WARP_ZOOM_PART_ZOOMBAR] = zoomSlider;
+		parts[WARP_ZOOM_PART_STOPS] = warpZoomRow(stopRow, blockFrame);
+
 		zoomBox->setSpacing(4);
 		zoomBox->addWidget(rocker);
 		zoomBox->addStretch(1);
 		zoomBox->addWidget(zoomSlider);
 		zoomBox->addStretch(1);
-		zoomBox->addLayout(stopRow);
+		zoomBox->addWidget(parts[WARP_ZOOM_PART_STOPS]);
 
 		frameRow = new QBoxLayout(QBoxLayout::LeftToRight);
 		frameRow->setSpacing(8);
@@ -3241,7 +3615,10 @@ private:
 		tileScroll->viewport()->setAutoFillBackground(false);
 		tileHost->setAutoFillBackground(false);
 
-		box->addLayout(head);
+		parts[WARP_ZOOM_PART_PRESETTOOLS] = warpZoomRow(head, blockPresets);
+		parts[WARP_ZOOM_PART_TILES] = tileScroll;
+
+		box->addWidget(parts[WARP_ZOOM_PART_PRESETTOOLS]);
 		box->addWidget(tileScroll, 1);
 
 		connect(editButton, &QPushButton::toggled, this, [this](bool checked) {
@@ -3306,14 +3683,151 @@ private:
 		speedSlider->setMinimumWidth(WARP_ZOOM_SLIDER_MIN);
 		speedSlider->setAccessibleName(QString::fromUtf8(obs_module_text("Warp.Video.Speed")));
 
+		parts[WARP_ZOOM_PART_SPEEDBUTTONS] = warpZoomRow(speedRow, blockSpeed);
+		parts[WARP_ZOOM_PART_SPEEDBAR] = speedSlider;
+
 		box->addLayout(head);
-		box->addLayout(speedRow);
+		box->addWidget(parts[WARP_ZOOM_PART_SPEEDBUTTONS]);
 		box->addWidget(speedSlider);
 
 		connect(speedSlider, &QSlider::valueChanged, this, [this](int value) {
 			if (!loading)
 				setSpeed(value);
 		});
+	}
+
+	/* Which parts of the dock are there: a column of ticks for each of its
+	 * shapes, so a part can be kept in one and put away in the other, and
+	 * the way into arranging the sections. Every tick takes at once. */
+	void customize()
+	{
+		if (customizer) {
+			customizer->raise();
+			customizer->activateWindow();
+			return;
+		}
+
+		auto say = [](const char *key) {
+			return QString::fromUtf8(obs_module_text(key));
+		};
+		auto *dialog = new QDialog(this);
+		auto *form = new QGridLayout();
+		QVector<QCheckBox *> ticks;
+		int row = 1;
+
+		customizer = dialog;
+		dialog->setAttribute(Qt::WA_DeleteOnClose);
+		dialog->setWindowTitle(say("Warp.Zoom.Dock.Customize.Title"));
+		form->addWidget(new QLabel(say("Warp.Zoom.Dock.Shape.Column"), dialog), 0, 1, Qt::AlignHCenter);
+		form->addWidget(new QLabel(say("Warp.Zoom.Dock.Shape.Wide"), dialog), 0, 2, Qt::AlignHCenter);
+
+		for (int part = 0; part < WARP_ZOOM_PARTS; part++) {
+			int section = warpZoomParts[part].section;
+
+			if (!part || section != warpZoomParts[part - 1].section)
+				form->addWidget(warpZoomCaption(warpZoomSectionNames[section], dialog), row++, 0, 1, 3);
+
+			form->addWidget(new QLabel(say(warpZoomParts[part].name), dialog), row, 0);
+
+			for (int shape : {0, 1}) {
+				auto *tick = new QCheckBox(dialog);
+
+				tick->setChecked(!(hidden[shape] & (1 << part)));
+				form->addWidget(tick, row, shape + 1, Qt::AlignHCenter);
+				ticks.append(tick);
+
+				connect(tick, &QCheckBox::toggled, this, [this, shape, part](bool shown) {
+					hidden[shape] = shown ? hidden[shape] & ~(1 << part)
+							      : hidden[shape] | (1 << part);
+					warpZoomSaveSetting(warpZoomHiddenKeys[shape], hidden[shape]);
+					relayout();
+				});
+			}
+
+			row++;
+		}
+
+		auto *buttons =
+			new QDialogButtonBox(QDialogButtonBox::RestoreDefaults | QDialogButtonBox::Close, dialog);
+		QPushButton *arrangeButton =
+			buttons->addButton(say("Warp.Zoom.Dock.Arrange"), QDialogButtonBox::ActionRole);
+
+		connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::close);
+		connect(arrangeButton, &QPushButton::clicked, this, [this, dialog]() {
+			dialog->close();
+			arrange();
+		});
+		connect(buttons->button(QDialogButtonBox::RestoreDefaults), &QPushButton::clicked, this,
+			[this, ticks]() {
+				/* the ticks quietly, and the dock laid out once for all of them */
+				for (QCheckBox *tick : ticks) {
+					QSignalBlocker quiet(tick);
+					tick->setChecked(true);
+				}
+
+				for (int shape : {0, 1}) {
+					hidden[shape] = 0;
+					warpZoomSaveSetting(warpZoomHiddenKeys[shape], 0);
+					order[shape] = warpZoomOrderFrom(warpZoomDefaultOrder[shape], shape);
+					warpZoomSaveSetting(warpZoomOrderKeys[shape], warpZoomDefaultOrder[shape]);
+				}
+
+				relayout();
+			});
+
+		auto *intro = new QLabel(say("Warp.Zoom.Dock.Customize.Desc"), dialog);
+		auto *box = new QVBoxLayout(dialog);
+
+		intro->setWordWrap(true);
+		box->addWidget(intro);
+		box->addLayout(form);
+		box->addWidget(buttons);
+		dialog->show();
+	}
+
+	/* the sections moved about on the dock itself, in the shape it is in */
+	void arrange()
+	{
+		if (!arranger) {
+			arranger = new WarpZoomArranger({blockTop, blockFrame, blockPresets, blockSpeed}, this);
+			arranger->onDrop = [this](int from, int onto, int zone) {
+				moveSection(from, onto, zone);
+			};
+		}
+
+		arranger->setGeometry(rect());
+		arranger->setShape(wide);
+		arranger->show();
+		arranger->raise();
+	}
+
+	/* a section dropped beside another: into the other's column above or
+	 * below it, or into a column of its own either side of it */
+	void moveSection(int from, int onto, int zone)
+	{
+		WarpZoomOrder &columns = order[wide];
+
+		for (QVector<int> &column : columns)
+			column.removeOne(from);
+
+		columns.removeAll(QVector<int>());
+
+		for (int c = 0; c < columns.size(); c++) {
+			int at = columns[c].indexOf(onto);
+
+			if (at < 0)
+				continue;
+
+			if (zone == WarpZoomArranger::Left || zone == WarpZoomArranger::Right)
+				columns.insert(c + (zone == WarpZoomArranger::Right), QVector<int>{from});
+			else
+				columns[c].insert(at + (zone == WarpZoomArranger::Below), from);
+
+			break;
+		}
+
+		warpZoomSaveSetting(warpZoomOrderKeys[wide], warpZoomOrderCode(columns));
+		relayout();
 	}
 
 	obs_source_t *zoomSource() const { return warpZoomTargetSource(target); }
@@ -3841,6 +4355,12 @@ private:
 	bool minimal = false;
 	bool wide = false;
 	bool placed = false;
+	bool media = false;
+	QWidget *parts[WARP_ZOOM_PARTS] = {};
+	int hidden[2] = {};
+	WarpZoomOrder order[2];
+	WarpZoomArranger *arranger = nullptr;
+	QPointer<QDialog> customizer;
 	bool editing = false;
 	/* what the source the dock is pointed at has to say about confirm, for
 	 * the menu that is only built when it is asked for */
