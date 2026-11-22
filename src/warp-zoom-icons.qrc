@@ -24,5 +24,6 @@
     <file>icons/previous.svg</file>
     <file>icons/next.svg</file>
     <file>icons/frame-step.svg</file>
+    <file>icons/customize.svg</file>
   </qresource>
 </RCC>
