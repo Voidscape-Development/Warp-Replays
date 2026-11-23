@@ -3933,9 +3933,21 @@ private:
 		dialog->setMinimumWidth(380);
 		box->setSpacing(10);
 
+		/* the switches under a widget, asked for as buttons: a class with
+		 * no Q_OBJECT cannot be looked up by its own name */
+		auto switches = [](QWidget *in) {
+			QVector<WarpZoomSwitch *> found;
+
+			for (QAbstractButton *button : in->findChildren<QAbstractButton *>())
+				if (auto *one = dynamic_cast<WarpZoomSwitch *>(button))
+					found.append(one);
+
+			return found;
+		};
+
 		/* every switch says what is so, after any of them is flipped */
-		auto sync = [this, dialog]() {
-			for (WarpZoomSwitch *button : dialog->findChildren<WarpZoomSwitch *>())
+		auto sync = [this, dialog, switches]() {
+			for (WarpZoomSwitch *button : switches(dialog))
 				button->setChecked(!(hidden[button->shape] & button->mask));
 		};
 
@@ -3995,7 +4007,7 @@ private:
 				form->addWidget(new WarpZoomSwitch(shape, mask, title->text(), card), 0, shape + 1,
 						Qt::AlignHCenter);
 
-			for (WarpZoomSwitch *button : card->findChildren<WarpZoomSwitch *>()) {
+			for (WarpZoomSwitch *button : switches(card)) {
 				connect(button, &QAbstractButton::clicked, this, [this, button, sync](bool shown) {
 					int &bits = hidden[button->shape];
 
