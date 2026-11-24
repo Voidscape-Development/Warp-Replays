@@ -31,6 +31,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QApplication>
 #include <QAbstractButton>
 #include <QBoxLayout>
+#include <QCloseEvent>
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -46,6 +47,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QInputDialog>
 #include <QLabel>
 #include <QLayout>
+#include <QLine>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMainWindow>
@@ -53,6 +55,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPainterPath>
 #include <QPalette>
 #include <QPointer>
 #include <QPushButton>
@@ -62,6 +65,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QSlider>
+#include <QSplitter>
 #include <QSpinBox>
 #include <QStyle>
 #include <QStyleOptionButton>
@@ -4653,222 +4657,896 @@ private:
 /* ------------------------------------------------------------------------- */
 /* the presets window
  *
- * What the dock does by eye, this does by number: the framing of every preset
- * of a source, and how long the move to it takes, written out so a show can be
- * set up before there is anything to look at. */
+ * Every preset of every source, set up by eye or by number: the sources down
+ * one side, their presets beside them in recall order, and the one picked drawn
+ * as a box on the source's own picture. Nothing goes anywhere until Apply, so a
+ * framing can be worked out without anything on air moving. */
+
+QString warpZoomPresetsText(const char *key)
+{
+	return QString::fromUtf8(obs_module_text(key));
+}
+
+/* The source's picture with a preset's framing drawn on it as a box: the box is
+ * dragged to pan, and a corner dragged or the wheel turned to zoom. */
+class WarpZoomPresetFrame : public QWidget {
+public:
+	std::function<void(const warp_zoom_view &)> changed;
+
+	explicit WarpZoomPresetFrame(QWidget *parent) : QWidget(parent)
+	{
+		setMinimumSize(320, 180);
+		setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+		setMouseTracking(true);
+	}
+
+	void setImage(const QImage &image)
+	{
+		picture = image;
+		update();
+	}
+
+	void setView(const warp_zoom_view &value, bool can_edit)
+	{
+		view = value;
+		editable = can_edit;
+		update();
+	}
+
+protected:
+	/* where the picture goes: the widget, letterboxed to the picture's shape */
+	QRectF area() const
+	{
+		QSizeF shape = picture.isNull() ? QSizeF(16, 9) : QSizeF(picture.size());
+
+		shape.scale(size(), Qt::KeepAspectRatio);
+		return QRectF(QPointF((width() - shape.width()) / 2, (height() - shape.height()) / 2), shape);
+	}
+
+	QRectF box() const
+	{
+		QRectF a = area();
+		double span = 1.0 / view.zoom;
+
+		return QRectF(a.left() + (view.x - span / 2) * a.width(), a.top() + (view.y - span / 2) * a.height(),
+			      span * a.width(), span * a.height());
+	}
+
+	bool onCorner(const QPointF &pos) const
+	{
+		QRectF b = box();
+
+		for (const QPointF &corner : {b.topLeft(), b.topRight(), b.bottomLeft(), b.bottomRight()}) {
+			if (QLineF(pos, corner).length() <= 9)
+				return true;
+		}
+
+		return false;
+	}
+
+	void paintEvent(QPaintEvent *) override
+	{
+		QPainter p(this);
+		QRectF a = area();
+		QRectF b = box();
+		QPointF c = b.center();
+		QPainterPath outside;
+
+		p.setRenderHint(QPainter::Antialiasing);
+
+		if (picture.isNull())
+			p.fillRect(a, QColor(32, 36, 45));
+		else
+			p.drawImage(a, picture);
+
+		p.setPen(QColor(255, 255, 255, 36));
+		for (int i = 1; i < 3; i++) {
+			p.drawLine(QPointF(a.left() + a.width() * i / 3, a.top()),
+				   QPointF(a.left() + a.width() * i / 3, a.bottom()));
+			p.drawLine(QPointF(a.left(), a.top() + a.height() * i / 3),
+				   QPointF(a.right(), a.top() + a.height() * i / 3));
+		}
+
+		/* what the preset leaves out is dimmed rather than hidden, so
+		 * the box can be judged against the whole picture */
+		outside.addRect(a);
+		outside.addRect(b);
+		p.fillPath(outside, QColor(8, 9, 12, 160));
+
+		p.setBrush(Qt::NoBrush);
+		p.setPen(QPen(palette().color(QPalette::Highlight), 2));
+		p.drawRect(b);
+
+		p.setPen(QPen(Qt::white, 1.5));
+		p.drawLine(c - QPointF(7, 0), c + QPointF(7, 0));
+		p.drawLine(c - QPointF(0, 7), c + QPointF(0, 7));
+
+		if (editable) {
+			p.setPen(Qt::NoPen);
+			p.setBrush(Qt::white);
+			for (const QPointF &corner : {b.topLeft(), b.topRight(), b.bottomLeft(), b.bottomRight()})
+				p.drawRect(QRectF(corner - QPointF(4, 4), QSizeF(8, 8)));
+		}
+
+		p.setPen(Qt::white);
+		p.drawText(b.adjusted(8, 0, 0, -6), Qt::AlignLeft | Qt::AlignBottom,
+			   QString("%1%").arg(qRound(view.zoom * 100.0f)));
+	}
+
+	void mousePressEvent(QMouseEvent *event) override
+	{
+		if (!editable || event->button() != Qt::LeftButton)
+			return;
+
+		QPointF pos = event->position();
+
+		resizing = onCorner(pos);
+
+		/* a press outside the box puts the box there, then carries on as
+		 * a drag from its middle */
+		if (!resizing && !box().contains(pos)) {
+			QRectF a = area();
+
+			view.x = (float)((pos.x() - a.left()) / a.width());
+			view.y = (float)((pos.y() - a.top()) / a.height());
+			emitView();
+		}
+
+		grabOffset = pos - box().center();
+		dragging = true;
+	}
+
+	void mouseMoveEvent(QMouseEvent *event) override
+	{
+		QPointF pos = event->position();
+		QRectF a = area();
+
+		if (!dragging) {
+			setCursor(!editable             ? Qt::ArrowCursor
+				  : onCorner(pos)       ? Qt::SizeFDiagCursor
+				  : box().contains(pos) ? Qt::SizeAllCursor
+							: Qt::CrossCursor);
+			return;
+		}
+
+		if (resizing) {
+			/* zooms about the centre: the corner stays under the cursor */
+			QPointF c = box().center();
+			double half =
+				std::max(std::abs(pos.x() - c.x()) / a.width(), std::abs(pos.y() - c.y()) / a.height());
+
+			view.zoom = (float)(0.5 / std::max(half, 0.001));
+		} else {
+			QPointF centre = pos - grabOffset;
+
+			view.x = (float)((centre.x() - a.left()) / a.width());
+			view.y = (float)((centre.y() - a.top()) / a.height());
+		}
+
+		emitView();
+	}
+
+	void mouseReleaseEvent(QMouseEvent *) override { dragging = false; }
+
+	void wheelEvent(QWheelEvent *event) override
+	{
+		if (!editable)
+			return;
+
+		view.zoom *= (float)std::pow(1.1, event->angleDelta().y() / 120.0);
+		emitView();
+	}
+
+private:
+	void emitView()
+	{
+		warp_zoom_clamp(&view);
+		update();
+
+		if (changed)
+			changed(view);
+	}
+
+	QImage picture;
+	warp_zoom_view view = warp_zoom_default_view();
+	QPointF grabOffset;
+	bool editable = false;
+	bool dragging = false;
+	bool resizing = false;
+};
 
 class WarpZoomPresetsDialog : public QDialog {
 public:
 	explicit WarpZoomPresetsDialog(QWidget *parent) : QDialog(parent)
 	{
-		setWindowTitle(QString::fromUtf8(obs_module_text("Warp.Zoom.Presets.Title")));
-		setMinimumSize(520, 420);
+		setWindowTitle(warpZoomPresetsText("Warp.Zoom.Presets.Title"));
+		setMinimumSize(860, 520);
+		resize(1060, 660);
+
+		auto heading = [this](const char *key) {
+			auto *label = new QLabel(warpZoomPresetsText(key), this);
+			QFont font = label->font();
+
+			font.setBold(true);
+			label->setFont(font);
+			return label;
+		};
+		auto note = [this](const QString &text) {
+			auto *label = new QLabel(text, this);
+
+			label->setWordWrap(true);
+			label->setEnabled(false);
+			return label;
+		};
+
+		/* the sources */
+		find = new QLineEdit(this);
+		find->setPlaceholderText(warpZoomPresetsText("Warp.Zoom.Presets.Find"));
+		find->setClearButtonEnabled(true);
+		sources = new QListWidget(this);
+
+		auto *sourcesPane = new QWidget(this);
+		auto *sourcesLayout = new QVBoxLayout(sourcesPane);
+
+		sourcesLayout->addWidget(heading("Warp.Zoom.Presets.Sources"));
+		sourcesLayout->addWidget(find);
+		sourcesLayout->addWidget(sources, 1);
+		sourcesLayout->addWidget(note(warpZoomPresetsText("Warp.Zoom.Presets.Sources.Desc")));
+
+		/* the presets, in recall order */
+		count = new QLabel(this);
+		count->setEnabled(false);
+		newButton = new QPushButton(warpZoomPresetsText("Warp.Zoom.Presets.New"), this);
+		newButton->setToolTip(warpZoomPresetsText("Warp.Zoom.Presets.New.Desc"));
+		presets = new QListWidget(this);
+		presets->setIconSize(QSize(64, 36));
+		presets->setDragDropMode(QAbstractItemView::InternalMove);
+		presets->setDefaultDropAction(Qt::MoveAction);
+
+		auto *presetsPane = new QWidget(this);
+		auto *presetsLayout = new QVBoxLayout(presetsPane);
+		auto *presetsHead = new QHBoxLayout();
+
+		presetsHead->addWidget(heading("Warp.Zoom.Presets.Presets"));
+		presetsHead->addWidget(count);
+		presetsHead->addStretch(1);
+		presetsHead->addWidget(newButton);
+		presetsLayout->addLayout(presetsHead);
+		presetsLayout->addWidget(presets, 1);
+		presetsLayout->addWidget(note(warpZoomPresetsText("Warp.Zoom.Presets.Order")));
+
+		/* the preset picked */
+		name = new QLineEdit(this);
+		duplicateButton = new QPushButton(warpZoomPresetsText("Warp.Zoom.Presets.Duplicate"), this);
+		removeButton = new QPushButton(warpZoomPresetsText("Warp.Zoom.Dock.Remove"), this);
+		frame = new WarpZoomPresetFrame(this);
+		hint = note(QString());
+
+		zoomSlider = new QSlider(Qt::Horizontal, this);
+		zoomSlider->setRange((int)(WARP_ZOOM_MIN * 100), (int)(WARP_ZOOM_MAX * 100));
+		zoom = new QSpinBox(this);
+		zoom->setRange((int)(WARP_ZOOM_MIN * 100), (int)(WARP_ZOOM_MAX * 100));
+		zoom->setSuffix("%");
+		x = centreSpin();
+		y = centreSpin();
+		centreButton = new QPushButton(warpZoomPresetsText("Warp.Zoom.Presets.Centre.Reset"), this);
+		glideSource = new QPushButton(warpZoomPresetsText("Warp.Zoom.Presets.Glide.Source"), this);
+		glideOwn = new QPushButton(warpZoomPresetsText("Warp.Zoom.Presets.Glide.Own"), this);
+		glideSource->setCheckable(true);
+		glideOwn->setCheckable(true);
+		glideSource->setAutoExclusive(true);
+		glideOwn->setAutoExclusive(true);
+		glide = new QSpinBox(this);
+		glide->setRange(50, WARP_ZOOM_GLIDE_MAX);
+		glide->setSingleStep(50);
+		glide->setSuffix(" ms");
+		slot = new QLabel(this);
+
+		auto *nameRow = new QHBoxLayout();
+		auto *zoomRow = new QHBoxLayout();
+		auto *centreRow = new QHBoxLayout();
+		auto *glideRow = new QHBoxLayout();
+		auto *form = new QFormLayout();
+
+		nameRow->addWidget(name, 1);
+		nameRow->addWidget(duplicateButton);
+		nameRow->addWidget(removeButton);
+		zoomRow->addWidget(zoomSlider, 1);
+		zoomRow->addWidget(zoom);
+		centreRow->addWidget(new QLabel("X", this));
+		centreRow->addWidget(x);
+		centreRow->addWidget(new QLabel("Y", this));
+		centreRow->addWidget(y);
+		centreRow->addWidget(centreButton);
+		centreRow->addStretch(1);
+		glideRow->setSpacing(0);
+		glideRow->addWidget(glideSource);
+		glideRow->addWidget(glideOwn);
+		glideRow->addSpacing(8);
+		glideRow->addWidget(glide);
+		glideRow->addStretch(1);
+
+		form->addRow(warpZoomPresetsText("Warp.Zoom.Zoom"), zoomRow);
+		form->addRow(warpZoomPresetsText("Warp.Zoom.Presets.Centre"), centreRow);
+		form->addRow(warpZoomPresetsText("Warp.Zoom.Preset.Glide"), glideRow);
+		form->addRow(warpZoomPresetsText("Warp.Zoom.Presets.Hotkeys"), slot);
+
+		auto *editorPane = new QWidget(this);
+		auto *editorLayout = new QVBoxLayout(editorPane);
+
+		editorLayout->addWidget(heading("Warp.Zoom.Presets.Name"));
+		editorLayout->addLayout(nameRow);
+		editorLayout->addWidget(frame, 1);
+		editorLayout->addWidget(hint);
+		editorLayout->addLayout(form);
+
+		auto *splitter = new QSplitter(this);
+
+		splitter->addWidget(sourcesPane);
+		splitter->addWidget(presetsPane);
+		splitter->addWidget(editorPane);
+		splitter->setStretchFactor(2, 1);
+		splitter->setSizes({220, 300, 540});
+		splitter->setChildrenCollapsible(false);
+
+		/* the footer */
+		status = new QLabel(this);
+		revertButton = new QPushButton(warpZoomPresetsText("Warp.Zoom.Presets.Revert"), this);
+		applyButton = new QPushButton(warpZoomPresetsText("Warp.Zoom.Presets.Apply"), this);
+		applyButton->setDefault(true);
+		auto *closeButton = new QPushButton(warpZoomPresetsText("Warp.Zoom.Presets.Close"), this);
+		auto *footer = new QHBoxLayout();
+
+		footer->addWidget(status, 1);
+		footer->addWidget(revertButton);
+		footer->addWidget(applyButton);
+		footer->addSpacing(12);
+		footer->addWidget(closeButton);
 
 		auto *layout = new QVBoxLayout(this);
 
-		sources = new QComboBox(this);
-		chosen = warpZoomTargets();
+		layout->addWidget(splitter, 1);
+		layout->addLayout(footer);
 
-		for (const WarpZoomTarget &entry : chosen)
-			sources->addItem(entry.label);
+		/* wiring */
+		connect(find, &QLineEdit::textChanged, this, [this]() { filterSources(); });
+		connect(sources, &QListWidget::currentRowChanged, this, [this](int) {
+			if (!confirmLeave()) {
+				selectSource(shownTarget);
+				return;
+			}
+			shownTarget = currentTarget();
+			selectedId.clear();
+			picture = QImage();
+			grabber.release();
+			refreshPresets();
+		});
+		connect(presets, &QListWidget::currentRowChanged, this, [this](int row) {
+			if (row < 0 || row >= rows.size())
+				return;
+			if (!confirmLeave()) {
+				selectPreset(selectedId);
+				return;
+			}
+			selectedId = rows[row].id;
+			showSelected();
+		});
+		connect(presets->model(), &QAbstractItemModel::rowsMoved, this,
+			[this](const QModelIndex &, int start, int, const QModelIndex &, int row) {
+				OBSSourceAutoRelease source = currentSource();
+				int to = row > start ? row - 1 : row;
 
-		presets = new QListWidget(this);
+				if (source && start < rows.size())
+					warp_zoom_source_move_preset(source, WARP_UTF8(rows[start].id), to - start);
 
-		zoom = new QDoubleSpinBox(this);
-		zoom->setRange(WARP_ZOOM_MIN * 100.0, WARP_ZOOM_MAX * 100.0);
-		zoom->setSuffix(QString::fromUtf8("%"));
+				/* the list is put back the way the source has it once
+				 * the drop has finished with it */
+				QTimer::singleShot(0, this, [this]() { refreshPresets(); });
+			});
 
-		x = new QDoubleSpinBox(this);
-		x->setRange(0.0, 100.0);
-		x->setSuffix(QString::fromUtf8("%"));
+		connect(name, &QLineEdit::textEdited, this, [this](const QString &text) {
+			draft.name = text;
+			changedDraft();
+		});
+		frame->changed = [this](const warp_zoom_view &view) {
+			draft.view = view;
+			changedDraft();
+		};
+		connect(zoomSlider, &QSlider::valueChanged, this, [this](int value) { setZoom(value); });
+		connect(zoom, &QSpinBox::valueChanged, this, [this](int value) { setZoom(value); });
+		connect(x, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+			draft.view.x = (float)(value / 100.0);
+			changedDraft();
+		});
+		connect(y, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+			draft.view.y = (float)(value / 100.0);
+			changedDraft();
+		});
+		connect(centreButton, &QPushButton::clicked, this, [this]() {
+			draft.view.x = draft.view.y = 0.5f;
+			changedDraft();
+		});
+		connect(glideSource, &QPushButton::clicked, this, [this]() {
+			draft.glide = 0;
+			changedDraft();
+		});
+		connect(glideOwn, &QPushButton::clicked, this, [this]() {
+			draft.glide = glide->value();
+			changedDraft();
+		});
+		connect(glide, &QSpinBox::valueChanged, this, [this](int value) {
+			draft.glide = value;
+			changedDraft();
+		});
 
-		y = new QDoubleSpinBox(this);
-		y->setRange(0.0, 100.0);
-		y->setSuffix(QString::fromUtf8("%"));
-
-		glide = new QSpinBox(this);
-		glide->setRange(0, WARP_ZOOM_GLIDE_MAX);
-		glide->setSuffix(QString::fromUtf8(" ms"));
-		glide->setSpecialValueText(QString::fromUtf8(obs_module_text("Warp.Zoom.Preset.Glide.Default")));
-
-		auto *form = new QFormLayout();
-
-		form->addRow(QString::fromUtf8(obs_module_text("Warp.Zoom.Zoom")), zoom);
-		form->addRow(QString::fromUtf8(obs_module_text("Warp.Zoom.CentreX")), x);
-		form->addRow(QString::fromUtf8(obs_module_text("Warp.Zoom.CentreY")), y);
-		form->addRow(QString::fromUtf8(obs_module_text("Warp.Zoom.Preset.Glide")), glide);
-
-		auto *applyButton =
-			new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Presets.Apply")), this);
-		auto *renameButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Rename")), this);
-		auto *removeButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Remove")), this);
-		auto *upButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Presets.Up")), this);
-		auto *downButton = new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Presets.Down")), this);
-		auto *closeButton =
-			new QPushButton(QString::fromUtf8(obs_module_text("Warp.Zoom.Presets.Close")), this);
-
-		auto *buttons = new QHBoxLayout();
-
-		buttons->addWidget(applyButton);
-		buttons->addWidget(renameButton);
-		buttons->addWidget(removeButton);
-		buttons->addWidget(upButton);
-		buttons->addWidget(downButton);
-		buttons->addStretch(1);
-		buttons->addWidget(closeButton);
-
-		auto *intro = new QLabel(QString::fromUtf8(obs_module_text("Warp.Zoom.Presets.Intro")), this);
-
-		intro->setWordWrap(true);
-
-		layout->addWidget(intro);
-		layout->addWidget(sources);
-		layout->addWidget(presets, 1);
-		layout->addLayout(form);
-		layout->addLayout(buttons);
-
-		connect(sources, &QComboBox::currentIndexChanged, this, [this](int) { refresh(); });
-		connect(presets, &QListWidget::itemSelectionChanged, this, [this]() { showSelected(); });
+		connect(newButton, &QPushButton::clicked, this, [this]() {
+			addPreset(
+				QString("%1 %2").arg(warpZoomPresetsText("Warp.Zoom.Preset.Unnamed")).arg(rows.size()),
+				false);
+		});
+		connect(duplicateButton, &QPushButton::clicked, this, [this]() {
+			addPreset(QString(warpZoomPresetsText("Warp.Zoom.Presets.Copy")).arg(draft.name), true);
+		});
+		connect(removeButton, &QPushButton::clicked, this, [this]() { removePreset(); });
+		connect(revertButton, &QPushButton::clicked, this, [this]() { showSelected(); });
+		connect(applyButton, &QPushButton::clicked, this, [this]() { apply(); });
 		connect(closeButton, &QPushButton::clicked, this, &QDialog::close);
 
-		connect(applyButton, &QPushButton::clicked, this, [this]() {
-			OBSSourceAutoRelease source = currentSource();
-			QString id = selectedId();
-			warp_zoom_view view;
-
-			if (!source || id.isEmpty())
-				return;
-
-			view.zoom = (float)(zoom->value() / 100.0);
-			view.x = (float)(x->value() / 100.0);
-			view.y = (float)(y->value() / 100.0);
-
-			warp_zoom_source_update_preset(source, WARP_UTF8(id), nullptr, &view, glide->value());
-			refresh();
+		/* The picture is grabbed often enough to follow a clip that is
+		 * playing; the lists are looked over now and then for sources and
+		 * presets changed from the dock, a hotkey or the websocket. */
+		timer = new QTimer(this);
+		connect(timer, &QTimer::timeout, this, [this]() {
+			grabPicture();
+			if (++ticks % 10 == 0)
+				refreshLists();
 		});
+		timer->start(100);
 
-		connect(renameButton, &QPushButton::clicked, this, [this]() {
-			OBSSourceAutoRelease source = currentSource();
-			QString id = selectedId();
-			bool ok = false;
-
-			if (!source || id.isEmpty())
-				return;
-
-			QString name = QInputDialog::getText(
-				this, QString::fromUtf8(obs_module_text("Warp.Zoom.Dock.Rename")),
-				QString::fromUtf8(obs_module_text("Warp.Zoom.Preset.Save.Prompt")), QLineEdit::Normal,
-				selectedName(), &ok);
-
-			if (ok && !name.trimmed().isEmpty())
-				warp_zoom_source_update_preset(source, WARP_UTF8(id), WARP_UTF8(name.trimmed()),
-							       nullptr, -1);
-
-			refresh();
-		});
-
-		connect(removeButton, &QPushButton::clicked, this, [this]() {
-			OBSSourceAutoRelease source = currentSource();
-			QString id = selectedId();
-
-			if (source && !id.isEmpty())
-				warp_zoom_source_remove_preset(source, WARP_UTF8(id));
-
-			refresh();
-		});
-
-		connect(upButton, &QPushButton::clicked, this, [this]() { move(-1); });
-		connect(downButton, &QPushButton::clicked, this, [this]() { move(1); });
-
-		refresh();
+		refreshSources();
+		refreshPresets();
 	}
+
+	~WarpZoomPresetsDialog() override { grabber.release(); }
+
+protected:
+	void closeEvent(QCloseEvent *event) override
+	{
+		if (confirmLeave())
+			event->accept();
+		else
+			event->ignore();
+	}
+
+	void reject() override { close(); }
 
 private:
+	QDoubleSpinBox *centreSpin()
+	{
+		auto *spin = new QDoubleSpinBox(this);
+
+		spin->setRange(0.0, 100.0);
+		spin->setDecimals(1);
+		spin->setSuffix("%");
+		return spin;
+	}
+
+	WarpZoomTarget currentTarget() const
+	{
+		QListWidgetItem *item = sources->currentItem();
+		int index = item ? item->data(Qt::UserRole).toInt() : -1;
+
+		return index >= 0 && index < chosen.size() ? chosen[index] : WarpZoomTarget();
+	}
+
+	/* the source being edited, which is the one picked in the list once any
+	 * changes to the one before have been dealt with */
 	obs_source_t *currentSource() const
 	{
-		int index = sources->currentIndex();
-
-		if (index < 0 || index >= chosen.size())
-			return nullptr;
-
-		return warpZoomTargetSource(chosen[index]);
+		return shownTarget.isEmpty() ? nullptr : warpZoomTargetSource(shownTarget);
 	}
 
-	QString selectedId() const
+	int selectedRow() const
 	{
-		QListWidgetItem *item = presets->currentItem();
+		for (int i = 0; i < rows.size(); i++) {
+			if (rows[i].id == selectedId)
+				return i;
+		}
 
-		return item ? item->data(Qt::UserRole).toString() : QString();
+		return -1;
 	}
 
-	QString selectedName() const
+	void selectSource(const WarpZoomTarget &target)
 	{
-		QListWidgetItem *item = presets->currentItem();
+		QSignalBlocker block(sources);
 
-		return item ? item->data(Qt::UserRole + 1).toString() : QString();
+		for (int i = 0; i < sources->count(); i++) {
+			if (chosen[sources->item(i)->data(Qt::UserRole).toInt()] == target) {
+				sources->setCurrentRow(i);
+				return;
+			}
+		}
 	}
 
-	void move(int delta)
+	void selectPreset(const QString &id)
+	{
+		QSignalBlocker block(presets);
+
+		for (int i = 0; i < rows.size(); i++) {
+			if (rows[i].id == id)
+				presets->setCurrentRow(i);
+		}
+	}
+
+	/* the line under a source's name: what it is, how many presets it has,
+	 * and whether it is on program */
+	QString sourceLine(const WarpZoomTarget &target)
+	{
+		OBSSourceAutoRelease parent = warpZoomParent(target);
+		OBSSourceAutoRelease source = warpZoomTargetSource(target);
+		QString line = target.filterName.isEmpty()
+				       ? QString::fromUtf8(obs_source_get_display_name(obs_source_get_id(parent)))
+				       : warpZoomPresetsText("Warp.Zoom.Presets.Kind.Filter");
+
+		line += QString("  ·  ") + warpZoomPresetsText("Warp.Zoom.Presets.PresetCount")
+						   .arg(std::max(0, (int)warpZoomReadPresets(source).size() - 1));
+
+		if (parent && obs_source_active(parent))
+			line += QString("  ·  ") + warpZoomPresetsText("Warp.Zoom.Presets.Program");
+
+		return line;
+	}
+
+	void refreshSources()
+	{
+		QVector<WarpZoomTarget> found = warpZoomTargets();
+		WarpZoomTarget keep = currentTarget();
+
+		if (!warpZoomSameList(chosen, found)) {
+			QSignalBlocker block(sources);
+
+			chosen = found;
+			sources->clear();
+
+			for (int i = 0; i < chosen.size(); i++) {
+				auto *item = new QListWidgetItem(sources);
+
+				item->setData(Qt::UserRole, i);
+			}
+
+			if (!chosen.isEmpty())
+				sources->setCurrentRow(0);
+			selectSource(keep);
+
+			/* the source being edited has gone */
+			if (currentTarget() != shownTarget) {
+				shownTarget = currentTarget();
+				selectedId.clear();
+				picture = QImage();
+				dirty = false;
+				refreshPresets();
+			}
+		}
+
+		for (int i = 0; i < sources->count(); i++) {
+			const WarpZoomTarget &target = chosen[i];
+
+			sources->item(i)->setText(target.label + "\n" + sourceLine(target));
+		}
+
+		filterSources();
+	}
+
+	void filterSources()
+	{
+		for (int i = 0; i < sources->count(); i++)
+			sources->item(i)->setHidden(!chosen[i].label.contains(find->text(), Qt::CaseInsensitive));
+	}
+
+	/* A preset's framing on the source's picture, small, for the list. */
+	QIcon thumbnail(const warp_zoom_view &view) const
+	{
+		QPixmap pixmap(128, 72);
+		QPainter p(&pixmap);
+		QRectF a(0, 0, 128, 72);
+		double span = 1.0 / view.zoom;
+		QRectF b((view.x - span / 2) * 128, (view.y - span / 2) * 72, span * 128, span * 72);
+		QPainterPath outside;
+
+		if (picture.isNull())
+			p.fillRect(a, QColor(58, 63, 76));
+		else
+			p.drawImage(a, picture);
+
+		outside.addRect(a);
+		outside.addRect(b);
+		p.fillPath(outside, QColor(8, 9, 12, 140));
+		p.setPen(QPen(palette().color(QPalette::Highlight), 3));
+		p.drawRect(b.adjusted(1, 1, -1, -1));
+
+		return QIcon(pixmap);
+	}
+
+	QString presetText(const WarpZoomPresetRow &row, int index) const
+	{
+		QString line = row.name;
+
+		if (!row.fixed && index >= 1 && index <= WARP_ZOOM_SLOTS)
+			line = QString("%1.  %2").arg(index).arg(row.name);
+
+		return line + "\n" +
+		       QString("%1%  ·  %2")
+			       .arg(qRound(row.view.zoom * 100.0f))
+			       .arg(row.glide ? QString("%1 ms").arg(row.glide)
+					      : warpZoomPresetsText("Warp.Zoom.Presets.Glide.Source"));
+	}
+
+	void refreshPresets()
 	{
 		OBSSourceAutoRelease source = currentSource();
-		QString id = selectedId();
-
-		if (source && !id.isEmpty())
-			warp_zoom_source_move_preset(source, WARP_UTF8(id), delta);
-
-		refresh();
-	}
-
-	void refresh()
-	{
-		OBSSourceAutoRelease source = currentSource();
-		QString selected = selectedId();
+		QSignalBlocker block(presets);
 
 		rows = warpZoomReadPresets(source);
 		presets->clear();
 
 		for (int i = 0; i < rows.size(); i++) {
-			auto *item = new QListWidgetItem(warpZoomPresetLabel(rows[i], i), presets);
+			auto *item = new QListWidgetItem(thumbnail(rows[i].view), presetText(rows[i], i), presets);
 
-			item->setData(Qt::UserRole, rows[i].id);
-			item->setData(Qt::UserRole + 1, rows[i].name);
-			item->setData(Qt::UserRole + 2, rows[i].fixed);
-
-			if (rows[i].id == selected)
-				presets->setCurrentItem(item);
+			/* the reset framing stays at the top: it is not dragged, and
+			 * nothing is dropped onto it */
+			if (rows[i].fixed)
+				item->setFlags(item->flags() & ~(Qt::ItemIsDragEnabled | Qt::ItemIsDropEnabled));
+			else
+				item->setFlags(item->flags() & ~Qt::ItemIsDropEnabled);
 		}
 
+		if (selectedRow() < 0)
+			selectedId = rows.size() > 1 ? rows[1].id : rows.isEmpty() ? QString() : rows[0].id;
+
+		selectPreset(selectedId);
+		count->setText(warpZoomPresetsText("Warp.Zoom.Presets.Count")
+				       .arg(std::max(0, (int)rows.size() - 1))
+				       .arg(WARP_ZOOM_MAX_PRESETS));
+		newButton->setEnabled(source && rows.size() - 1 < WARP_ZOOM_MAX_PRESETS);
 		showSelected();
+	}
+
+	/* Picks up changes made from outside the window, leaving alone anything
+	 * the operator is in the middle of. */
+	void refreshLists()
+	{
+		refreshSources();
+
+		/* nor under a drag, of a row or of the box */
+		if (dirty || QApplication::mouseButtons() != Qt::NoButton)
+			return;
+
+		OBSSourceAutoRelease source = currentSource();
+		QVector<WarpZoomPresetRow> found = warpZoomReadPresets(source);
+		bool same = found.size() == rows.size();
+
+		for (int i = 0; same && i < rows.size(); i++) {
+			same = found[i].id == rows[i].id && found[i].name == rows[i].name &&
+			       found[i].glide == rows[i].glide && found[i].view.zoom == rows[i].view.zoom &&
+			       found[i].view.x == rows[i].view.x && found[i].view.y == rows[i].view.y;
+		}
+
+		if (same) {
+			/* the thumbnails follow the picture */
+			for (int i = 0; i < rows.size(); i++)
+				presets->item(i)->setIcon(thumbnail(rows[i].view));
+		} else {
+			refreshPresets();
+		}
+	}
+
+	void grabPicture()
+	{
+		const WarpZoomTarget &target = shownTarget;
+		OBSSourceAutoRelease parent = warpZoomParent(target);
+		OBSSourceAutoRelease source = warpZoomTargetSource(target);
+
+		if (!parent)
+			return;
+
+		/* the whole picture, from under the zoom, whatever is on air */
+		warp_zoom_view whole = warp_zoom_default_view();
+		WarpZoomFrame grabbed =
+			grabber.grab(parent, &whole, target.filterName.isEmpty() ? nullptr : source.Get());
+		bool first = picture.isNull();
+
+		if (grabbed.image.isNull())
+			return;
+
+		picture = grabbed.image;
+		frame->setImage(picture);
+
+		if (first)
+			refreshLists();
 	}
 
 	void showSelected()
 	{
-		QListWidgetItem *item = presets->currentItem();
-		bool editable = item && !item->data(Qt::UserRole + 2).toBool();
-		int index = item ? presets->row(item) : -1;
+		int row = selectedRow();
 
-		if (index >= 0 && index < rows.size()) {
-			zoom->setValue(rows[index].view.zoom * 100.0);
-			x->setValue(rows[index].view.x * 100.0);
-			y->setValue(rows[index].view.y * 100.0);
-			glide->setValue(rows[index].glide);
-		}
-
-		zoom->setEnabled(editable);
-		x->setEnabled(editable);
-		y->setEnabled(editable);
-		glide->setEnabled(editable);
+		draft = row >= 0 ? rows[row]
+				 : WarpZoomPresetRow{QString(), QString(), warp_zoom_default_view(), 0, true};
+		warp_zoom_clamp(&draft.view);
+		dirty = false;
+		showDraft();
 	}
 
-	QComboBox *sources = nullptr;
+	void showDraft()
+	{
+		int row = selectedRow();
+		bool editable = row >= 0 && !draft.fixed;
+		QSignalBlocker blocks[] = {QSignalBlocker(name), QSignalBlocker(zoomSlider), QSignalBlocker(zoom),
+					   QSignalBlocker(x),    QSignalBlocker(y),          QSignalBlocker(glide)};
+
+		if (name->text() != draft.name)
+			name->setText(draft.name);
+		zoomSlider->setValue(qRound(draft.view.zoom * 100.0f));
+		zoom->setValue(qRound(draft.view.zoom * 100.0f));
+		x->setValue(draft.view.x * 100.0);
+		y->setValue(draft.view.y * 100.0);
+		glideSource->setChecked(!draft.glide);
+		glideOwn->setChecked(draft.glide != 0);
+		if (draft.glide)
+			glide->setValue(draft.glide);
+		frame->setView(draft.view, editable);
+
+		for (QWidget *widget : std::initializer_list<QWidget *>{name, removeButton, zoomSlider, zoom, x, y,
+									centreButton, glideSource, glideOwn})
+			widget->setEnabled(editable);
+		glide->setEnabled(editable && draft.glide);
+		duplicateButton->setEnabled(row >= 0 && newButton->isEnabled());
+
+		hint->setText(shownTarget.isEmpty() ? warpZoomPresetsText("Warp.Zoom.Dock.NoTarget")
+			      : draft.fixed         ? warpZoomPresetsText("Warp.Zoom.Presets.Fixed")
+						    : warpZoomPresetsText("Warp.Zoom.Presets.Hint"));
+		slot->setText(row >= 1 && row <= WARP_ZOOM_SLOTS
+				      ? warpZoomPresetsText("Warp.Zoom.Dock.Preset.Slot").arg(row) + "\n" +
+						warpZoomPresetsText("Warp.Zoom.Presets.OwnHotkey")
+				      : warpZoomPresetsText("Warp.Zoom.Presets.NoSlot"));
+
+		status->setText(dirty ? warpZoomPresetsText("Warp.Zoom.Presets.Unapplied").arg(draft.name)
+				      : warpZoomPresetsText("Warp.Zoom.Presets.Applied"));
+		revertButton->setEnabled(dirty);
+		applyButton->setEnabled(dirty);
+	}
+
+	void changedDraft()
+	{
+		warp_zoom_clamp(&draft.view);
+		dirty = true;
+		showDraft();
+	}
+
+	void setZoom(int percent)
+	{
+		draft.view.zoom = (float)(percent / 100.0);
+		changedDraft();
+	}
+
+	void apply()
+	{
+		OBSSourceAutoRelease source = currentSource();
+		int row = selectedRow();
+
+		if (!source || row < 0 || !dirty)
+			return;
+
+		QString trimmed = draft.name.trimmed();
+		bool renamed = !trimmed.isEmpty() && trimmed != rows[row].name;
+
+		warp_zoom_source_update_preset(source, WARP_UTF8(draft.id), renamed ? WARP_UTF8(trimmed) : nullptr,
+					       &draft.view, draft.glide);
+		dirty = false;
+		refreshPresets();
+	}
+
+	/* Unapplied changes are applied or let go of before anything else is
+	 * looked at; false when the operator would rather stay. */
+	bool confirmLeave()
+	{
+		if (!dirty)
+			return true;
+
+		auto answer = QMessageBox::question(this, windowTitle(),
+						    warpZoomPresetsText("Warp.Zoom.Presets.Leave").arg(draft.name),
+						    QMessageBox::Apply | QMessageBox::Discard | QMessageBox::Cancel,
+						    QMessageBox::Apply);
+
+		if (answer == QMessageBox::Cancel)
+			return false;
+		if (answer == QMessageBox::Apply)
+			apply();
+
+		dirty = false;
+		return true;
+	}
+
+	/* A new preset framed like the one picked - with its glide too, for a
+	 * copy - put straight after it when it is a copy. */
+	void addPreset(const QString &title, bool copy)
+	{
+		OBSSourceAutoRelease source = currentSource();
+		WarpZoomPresetRow from = draft;
+		int after = selectedRow();
+
+		if (!source || !confirmLeave())
+			return;
+
+		char *id = warp_zoom_source_save_preset(source, WARP_UTF8(title));
+
+		if (!id) {
+			QMessageBox::warning(this, windowTitle(), warpZoomPresetsText("Warp.Zoom.Preset.Save.Failed"));
+			return;
+		}
+
+		warp_zoom_source_update_preset(source, id, nullptr, &from.view, copy ? from.glide : 0);
+		if (copy)
+			warp_zoom_source_move_preset(source, id, after + 1 - (int)rows.size());
+
+		selectedId = QString::fromUtf8(id);
+		bfree(id);
+		refreshPresets();
+		name->setFocus();
+		name->selectAll();
+	}
+
+	void removePreset()
+	{
+		OBSSourceAutoRelease source = currentSource();
+		int row = selectedRow();
+
+		if (!source || row < 0 || rows[row].fixed)
+			return;
+
+		if (QMessageBox::question(this, windowTitle(),
+					  warpZoomPresetsText("Warp.Zoom.Presets.Remove.Confirm").arg(rows[row].name)) !=
+		    QMessageBox::Yes)
+			return;
+
+		warp_zoom_source_remove_preset(source, WARP_UTF8(rows[row].id));
+		selectedId = rows[row - 1].id;
+		dirty = false;
+		refreshPresets();
+	}
+
+	QLineEdit *find = nullptr;
+	QListWidget *sources = nullptr;
+	QLabel *count = nullptr;
+	QPushButton *newButton = nullptr;
 	QListWidget *presets = nullptr;
-	QDoubleSpinBox *zoom = nullptr;
+	QLineEdit *name = nullptr;
+	QPushButton *duplicateButton = nullptr;
+	QPushButton *removeButton = nullptr;
+	WarpZoomPresetFrame *frame = nullptr;
+	QLabel *hint = nullptr;
+	QSlider *zoomSlider = nullptr;
+	QSpinBox *zoom = nullptr;
 	QDoubleSpinBox *x = nullptr;
 	QDoubleSpinBox *y = nullptr;
+	QPushButton *centreButton = nullptr;
+	QPushButton *glideSource = nullptr;
+	QPushButton *glideOwn = nullptr;
 	QSpinBox *glide = nullptr;
+	QLabel *slot = nullptr;
+	QLabel *status = nullptr;
+	QPushButton *revertButton = nullptr;
+	QPushButton *applyButton = nullptr;
+	QTimer *timer = nullptr;
 
 	QVector<WarpZoomTarget> chosen;
+	WarpZoomTarget shownTarget;
 	QVector<WarpZoomPresetRow> rows;
+	QString selectedId;
+	WarpZoomPresetRow draft{};
+	bool dirty = false;
+	int ticks = 0;
+	QImage picture;
+	WarpZoomGrabber grabber;
 };
 
 } // namespace
