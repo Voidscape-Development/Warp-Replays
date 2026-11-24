@@ -1398,6 +1398,13 @@ static void *warp_source_create(obs_data_t *settings, obs_source_t *source)
 	struct warp_source *s = bzalloc(sizeof(struct warp_source));
 	s->source = source;
 
+	/* The engine hands each frame over when it falls due, so libobs is told
+	 * to put it up as it arrives. Left buffered, libobs holds a frame until
+	 * its own frame clock reaches the stamp, and that clock only moves while
+	 * frames are queued: after a pause or a step of under two seconds it is
+	 * that far behind, and playing on would hold the picture that long. */
+	obs_source_set_async_unbuffered(source, true);
+
 	signal_handler_add_array(obs_source_get_signal_handler(source), signals);
 
 	// Manual type since the event can be signalled without an active thread
