@@ -536,8 +536,8 @@ void WarpSwitch::paintEvent(QPaintEvent *)
 	QColor faint = ink;
 
 	p.setRenderHint(QPainter::Antialiasing, true);
-	faint.setAlphaF(0.25);
-	ink.setAlphaF(0.7);
+	faint.setAlphaF(0.25f);
+	ink.setAlphaF(0.7f);
 
 	p.setPen(Qt::NoPen);
 	p.setBrush(isChecked() ? QColor(0x3E, 0xC7, 0x6A) : faint);
