@@ -18,19 +18,22 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #pragma once
 
+#include <obs.h>
+
+#include <QAbstractButton>
 #include <QDialog>
 #include <QIcon>
-#include <QList>
+#include <QMap>
 #include <QString>
 #include <QStringList>
 
 class QCheckBox;
-class QComboBox;
 class QFormLayout;
 class QLabel;
 class QLineEdit;
 class QListWidget;
-class QSpinBox;
+class QPushButton;
+class WarpFlowSettings;
 
 /* the "combo" kind only exists in the create dialog: what it makes is a replay
  * flow and a highlight flow, linked together */
@@ -39,10 +42,27 @@ class QSpinBox;
 QString warp_flow_text(const char *key);
 QIcon warp_flow_icon(const char *kind);
 QString warp_flow_kind_name(const char *kind);
+/* a length in seconds the way the UI says it */
+QString warp_length_label(int seconds);
 
-/* Picks what to make, the way the Add Source dialog does: the kinds down the
- * left, what the one that is picked does on the right, and the settings it
- * needs underneath. Everything it makes is made by the time it is accepted. */
+/* Every key bound to anything, by the hotkey it is bound to, as the hotkey
+ * settings would write it: "Shift+F9". */
+QMap<obs_hotkey_id, QStringList> warp_bound_keys();
+QString warp_key_text(const QMap<obs_hotkey_id, QStringList> &keys, obs_hotkey_id id);
+
+/* the switch a flow is turned on and off with */
+class WarpSwitch : public QAbstractButton {
+public:
+	explicit WarpSwitch(QWidget *parent);
+	QSize sizeHint() const override { return QSize(36, 20); }
+
+protected:
+	void paintEvent(QPaintEvent *) override;
+};
+
+/* Picks what to make: the kinds down the left, and the settings the one that
+ * is picked needs beside them. Everything it makes is made by the time it is
+ * accepted. */
 class WarpFlowCreateDialog : public QDialog {
 public:
 	explicit WarpFlowCreateDialog(QWidget *parent);
@@ -53,71 +73,55 @@ public:
 	void accept() override;
 
 private:
-	void kindChanged();
-	void targetChanged();
-	bool buildFlow(const char *kind, const QString &name, QComboBox *targetCombo, QLineEdit *newTargetEdit,
-		       const char *trigger, const char *order, int maxClips, const QList<int> &lengths,
-		       const QStringList &links, QString &flowId);
+	QString kind() const;
+	void refresh();
+	bool buildFlow(const char *kind, const QString &name, bool highlight, const char *trigger, const char *order,
+		       int maxClips, const QList<int> &lengths, const QStringList &links, QString &flowId);
 	void linkFedBy(const QString &fedBy, const QString &flowId);
 
 	QListWidget *kindList = nullptr;
 	QLabel *kindTitle = nullptr;
 	QLabel *kindDesc = nullptr;
-
-	QFormLayout *form = nullptr;
+	QLabel *chain = nullptr;
 	QLineEdit *nameEdit = nullptr;
-	QComboBox *targetCombo = nullptr;
-	QLineEdit *newTargetEdit = nullptr;
-	QComboBox *triggerCombo = nullptr;
-	QComboBox *orderCombo = nullptr;
-	QCheckBox *limitCheck = nullptr;
-	QSpinBox *limitSpin = nullptr;
-	QComboBox *fedByCombo = nullptr;
-	QComboBox *hlTargetCombo = nullptr;
-	QLineEdit *hlNewTargetEdit = nullptr;
-	QComboBox *hlOrderCombo = nullptr;
-	QComboBox *playbackCombo = nullptr;
-	QCheckBox *speedCheck = nullptr;
-	QSpinBox *speedSpin = nullptr;
-	QSpinBox *lengthSpin = nullptr;
-	QLineEdit *lengthsEdit = nullptr;
-
-	/* the id of the source kind targetCombo is listing, so it is only filled
-	 * again when the kind that is picked feeds a different one */
-	QString targetSourceId;
+	WarpFlowSettings *settings = nullptr;
+	QLabel *summary = nullptr;
+	QPushButton *createButton = nullptr;
 
 	QStringList created;
 };
 
-/* everything about a flow that is already there, kind aside */
+/* everything about a flow that is already there, kind aside; changes wait for
+ * Apply */
 class WarpFlowPropsDialog : public QDialog {
 public:
 	WarpFlowPropsDialog(QWidget *parent, const QString &flowId);
 
-	void accept() override;
+protected:
+	void closeEvent(QCloseEvent *event) override;
+	void reject() override;
 
 private:
-	void targetChanged();
+	void load();
+	bool apply();
+	void setDirty(bool value);
+	void refreshStatus();
 
 	QString flowId;
-	/* the kind cannot be changed here, so what it feeds and which fields
-	 * mean anything are settled once, when the dialog is built */
-	bool isInstant = false;
-	QString targetSourceId;
+	QString kind;
+	bool loading = false;
+	bool dirty = false;
 
-	QFormLayout *form = nullptr;
 	QLineEdit *nameEdit = nullptr;
-	QComboBox *targetCombo = nullptr;
-	QLineEdit *newTargetEdit = nullptr;
-	QComboBox *triggerCombo = nullptr;
-	QComboBox *orderCombo = nullptr;
-	QCheckBox *limitCheck = nullptr;
-	QSpinBox *limitSpin = nullptr;
-	QComboBox *playbackCombo = nullptr;
-	QCheckBox *speedCheck = nullptr;
-	QSpinBox *speedSpin = nullptr;
-	QSpinBox *lengthSpin = nullptr;
-	QLineEdit *lengthsEdit = nullptr;
-	QCheckBox *enabledCheck = nullptr;
+	QLabel *status = nullptr;
+	QLabel *enabledText = nullptr;
+	WarpSwitch *enabledSwitch = nullptr;
+	WarpFlowSettings *settings = nullptr;
+	QListWidget *sections = nullptr;
 	QListWidget *linkList = nullptr;
+	QLabel *fedBy = nullptr;
+	QFormLayout *hotkeyForm = nullptr;
+	QLabel *dirtyLabel = nullptr;
+	QPushButton *revertButton = nullptr;
+	QPushButton *applyButton = nullptr;
 };
