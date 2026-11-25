@@ -19,18 +19,23 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 
 #include <obs-module.h>
 #include <obs-frontend-api.h>
+#include <util/dstr.h>
 
 #include <QApplication>
+#include <QButtonGroup>
 #include <QCheckBox>
+#include <QCloseEvent>
 #include <QComboBox>
-#include <QDialogButtonBox>
 #include <QFont>
 #include <QFormLayout>
 #include <QFrame>
+#include <QGridLayout>
 #include <QHBoxLayout>
+#include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
 #include <QList>
@@ -40,8 +45,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QPair>
 #include <QPixmap>
 #include <QPolygonF>
-#include <QRegularExpression>
+#include <QPushButton>
+#include <QScrollArea>
+#include <QSignalBlocker>
 #include <QSpinBox>
+#include <QStackedWidget>
+#include <QTimer>
 #include <QVBoxLayout>
 
 #include "warp-events.h"
@@ -90,18 +99,6 @@ void warp_draw_play(QPainter &p, const QRectF &box, const QColor &color)
 	p.setPen(Qt::NoPen);
 	p.setBrush(color);
 	p.drawPolygon(triangle);
-}
-
-/* hides a form row, label and all: a field on its own leaves its label behind */
-void warp_set_row_visible(QFormLayout *form, QWidget *field, bool visible)
-{
-	if (!form || !field)
-		return;
-
-	if (QWidget *label = form->labelForField(field))
-		label->setVisible(visible);
-
-	field->setVisible(visible);
 }
 
 /* the Warp source a flow of that kind feeds: an instant replay holds its one
@@ -166,33 +163,6 @@ void warp_fill_target_combo(QComboBox *combo, const QString &selected_uuid, cons
 		index = search.found.isEmpty() ? combo->count() - 1 : 0;
 
 	combo->setCurrentIndex(index);
-}
-
-void warp_fill_trigger_combo(QComboBox *combo)
-{
-	combo->addItem(warp_flow_text("Warp.Flow.Trigger.Hotkey"), QString(WARP_FLOW_TRIGGER_HOTKEY));
-	combo->addItem(warp_flow_text("Warp.Flow.Trigger.Listen"), QString(WARP_FLOW_TRIGGER_LISTEN));
-}
-
-void warp_fill_order_combo(QComboBox *combo)
-{
-	combo->addItem(warp_flow_text("Warp.Flow.Order.OldestFirst"), QString(WARP_FLOW_ORDER_OLDEST_FIRST));
-	combo->addItem(warp_flow_text("Warp.Flow.Order.NewestFirst"), QString(WARP_FLOW_ORDER_NEWEST_FIRST));
-}
-
-void warp_fill_playback_combo(QComboBox *combo)
-{
-	combo->addItem(warp_flow_text("Warp.Flow.Playback.Keep"), QString(WARP_MEDIA_LOAD_KEEP));
-	combo->addItem(warp_flow_text("Warp.Flow.Playback.Play"), QString(WARP_MEDIA_LOAD_PLAY));
-	combo->addItem(warp_flow_text("Warp.Flow.Playback.Hold"), QString(WARP_MEDIA_LOAD_HOLD));
-}
-
-void warp_select_data(QComboBox *combo, const QString &value)
-{
-	const int index = combo->findData(value);
-
-	if (index >= 0)
-		combo->setCurrentIndex(index);
 }
 
 /* A Warp source called 'wanted', or as close to it as a name that is not taken
@@ -302,155 +272,6 @@ bool warp_flow_name_free(QWidget *parent, const QString &name, const QString &ex
 	return false;
 }
 
-QWidget *warp_limit_row(QCheckBox **check, QSpinBox **spin, QWidget *parent)
-{
-	auto *row = new QWidget(parent);
-	auto *layout = new QHBoxLayout(row);
-
-	layout->setContentsMargins(0, 0, 0, 0);
-
-	*check = new QCheckBox(warp_flow_text("Warp.Flow.Limit"), row);
-	*spin = new QSpinBox(row);
-
-	(*spin)->setRange(1, 500);
-	(*spin)->setValue(10);
-	(*spin)->setSuffix(warp_flow_text("Warp.Flow.Limit.Suffix"));
-	(*spin)->setEnabled(false);
-
-	QObject::connect(*check, &QCheckBox::toggled, *spin, &QSpinBox::setEnabled);
-
-	layout->addWidget(*check);
-	layout->addWidget(*spin);
-	layout->addStretch(1);
-
-	return row;
-}
-
-/* the speed an instant replay flow plays a clip at, off until it is ticked: a
- * flow that is not asked for a speed leaves the source playing at its own */
-QWidget *warp_speed_row(QCheckBox **check, QSpinBox **spin, QWidget *parent)
-{
-	auto *row = new QWidget(parent);
-	auto *layout = new QHBoxLayout(row);
-
-	layout->setContentsMargins(0, 0, 0, 0);
-
-	*check = new QCheckBox(warp_flow_text("Warp.Flow.Speed"), row);
-	*spin = new QSpinBox(row);
-
-	(*spin)->setRange(WARP_FLOW_SPEED_MIN, WARP_FLOW_SPEED_MAX);
-	(*spin)->setValue(50);
-	(*spin)->setSuffix(warp_flow_text("Warp.Flow.Speed.Suffix"));
-	(*spin)->setEnabled(false);
-
-	QObject::connect(*check, &QCheckBox::toggled, *spin, &QSpinBox::setEnabled);
-
-	layout->addWidget(*check);
-	layout->addWidget(*spin);
-	layout->addStretch(1);
-
-	return row;
-}
-
-/* how much of the replay buffer a flow keeps, with the bottom of the range
- * standing for all of it rather than for a clip of no length */
-QWidget *warp_length_row(QSpinBox **spin, QWidget *parent)
-{
-	auto *row = new QWidget(parent);
-	auto *layout = new QHBoxLayout(row);
-
-	layout->setContentsMargins(0, 0, 0, 0);
-
-	*spin = new QSpinBox(row);
-
-	(*spin)->setRange(WARP_FLOW_LENGTH_WHOLE, WARP_FLOW_LENGTH_MAX);
-	(*spin)->setSuffix(warp_flow_text("Warp.Flow.Length.Suffix"));
-	(*spin)->setSpecialValueText(warp_flow_text("Warp.Flow.Length.Whole"));
-
-	layout->addWidget(new QLabel(warp_flow_text("Warp.Flow.Length"), row));
-	layout->addWidget(*spin);
-	layout->addStretch(1);
-
-	row->setToolTip(warp_flow_text("Warp.Flow.Length.Desc"));
-
-	return row;
-}
-
-/* the lengths a flow offers on top of its own, each of which is a hotkey */
-QWidget *warp_lengths_row(QLineEdit **edit, QWidget *parent)
-{
-	auto *row = new QWidget(parent);
-	auto *layout = new QHBoxLayout(row);
-
-	layout->setContentsMargins(0, 0, 0, 0);
-
-	*edit = new QLineEdit(row);
-	(*edit)->setPlaceholderText(warp_flow_text("Warp.Flow.Lengths.Placeholder"));
-
-	layout->addWidget(new QLabel(warp_flow_text("Warp.Flow.Lengths"), row));
-	layout->addWidget(*edit, 1);
-
-	row->setToolTip(warp_flow_text("Warp.Flow.Lengths.Desc"));
-
-	return row;
-}
-
-/* the lengths a flow offers, as they are written in the field */
-QString warp_lengths_text(obs_data_t *config)
-{
-	obs_data_array_t *lengths = config ? obs_data_get_array(config, WARP_FLOW_LENGTHS) : nullptr;
-	const size_t count = lengths ? obs_data_array_count(lengths) : 0;
-	QStringList parts;
-
-	for (size_t i = 0; i < count; i++) {
-		obs_data_t *item = obs_data_array_item(lengths, i);
-
-		parts.append(QString::number(obs_data_get_int(item, WARP_FLOW_LENGTH_SECONDS)));
-		obs_data_release(item);
-	}
-
-	obs_data_array_release(lengths);
-
-	return parts.join(QStringLiteral(", "));
-}
-
-/* What was written in that field, as lengths in seconds: whole numbers, in any
- * of the ways one might separate them, with the "s" they are said with allowed
- * and anything offered twice kept once. Says what is wrong with it and answers
- * false when it cannot be read. */
-bool warp_parse_lengths(QWidget *parent, const QString &title, const QString &text, QList<int> &lengths)
-{
-	static const QRegularExpression separators(QStringLiteral("[,;/\\s]+"));
-
-	const QStringList parts = text.split(separators, Qt::SkipEmptyParts);
-
-	for (const QString &part : parts) {
-		QString number = part;
-
-		if (number.endsWith(QLatin1Char('s'), Qt::CaseInsensitive))
-			number.chop(1);
-
-		bool read = false;
-		const int seconds = number.toInt(&read);
-
-		if (!read || seconds < 1 || seconds > WARP_FLOW_LENGTH_MAX) {
-			QMessageBox::warning(parent, title, warp_flow_text("Warp.Flow.Error.Lengths"));
-			return false;
-		}
-
-		if (!lengths.contains(seconds))
-			lengths.append(seconds);
-	}
-
-	if (lengths.size() > WARP_FLOW_LENGTHS_MAX) {
-		QMessageBox::warning(parent, title,
-				     warp_flow_text("Warp.Flow.Error.LengthsTooMany").arg(WARP_FLOW_LENGTHS_MAX));
-		return false;
-	}
-
-	return true;
-}
-
 void warp_set_lengths(obs_data_t *config, const QList<int> &lengths)
 {
 	obs_data_array_t *array = obs_data_array_create();
@@ -467,14 +288,95 @@ void warp_set_lengths(obs_data_t *config, const QList<int> &lengths)
 	obs_data_array_release(array);
 }
 
-QFrame *warp_separator(QWidget *parent)
+/* A row of buttons only one of which is down at a time, each standing for a
+ * value: what a pair of choices is put as, rather than a combo box that hides
+ * the other one. */
+class WarpSegment : public QWidget {
+public:
+	std::function<void()> changed;
+
+	explicit WarpSegment(QWidget *parent) : QWidget(parent)
+	{
+		row = new QHBoxLayout(this);
+		row->setContentsMargins(0, 0, 0, 0);
+		row->setSpacing(0);
+		group = new QButtonGroup(this);
+		connect(group, &QButtonGroup::idClicked, this, [this](int) {
+			if (changed)
+				changed();
+		});
+	}
+
+	void add(const QString &text, const QString &value, const QString &tip = QString())
+	{
+		auto *button = new QPushButton(text, this);
+
+		button->setCheckable(true);
+		button->setToolTip(tip);
+		button->setChecked(values.isEmpty());
+		group->addButton(button, (int)values.size());
+		values.append(value);
+		row->addWidget(button);
+	}
+
+	QString value() const
+	{
+		int id = group->checkedId();
+		return id >= 0 ? values[id] : QString();
+	}
+
+	void setValue(const QString &value)
+	{
+		int index = (int)values.indexOf(value);
+
+		if (index >= 0)
+			group->button(index)->setChecked(true);
+	}
+
+private:
+	QHBoxLayout *row = nullptr;
+	QButtonGroup *group = nullptr;
+	QStringList values;
+};
+
+/* the heading of a section, set small and let back */
+QLabel *warp_section_title(const QString &text, QWidget *parent)
 {
-	auto *line = new QFrame(parent);
+	auto *label = new QLabel(text.toUpper(), parent);
+	QFont font = label->font();
 
-	line->setFrameShape(QFrame::HLine);
-	line->setFrameShadow(QFrame::Sunken);
+	font.setBold(true);
+	font.setPointSizeF(font.pointSizeF() * 0.85);
+	label->setFont(font);
+	label->setEnabled(false);
+	label->setMinimumWidth(110);
+	label->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+	return label;
+}
 
-	return line;
+/* a field with what it is above it */
+QWidget *warp_labelled(QLabel *label, QWidget *field, QWidget *parent)
+{
+	auto *box = new QWidget(parent);
+	auto *column = new QVBoxLayout(box);
+
+	column->setContentsMargins(0, 0, 0, 0);
+	column->setSpacing(4);
+	column->addWidget(label);
+	column->addWidget(field);
+	return box;
+}
+
+QWidget *warp_hbox(QWidget *parent, std::initializer_list<QWidget *> widgets)
+{
+	auto *box = new QWidget(parent);
+	auto *row = new QHBoxLayout(box);
+
+	row->setContentsMargins(0, 0, 0, 0);
+	for (QWidget *widget : widgets)
+		row->addWidget(widget);
+	row->addStretch(1);
+	return box;
 }
 
 } // namespace
@@ -577,217 +479,715 @@ QString warp_flow_kind_name(const char *kind)
 	return warp_flow_text(warp_flow_kinds[0].name_key);
 }
 
+QString warp_length_label(int seconds)
+{
+	char label[WARP_FLOW_LENGTH_LABEL_SIZE];
+
+	warp_flow_length_label(seconds, label, sizeof(label));
+
+	return QString::fromUtf8(label);
+}
+
+QMap<obs_hotkey_id, QStringList> warp_bound_keys()
+{
+	QMap<obs_hotkey_id, QStringList> keys;
+
+	obs_enum_hotkey_bindings(
+		[](void *data, size_t, obs_hotkey_binding_t *binding) {
+			auto *map = static_cast<QMap<obs_hotkey_id, QStringList> *>(data);
+			const obs_key_combination_t combination = obs_hotkey_binding_get_key_combination(binding);
+			struct dstr text = {};
+
+			obs_key_combination_to_str(combination, &text);
+
+			if (text.array && *text.array)
+				(*map)[obs_hotkey_binding_get_hotkey_id(binding)].append(QString::fromUtf8(text.array));
+
+			dstr_free(&text);
+			return true;
+		},
+		&keys);
+
+	return keys;
+}
+
+QString warp_key_text(const QMap<obs_hotkey_id, QStringList> &keys, obs_hotkey_id id)
+{
+	if (id == OBS_INVALID_HOTKEY_ID)
+		return QString();
+
+	return keys.value(id).join(QStringLiteral(" / "));
+}
+
+WarpSwitch::WarpSwitch(QWidget *parent) : QAbstractButton(parent)
+{
+	setCheckable(true);
+	setCursor(Qt::PointingHandCursor);
+	setFocusPolicy(Qt::StrongFocus);
+	setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+}
+
+void WarpSwitch::paintEvent(QPaintEvent *)
+{
+	QPainter p(this);
+	const QRectF track = QRectF(rect()).adjusted(1, 1, -1, -1);
+	const qreal radius = track.height() / 2.0;
+	QColor ink = palette().color(QPalette::WindowText);
+	QColor faint = ink;
+
+	p.setRenderHint(QPainter::Antialiasing, true);
+	faint.setAlphaF(0.25f);
+	ink.setAlphaF(0.7f);
+
+	p.setPen(Qt::NoPen);
+	p.setBrush(isChecked() ? QColor(0x3E, 0xC7, 0x6A) : faint);
+	p.drawRoundedRect(track, radius, radius);
+
+	const qreal knob = track.height() - 4.0;
+	const qreal x = isChecked() ? track.right() - 2.0 - knob : track.left() + 2.0;
+
+	p.setBrush(isChecked() ? QColor(Qt::white) : ink);
+	p.drawEllipse(QRectF(x, track.top() + 2.0, knob, knob));
+
+	if (hasFocus()) {
+		p.setPen(QPen(palette().color(QPalette::Highlight), 1.5));
+		p.setBrush(Qt::NoBrush);
+		p.drawRoundedRect(track, radius, radius);
+	}
+}
+
+/* ------------------------------------------------------------------------- */
+/* the settings both windows share
+ *
+ * Grouped the way a clip goes through a flow: where it comes from, where it
+ * goes, what the list does with it (or, for an instant replay, what playback
+ * does as it lands), and how much of the buffer it is. */
+
+class WarpFlowSettings : public QWidget {
+public:
+	std::function<void()> changed;
+
+	WarpFlowSettings(QWidget *parent, QWidget *nameField) : QWidget(parent), creating(nameField != nullptr)
+	{
+		grid = new QGridLayout(this);
+		grid->setColumnStretch(1, 1);
+		grid->setHorizontalSpacing(20);
+		grid->setVerticalSpacing(12);
+
+		auto notify = [this]() {
+			if (changed)
+				changed();
+		};
+
+		if (nameField)
+			addSection("Warp.Flow.Section.Flow",
+				   warp_labelled(new QLabel(warp_flow_text("Warp.Flow.Name"), this), nameField, this));
+
+		/* clips in */
+		takes = new WarpSegment(this);
+		takes->add(warp_flow_text("Warp.Flow.Trigger.Listen"), WARP_FLOW_TRIGGER_LISTEN);
+		takes->add(warp_flow_text("Warp.Flow.Trigger.Hotkey"), WARP_FLOW_TRIGGER_HOTKEY);
+		takes->changed = notify;
+
+		fedBy = new QComboBox(this);
+		fedBy->addItem(warp_flow_text("Warp.Flow.FedBy.None"), QString());
+		fedByBox = warp_labelled(new QLabel(warp_flow_text("Warp.Flow.FedBy"), this), fedBy, this);
+		fedBy->setToolTip(warp_flow_text("Warp.Flow.FedBy.Desc"));
+		connect(fedBy, &QComboBox::currentIndexChanged, this, notify);
+
+		auto *in = new QWidget(this);
+		auto *inColumn = new QVBoxLayout(in);
+
+		inColumn->setContentsMargins(0, 0, 0, 0);
+		inColumn->addWidget(warp_labelled(new QLabel(warp_flow_text("Warp.Flow.Trigger"), this),
+						  warp_hbox(this, {takes}), this));
+		inColumn->addWidget(warp_hbox(this, {fedByBox}));
+		addSection("Warp.Flow.Section.In", in);
+
+		/* clips out: one source, or the two a combo feeds side by side */
+		target = new QComboBox(this);
+		newTarget = new QLineEdit(this);
+		hlTarget = new QComboBox(this);
+		hlNewTarget = new QLineEdit(this);
+		targetLabel = new QLabel(this);
+		newTarget->setPlaceholderText(warp_flow_text("Warp.Flow.Target.NewName.Placeholder"));
+		hlNewTarget->setPlaceholderText(warp_flow_text("Warp.Flow.Target.NewName.Placeholder"));
+
+		auto *out = new QWidget(this);
+		auto *outGrid = new QGridLayout(out);
+
+		outGrid->setContentsMargins(0, 0, 0, 0);
+		outGrid->addWidget(targetLabel, 0, 0);
+		outGrid->addWidget(target, 1, 0);
+		outGrid->addWidget(newTarget, 2, 0);
+		hlColumn =
+			warp_labelled(new QLabel(warp_flow_text("Warp.Flow.Target.Highlight"), this), hlTarget, this);
+		hlColumn->layout()->addWidget(hlNewTarget);
+		outGrid->addWidget(hlColumn, 0, 1, 3, 1, Qt::AlignTop);
+		outGrid->setColumnStretch(0, 1);
+		outGrid->setColumnStretch(1, 1);
+		addSection("Warp.Flow.Section.Out", out);
+
+		connect(target, &QComboBox::currentIndexChanged, this, [this, notify](int) {
+			showNewNames();
+			notify();
+		});
+		connect(hlTarget, &QComboBox::currentIndexChanged, this, [this, notify](int) {
+			showNewNames();
+			notify();
+		});
+		connect(newTarget, &QLineEdit::textEdited, this, notify);
+		connect(hlNewTarget, &QLineEdit::textEdited, this, notify);
+
+		/* the list */
+		order = orderSegment(notify);
+		hlOrder = orderSegment(notify);
+		orderLabel = new QLabel(this);
+		hlOrderBox =
+			warp_labelled(new QLabel(warp_flow_text("Warp.Flow.Order.Highlight"), this), hlOrder, this);
+
+		limitCheck = new QCheckBox(warp_flow_text("Warp.Flow.Limit"), this);
+		limitSpin = new QSpinBox(this);
+		limitSpin->setRange(1, 500);
+		limitSpin->setValue(10);
+		limitSpin->setSuffix(warp_flow_text("Warp.Flow.Limit.Suffix"));
+		limitBox = warp_labelled(new QLabel(warp_flow_text("Warp.Flow.Limit.Label"), this),
+					 warp_hbox(this, {limitCheck, limitSpin}), this);
+		connect(limitCheck, &QCheckBox::toggled, this, [this, notify](bool) {
+			showEnabled();
+			notify();
+		});
+		connect(limitSpin, &QSpinBox::valueChanged, this, notify);
+
+		listSection =
+			addSection("Warp.Flow.Section.List",
+				   warp_hbox(this, {warp_labelled(orderLabel, order, this), hlOrderBox, limitBox}));
+
+		/* what an instant replay does as a clip lands */
+		playback = new WarpSegment(this);
+		playback->add(warp_flow_text("Warp.Flow.Playback.Keep.Short"), WARP_MEDIA_LOAD_KEEP,
+			      warp_flow_text("Warp.Flow.Playback.Keep"));
+		playback->add(warp_flow_text("Warp.Flow.Playback.Play.Short"), WARP_MEDIA_LOAD_PLAY,
+			      warp_flow_text("Warp.Flow.Playback.Play"));
+		playback->add(warp_flow_text("Warp.Flow.Playback.Hold.Short"), WARP_MEDIA_LOAD_HOLD,
+			      warp_flow_text("Warp.Flow.Playback.Hold"));
+		playback->changed = notify;
+
+		speedCheck = new QCheckBox(warp_flow_text("Warp.Flow.Speed"), this);
+		speedSpin = new QSpinBox(this);
+		speedSpin->setRange(WARP_FLOW_SPEED_MIN, WARP_FLOW_SPEED_MAX);
+		speedSpin->setValue(50);
+		speedSpin->setSuffix(warp_flow_text("Warp.Flow.Speed.Suffix"));
+		connect(speedCheck, &QCheckBox::toggled, this, [this, notify](bool) {
+			showEnabled();
+			notify();
+		});
+		connect(speedSpin, &QSpinBox::valueChanged, this, notify);
+
+		auto *lands = new QWidget(this);
+		auto *landsColumn = new QVBoxLayout(lands);
+
+		landsColumn->setContentsMargins(0, 0, 0, 0);
+		landsColumn->addWidget(warp_hbox(this, {playback}));
+		landsColumn->addWidget(warp_hbox(this, {speedCheck, speedSpin}));
+		landsSection = addSection("Warp.Flow.Section.Lands", lands);
+
+		/* how much of the buffer, and the other lengths on offer */
+		lengthMode = new WarpSegment(this);
+		lengthMode->add(warp_flow_text("Warp.Flow.Length.Whole.Short"), "whole",
+				warp_flow_text("Warp.Flow.Length.Desc"));
+		lengthMode->add(warp_flow_text("Warp.Flow.Length.Last"), "last",
+				warp_flow_text("Warp.Flow.Length.Desc"));
+		lengthMode->changed = [this, notify]() {
+			showEnabled();
+			notify();
+		};
+		lengthSpin = new QSpinBox(this);
+		lengthSpin->setRange(1, WARP_FLOW_LENGTH_MAX);
+		lengthSpin->setValue(20);
+		lengthSpin->setSuffix(warp_flow_text("Warp.Flow.Length.Suffix"));
+		connect(lengthSpin, &QSpinBox::valueChanged, this, notify);
+
+		tags = new QHBoxLayout();
+		tags->setContentsMargins(0, 0, 0, 0);
+		addLength = new QPushButton(QStringLiteral("+ ") + warp_flow_text("Warp.Flow.Lengths.Add"), this);
+		tags->addWidget(addLength);
+		tags->addStretch(1);
+		connect(addLength, &QPushButton::clicked, this, [this, notify]() {
+			bool ok = false;
+			int seconds = QInputDialog::getInt(this, warp_flow_text("Warp.Flow.Lengths.Add"),
+							   warp_flow_text("Warp.Flow.Lengths.Prompt"), 10, 1,
+							   WARP_FLOW_LENGTH_MAX, 1, &ok);
+
+			if (!ok || lengths.contains(seconds))
+				return;
+
+			lengths.append(seconds);
+			std::sort(lengths.begin(), lengths.end());
+			showLengths();
+			notify();
+		});
+
+		auto *length = new QWidget(this);
+		auto *lengthColumn = new QVBoxLayout(length);
+
+		lengthColumn->setContentsMargins(0, 0, 0, 0);
+		lengthColumn->addWidget(warp_hbox(this, {lengthMode, lengthSpin}));
+		lengthColumn->addWidget(new QLabel(warp_flow_text("Warp.Flow.Lengths"), this));
+		lengthColumn->addLayout(tags);
+		lengthColumn->itemAt(1)->widget()->setToolTip(warp_flow_text("Warp.Flow.Lengths.Desc"));
+		addSection("Warp.Flow.Section.Length", length);
+
+		grid->setRowStretch(grid->rowCount(), 1);
+		showLengths();
+	}
+
+	void setKind(const QString &value)
+	{
+		const bool combo = value == WARP_FLOW_KIND_COMBO;
+		const bool highlight = value == WARP_FLOW_KIND_HIGHLIGHT;
+		const bool instant = value == WARP_FLOW_KIND_INSTANT;
+		const QString source_id = QString::fromUtf8(warp_flow_target_id(value));
+
+		/* an instant replay is held in a Warp Media source, so it is
+		 * picked from other sources; refilled only when that changes,
+		 * so moving between the list kinds keeps what was chosen */
+		if (source_id != targetSourceId) {
+			QSignalBlocker block(target);
+
+			targetSourceId = source_id;
+			warp_fill_target_combo(target, QString(), source_id.toUtf8().constData());
+		}
+
+		if (creating && hlTarget->count() == 0) {
+			QSignalBlocker block(hlTarget);
+
+			warp_fill_target_combo(hlTarget, QString(), WARP_PLAYLIST_SOURCE_ID);
+			hlTarget->setCurrentIndex(hlTarget->count() - 1);
+		}
+
+		targetLabel->setText(warp_flow_text(combo     ? "Warp.Flow.Target.Replay"
+						    : instant ? "Warp.Flow.Target.Instant"
+							      : "Warp.Flow.Target"));
+		orderLabel->setText(warp_flow_text(combo ? "Warp.Flow.Order.Replay" : "Warp.Flow.Order"));
+
+		fedByBox->setVisible(creating && (highlight || instant));
+		hlColumn->setVisible(combo);
+		hlOrderBox->setVisible(combo);
+		/* a highlight list keeps what it is given: the clips it is fed
+		 * have been picked out already */
+		limitBox->setVisible(!highlight && !instant);
+		setSectionVisible(listSection, !instant);
+		setSectionVisible(landsSection, instant);
+		showNewNames();
+	}
+
+	void load(obs_data_t *config)
+	{
+		QSignalBlocker block(target);
+		const int max_clips = (int)obs_data_get_int(config, WARP_FLOW_MAX_CLIPS);
+		const int speed = (int)obs_data_get_int(config, WARP_FLOW_SPEED);
+		const int length = (int)obs_data_get_int(config, WARP_FLOW_LENGTH);
+		obs_data_array_t *array = obs_data_get_array(config, WARP_FLOW_LENGTHS);
+
+		warp_fill_target_combo(target, QString::fromUtf8(obs_data_get_string(config, WARP_FLOW_TARGET_UUID)),
+				       targetSourceId.toUtf8().constData());
+		newTarget->clear();
+		takes->setValue(QString::fromUtf8(obs_data_get_string(config, WARP_FLOW_TRIGGER)));
+		order->setValue(QString::fromUtf8(obs_data_get_string(config, WARP_FLOW_ORDER)));
+		playback->setValue(QString::fromUtf8(obs_data_get_string(config, WARP_FLOW_PLAYBACK)));
+		limitCheck->setChecked(max_clips > 0);
+		if (max_clips > 0)
+			limitSpin->setValue(max_clips);
+		speedCheck->setChecked(speed > 0);
+		if (speed > 0)
+			speedSpin->setValue(speed);
+		lengthMode->setValue(length > 0 ? "last" : "whole");
+		if (length > 0)
+			lengthSpin->setValue(length);
+
+		lengths.clear();
+		for (size_t i = 0; array && i < obs_data_array_count(array); i++) {
+			obs_data_t *item = obs_data_array_item(array, i);
+
+			lengths.append((int)obs_data_get_int(item, WARP_FLOW_LENGTH_SECONDS));
+			obs_data_release(item);
+		}
+		obs_data_array_release(array);
+
+		showLengths();
+		showNewNames();
+	}
+
+	/* what both windows write the same way */
+	void write(obs_data_t *config, bool instant) const
+	{
+		obs_data_set_int(config, WARP_FLOW_LENGTH, length());
+		warp_set_lengths(config, lengths);
+
+		/* what playback does with a clip, and how fast, is the instant
+		 * replay flow's alone */
+		if (instant) {
+			obs_data_set_string(config, WARP_FLOW_PLAYBACK, playback->value().toUtf8().constData());
+			obs_data_set_int(config, WARP_FLOW_SPEED, speedCheck->isChecked() ? speedSpin->value() : 0);
+		}
+	}
+
+	int length() const { return lengthMode->value() == "last" ? lengthSpin->value() : WARP_FLOW_LENGTH_WHOLE; }
+	int maxClips() const { return limitCheck->isChecked() ? limitSpin->value() : 0; }
+
+	/* the name a source made for the flow gets */
+	QString targetText(QComboBox *combo, QLineEdit *edit, const QString &fallback) const
+	{
+		if (!combo->currentData().toString().isEmpty())
+			return combo->currentText();
+
+		return edit->text().trimmed().isEmpty() ? fallback : edit->text().trimmed();
+	}
+
+	/* the Save hotkeys a flow with these settings has, by name */
+	QStringList saveHotkeys() const
+	{
+		QStringList names;
+
+		names.append(warp_flow_text("Warp.Window.Menu.Save") + " (" +
+			     (length() > 0 ? warp_length_label(length()) : warp_flow_text("Warp.Window.Length.Whole")) +
+			     ")");
+		for (int seconds : lengths)
+			names.append(warp_flow_text("Warp.Window.Menu.SaveLength").arg(warp_length_label(seconds)));
+
+		return names;
+	}
+
+	WarpSegment *takes = nullptr;
+	WarpSegment *order = nullptr;
+	WarpSegment *hlOrder = nullptr;
+	WarpSegment *playback = nullptr;
+	QComboBox *fedBy = nullptr;
+	QComboBox *target = nullptr;
+	QLineEdit *newTarget = nullptr;
+	QComboBox *hlTarget = nullptr;
+	QLineEdit *hlNewTarget = nullptr;
+	QList<int> lengths;
+	QString targetSourceId;
+
+private:
+	WarpSegment *orderSegment(const std::function<void()> &notify)
+	{
+		auto *segment = new WarpSegment(this);
+
+		segment->add(warp_flow_text("Warp.Flow.Order.OldestFirst"), WARP_FLOW_ORDER_OLDEST_FIRST);
+		segment->add(warp_flow_text("Warp.Flow.Order.NewestFirst"), WARP_FLOW_ORDER_NEWEST_FIRST);
+		segment->changed = notify;
+		return segment;
+	}
+
+	/* a titled section under a rule, answering its row */
+	int addSection(const char *title, QWidget *content)
+	{
+		int row = grid->rowCount();
+
+		if (row > 0 || grid->count() > 0) {
+			auto *rule = new QFrame(this);
+
+			rule->setFrameShape(QFrame::HLine);
+			rule->setFrameShadow(QFrame::Sunken);
+			grid->addWidget(rule, row++, 0, 1, 2);
+		}
+
+		grid->addWidget(warp_section_title(warp_flow_text(title), this), row, 0);
+		grid->addWidget(content, row, 1);
+		return row;
+	}
+
+	void setSectionVisible(int row, bool visible)
+	{
+		for (int r = row - 1; r <= row; r++) {
+			for (int c = 0; c < 2; c++) {
+				QLayoutItem *item = grid->itemAtPosition(r, c);
+
+				if (item && item->widget())
+					item->widget()->setVisible(visible);
+			}
+		}
+	}
+
+	void showNewNames()
+	{
+		newTarget->setVisible(target->currentData().toString().isEmpty());
+		hlNewTarget->setVisible(hlTarget->currentData().toString().isEmpty());
+	}
+
+	void showEnabled()
+	{
+		limitSpin->setEnabled(limitCheck->isChecked());
+		speedSpin->setEnabled(speedCheck->isChecked());
+		lengthSpin->setVisible(lengthMode->value() == "last");
+	}
+
+	/* each length on offer as a tag that is clicked to take it off */
+	void showLengths()
+	{
+		while (tags->count() > 2) {
+			QLayoutItem *item = tags->takeAt(0);
+
+			delete item->widget();
+			delete item;
+		}
+
+		for (int i = 0; i < lengths.size(); i++) {
+			const int seconds = lengths[i];
+			auto *tag = new QPushButton(warp_length_label(seconds) + QStringLiteral("  ×"), this);
+
+			tag->setToolTip(warp_flow_text("Warp.Flow.Lengths.Remove").arg(warp_length_label(seconds)));
+			tags->insertWidget(i, tag);
+			connect(tag, &QPushButton::clicked, this, [this, seconds]() {
+				lengths.removeAll(seconds);
+				/* the tag that was clicked is still on the stack */
+				QTimer::singleShot(0, this, [this]() { showLengths(); });
+				if (changed)
+					changed();
+			});
+		}
+
+		addLength->setEnabled(lengths.size() < WARP_FLOW_LENGTHS_MAX);
+		showEnabled();
+	}
+
+	bool creating;
+	QGridLayout *grid = nullptr;
+	QWidget *fedByBox = nullptr;
+	QWidget *hlColumn = nullptr;
+	QWidget *hlOrderBox = nullptr;
+	QWidget *limitBox = nullptr;
+	QLabel *targetLabel = nullptr;
+	QLabel *orderLabel = nullptr;
+	QCheckBox *limitCheck = nullptr;
+	QSpinBox *limitSpin = nullptr;
+	QCheckBox *speedCheck = nullptr;
+	QSpinBox *speedSpin = nullptr;
+	WarpSegment *lengthMode = nullptr;
+	QSpinBox *lengthSpin = nullptr;
+	QHBoxLayout *tags = nullptr;
+	QPushButton *addLength = nullptr;
+	int listSection = 0;
+	int landsSection = 0;
+};
+
+namespace {
+
+QScrollArea *warp_scroll(QWidget *content, QWidget *parent)
+{
+	auto *scroll = new QScrollArea(parent);
+
+	scroll->setWidget(content);
+	scroll->setWidgetResizable(true);
+	scroll->setFrameShape(QFrame::NoFrame);
+	return scroll;
+}
+
+/* a link between flows, as the array they are saved as */
+obs_data_array_t *warp_link_array(const QStringList &links)
+{
+	obs_data_array_t *array = obs_data_array_create();
+
+	for (const QString &link : links) {
+		obs_data_t *item = obs_data_create();
+
+		obs_data_set_string(item, WARP_FLOW_LINK_ID, link.toUtf8().constData());
+		obs_data_array_push_back(array, item);
+		obs_data_release(item);
+	}
+
+	return array;
+}
+
+QStringList warp_links_of(obs_data_t *flow)
+{
+	QStringList links;
+	obs_data_array_t *array = obs_data_get_array(flow, WARP_FLOW_LINKS);
+
+	for (size_t i = 0; array && i < obs_data_array_count(array); i++) {
+		obs_data_t *item = obs_data_array_item(array, i);
+
+		links.append(QString::fromUtf8(obs_data_get_string(item, WARP_FLOW_LINK_ID)));
+		obs_data_release(item);
+	}
+
+	obs_data_array_release(array);
+	return links;
+}
+
+} // namespace
+
 /* ------------------------------------------------------------------------- */
 /* making flows */
 
 WarpFlowCreateDialog::WarpFlowCreateDialog(QWidget *parent) : QDialog(parent)
 {
 	setWindowTitle(warp_flow_text("Warp.Flow.Create.Title"));
-	resize(820, 560);
+	setMinimumSize(760, 520);
+	resize(980, 680);
 
+	/* the kinds, each with the first line of what it is */
 	kindList = new QListWidget(this);
-	kindList->setIconSize(QSize(36, 36));
-	kindList->setMinimumWidth(210);
-	kindList->setMaximumWidth(240);
-	kindList->setUniformItemSizes(false);
+	kindList->setIconSize(QSize(32, 32));
+	kindList->setFixedWidth(260);
+	kindList->setWordWrap(true);
+	kindList->setSpacing(3);
 
 	for (const WarpFlowKind &kind : warp_flow_kinds) {
-		auto *item = new QListWidgetItem(warp_flow_icon(kind.id), warp_flow_text(kind.name_key), kindList);
+		const QString first = warp_flow_text(kind.desc_key).section(QStringLiteral("\n\n"), 0, 0);
+		auto *item = new QListWidgetItem(warp_flow_icon(kind.id),
+						 warp_flow_text(kind.name_key) + QStringLiteral("\n") + first,
+						 kindList);
 
 		item->setData(Qt::UserRole, QString::fromUtf8(kind.id));
 	}
 
 	kindTitle = new QLabel(this);
-
 	QFont title_font = kindTitle->font();
 
 	title_font.setBold(true);
-	title_font.setPointSizeF(title_font.pointSizeF() * 1.2);
+	title_font.setPointSizeF(title_font.pointSizeF() * 1.25);
 	kindTitle->setFont(title_font);
 
 	kindDesc = new QLabel(this);
 	kindDesc->setWordWrap(true);
 	kindDesc->setTextFormat(Qt::PlainText);
-	kindDesc->setAlignment(Qt::AlignTop | Qt::AlignLeft);
-	kindDesc->setMinimumHeight(90);
 
-	form = new QFormLayout();
-	form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+	chain = new QLabel(this);
+	chain->setWordWrap(true);
+	chain->setTextFormat(Qt::PlainText);
 
 	nameEdit = new QLineEdit(this);
 	nameEdit->setPlaceholderText(warp_flow_text("Warp.Flow.Name.Placeholder"));
-	form->addRow(warp_flow_text("Warp.Flow.Name"), nameEdit);
+	settings = new WarpFlowSettings(this, nameEdit);
 
-	targetCombo = new QComboBox(this);
-	targetSourceId = QString::fromUtf8(WARP_PLAYLIST_SOURCE_ID);
-	warp_fill_target_combo(targetCombo, QString(), WARP_PLAYLIST_SOURCE_ID);
-	form->addRow(warp_flow_text("Warp.Flow.Target"), targetCombo);
-
-	newTargetEdit = new QLineEdit(this);
-	newTargetEdit->setPlaceholderText(warp_flow_text("Warp.Flow.Target.NewName.Placeholder"));
-	form->addRow(warp_flow_text("Warp.Flow.Target.NewName"), newTargetEdit);
-
-	hlTargetCombo = new QComboBox(this);
-	warp_fill_target_combo(hlTargetCombo, QString(), WARP_PLAYLIST_SOURCE_ID);
-	hlTargetCombo->setCurrentIndex(hlTargetCombo->count() - 1);
-	form->addRow(warp_flow_text("Warp.Flow.Target.Highlight"), hlTargetCombo);
-
-	hlNewTargetEdit = new QLineEdit(this);
-	hlNewTargetEdit->setPlaceholderText(warp_flow_text("Warp.Flow.Target.NewName.Placeholder"));
-	form->addRow(warp_flow_text("Warp.Flow.Target.Highlight.NewName"), hlNewTargetEdit);
-
-	fedByCombo = new QComboBox(this);
-	form->addRow(warp_flow_text("Warp.Flow.FedBy"), fedByCombo);
-
-	triggerCombo = new QComboBox(this);
-	warp_fill_trigger_combo(triggerCombo);
-	form->addRow(warp_flow_text("Warp.Flow.Trigger"), triggerCombo);
-
-	orderCombo = new QComboBox(this);
-	warp_fill_order_combo(orderCombo);
-	form->addRow(warp_flow_text("Warp.Flow.Order"), orderCombo);
-
-	hlOrderCombo = new QComboBox(this);
-	warp_fill_order_combo(hlOrderCombo);
-	form->addRow(warp_flow_text("Warp.Flow.Order.Highlight"), hlOrderCombo);
-
-	playbackCombo = new QComboBox(this);
-	warp_fill_playback_combo(playbackCombo);
-	form->addRow(warp_flow_text("Warp.Flow.Playback"), playbackCombo);
-
-	QWidget *speed_row = warp_speed_row(&speedCheck, &speedSpin, this);
-
-	form->addRow(warp_flow_text("Warp.Flow.Speed.Label"), speed_row);
-
-	QWidget *limit_row = warp_limit_row(&limitCheck, &limitSpin, this);
-
-	form->addRow(warp_flow_text("Warp.Flow.Limit.Label"), limit_row);
-
-	form->addRow(warp_flow_text("Warp.Flow.Length.Label"), warp_length_row(&lengthSpin, this));
-	form->addRow(warp_flow_text("Warp.Flow.Lengths.Label"), warp_lengths_row(&lengthsEdit, this));
-
-	/* the replay flows a highlight or instant replay list can be fed from */
-	fedByCombo->addItem(warp_flow_text("Warp.Flow.FedBy.None"), QString());
-
+	/* the replay flows a highlight or instant replay can be fed from */
 	obs_data_array_t *flows = warp_flow_list();
-	const size_t flow_count = obs_data_array_count(flows);
 
-	for (size_t i = 0; i < flow_count; i++) {
+	for (size_t i = 0; i < obs_data_array_count(flows); i++) {
 		obs_data_t *flow = obs_data_array_item(flows, i);
 
 		if (strcmp(obs_data_get_string(flow, WARP_FLOW_KIND), WARP_FLOW_KIND_REPLAY) == 0)
-			fedByCombo->addItem(QString::fromUtf8(obs_data_get_string(flow, WARP_FLOW_NAME)),
-					    QString::fromUtf8(obs_data_get_string(flow, WARP_FLOW_ID)));
+			settings->fedBy->addItem(QString::fromUtf8(obs_data_get_string(flow, WARP_FLOW_NAME)),
+						 QString::fromUtf8(obs_data_get_string(flow, WARP_FLOW_ID)));
 
 		obs_data_release(flow);
 	}
 
 	obs_data_array_release(flows);
 
-	auto *right = new QVBoxLayout();
+	auto *about = new QWidget(this);
+	auto *aboutColumn = new QVBoxLayout(about);
 
-	right->addWidget(kindTitle);
-	right->addWidget(kindDesc);
-	right->addWidget(warp_separator(this));
-	right->addLayout(form);
-	right->addStretch(1);
+	aboutColumn->addWidget(kindTitle);
+	aboutColumn->addWidget(kindDesc);
+	aboutColumn->addWidget(chain);
+
+	auto *page = new QWidget(this);
+	auto *pageColumn = new QVBoxLayout(page);
+
+	pageColumn->setContentsMargins(0, 0, 0, 0);
+	pageColumn->addWidget(about);
+	pageColumn->addWidget(settings, 1);
 
 	auto *columns = new QHBoxLayout();
 
 	columns->addWidget(kindList);
-	columns->addLayout(right, 1);
+	columns->addWidget(warp_scroll(page, this), 1);
 
-	auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+	summary = new QLabel(this);
+	summary->setWordWrap(true);
+	summary->setEnabled(false);
+	createButton = new QPushButton(this);
+	createButton->setDefault(true);
+	auto *cancelButton = new QPushButton(warp_flow_text("Warp.Flow.Cancel"), this);
 
-	connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
-	connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+	auto *footer = new QHBoxLayout();
+
+	footer->addWidget(summary, 1);
+	footer->addWidget(cancelButton);
+	footer->addWidget(createButton);
 
 	auto *layout = new QVBoxLayout(this);
 
 	layout->addLayout(columns, 1);
-	layout->addWidget(buttons);
+	layout->addLayout(footer);
 
-	connect(kindList, &QListWidget::currentRowChanged, this, [this](int) { kindChanged(); });
-	connect(targetCombo, &QComboBox::currentIndexChanged, this, [this](int) { targetChanged(); });
-	connect(hlTargetCombo, &QComboBox::currentIndexChanged, this, [this](int) { targetChanged(); });
+	connect(kindList, &QListWidget::currentRowChanged, this, [this](int) { refresh(); });
+	connect(nameEdit, &QLineEdit::textChanged, this, [this]() { refresh(); });
+	settings->changed = [this]() {
+		refresh();
+	};
+	connect(createButton, &QPushButton::clicked, this, &QDialog::accept);
+	connect(cancelButton, &QPushButton::clicked, this, &QDialog::reject);
 
 	kindList->setCurrentRow(0);
 	nameEdit->setFocus();
 }
 
-void WarpFlowCreateDialog::kindChanged()
+QString WarpFlowCreateDialog::kind() const
 {
 	QListWidgetItem *item = kindList->currentItem();
 
-	if (!item)
-		return;
+	return item ? item->data(Qt::UserRole).toString() : QString(WARP_FLOW_KIND_REPLAY);
+}
 
-	const QString kind = item->data(Qt::UserRole).toString();
-	const bool is_combo = kind == QString(WARP_FLOW_KIND_COMBO);
-	const bool is_highlight = kind == QString(WARP_FLOW_KIND_HIGHLIGHT);
-	const bool is_instant = kind == QString(WARP_FLOW_KIND_INSTANT);
+/* Says what the kind is, what the settings as they stand will make and the
+ * hotkeys it will add: the chain of where a clip goes, and the keys that run
+ * it, before anything is made. */
+void WarpFlowCreateDialog::refresh()
+{
+	const QString value = kind();
+	const bool combo = value == WARP_FLOW_KIND_COMBO;
+	const QString name = nameEdit->text().trimmed().isEmpty() ? warp_flow_text("Warp.Flow.Chain.This")
+								  : nameEdit->text().trimmed();
+	const QString arrow = QStringLiteral("  →  ");
 
 	for (const WarpFlowKind &entry : warp_flow_kinds) {
-		if (kind == QString::fromUtf8(entry.id)) {
+		if (value == QString::fromUtf8(entry.id)) {
 			kindTitle->setText(warp_flow_text(entry.name_key));
-			kindDesc->setText(warp_flow_text(entry.desc_key));
-			break;
+			kindDesc->setText(warp_flow_text(entry.desc_key).section(QStringLiteral("\n\n"), 1));
 		}
 	}
 
-	/* An instant replay is held in a Warp Media source, so the sources it is
-	 * picked from are different ones. Filled again only when the kind that
-	 * was picked feeds something other than the kind before it did, so
-	 * moving between the list kinds keeps whatever was chosen. */
-	const QString target_id = QString::fromUtf8(warp_flow_target_id(kind));
+	settings->setKind(value);
 
-	if (target_id != targetSourceId) {
-		targetSourceId = target_id;
-		warp_fill_target_combo(targetCombo, QString(), target_id.toUtf8().constData());
+	const QString from = value == WARP_FLOW_KIND_HIGHLIGHT && !settings->fedBy->currentData().toString().isEmpty()
+				     ? settings->fedBy->currentText()
+				     : warp_flow_text("Warp.Flow.Chain.Buffer");
+	QString text = from + arrow + name + arrow + settings->targetText(settings->target, settings->newTarget, name);
+
+	if (combo) {
+		const QString hl = name + " " + warp_flow_text("Warp.Flow.Combo.HighlightSuffix");
+
+		text += QStringLiteral("\n↳  ") + hl + arrow +
+			settings->targetText(settings->hlTarget, settings->hlNewTarget, hl);
 	}
 
-	warp_set_row_visible(form, hlTargetCombo, is_combo);
-	warp_set_row_visible(form, hlOrderCombo, is_combo);
-	warp_set_row_visible(form, fedByCombo, is_highlight || is_instant);
+	chain->setText(text);
 
-	/* one clip rather than a list: there is no end to add it to, and nothing
-	 * to drop when the list gets long */
-	warp_set_row_visible(form, orderCombo, !is_instant);
-	warp_set_row_visible(form, playbackCombo, is_instant);
-	warp_set_row_visible(form, speedCheck->parentWidget(), is_instant);
+	QStringList hotkeys = settings->saveHotkeys();
 
-	/* A highlight list keeps what it is given: the clips it is fed have
-	 * been picked out already, so a limit on it would throw them away. */
-	warp_set_row_visible(form, limitCheck->parentWidget(), !is_highlight && !is_instant);
-
-	if (auto *label = qobject_cast<QLabel *>(form->labelForField(targetCombo)))
-		label->setText(warp_flow_text(is_combo     ? "Warp.Flow.Target.Replay"
-					      : is_instant ? "Warp.Flow.Target.Instant"
-							   : "Warp.Flow.Target"));
-
-	targetChanged();
+	hotkeys.append(warp_flow_text("Warp.Window.Menu.AddLast"));
+	summary->setText(warp_flow_text(combo ? "Warp.Flow.Create.Hotkeys.Combo" : "Warp.Flow.Create.Hotkeys")
+				 .arg(hotkeys.join(QStringLiteral(", "))));
+	createButton->setText(warp_flow_text(combo ? "Warp.Flow.Create.AddBoth" : "Warp.Flow.Create.Add"));
 }
 
-void WarpFlowCreateDialog::targetChanged()
-{
-	QListWidgetItem *item = kindList->currentItem();
-	const QString kind = item ? item->data(Qt::UserRole).toString() : QString();
-	const bool is_combo = kind == QString(WARP_FLOW_KIND_COMBO);
-
-	warp_set_row_visible(form, newTargetEdit, targetCombo->currentData().toString().isEmpty());
-	warp_set_row_visible(form, hlNewTargetEdit, is_combo && hlTargetCombo->currentData().toString().isEmpty());
-}
-
-bool WarpFlowCreateDialog::buildFlow(const char *kind, const QString &name, QComboBox *target_combo,
-				     QLineEdit *new_target_edit, const char *trigger, const char *order, int max_clips,
-				     const QList<int> &lengths, const QStringList &links, QString &flow_id)
+bool WarpFlowCreateDialog::buildFlow(const char *kind, const QString &name, bool highlight, const char *trigger,
+				     const char *order, int max_clips, const QList<int> &lengths,
+				     const QStringList &links, QString &flow_id)
 {
 	QString uuid;
 	QString target_name;
-
 	const char *target_id = warp_flow_target_id(QString::fromUtf8(kind));
 
-	if (!warp_resolve_target(this, target_combo, new_target_edit, name, target_id, uuid, target_name))
+	if (!warp_resolve_target(this, highlight ? settings->hlTarget : settings->target,
+				 highlight ? settings->hlNewTarget : settings->newTarget, name, target_id, uuid,
+				 target_name))
 		return false;
 
 	obs_data_t *config = obs_data_create();
@@ -801,31 +1201,12 @@ bool WarpFlowCreateDialog::buildFlow(const char *kind, const QString &name, QCom
 	obs_data_set_int(config, WARP_FLOW_MAX_CLIPS, max_clips);
 	obs_data_set_bool(config, WARP_FLOW_ENABLED, true);
 
-	/* how much of the buffer a clip is, and the lengths this flow offers on
-	 * top of that: the pair a Combo makes keeps the same length either
-	 * side, and it is the replay list that takes the saves, so the length
-	 * hotkeys are its */
-	obs_data_set_int(config, WARP_FLOW_LENGTH, lengthSpin->value());
+	/* the pair a Combo makes keeps the same length either side, and it is
+	 * the replay list that takes the saves, so the length hotkeys are its */
+	settings->write(config, warp_flow_target_is_media(target_id));
 	warp_set_lengths(config, lengths);
 
-	/* what playback does with a clip, and how fast, is the instant replay
-	 * flow's alone: the list kinds put a clip in a list and leave playback
-	 * where it was */
-	if (warp_flow_target_is_media(target_id)) {
-		obs_data_set_string(config, WARP_FLOW_PLAYBACK,
-				    playbackCombo->currentData().toString().toUtf8().constData());
-		obs_data_set_int(config, WARP_FLOW_SPEED, speedCheck->isChecked() ? speedSpin->value() : 0);
-	}
-
-	obs_data_array_t *link_array = obs_data_array_create();
-
-	for (const QString &link : links) {
-		obs_data_t *item = obs_data_create();
-
-		obs_data_set_string(item, WARP_FLOW_LINK_ID, link.toUtf8().constData());
-		obs_data_array_push_back(link_array, item);
-		obs_data_release(item);
-	}
+	obs_data_array_t *link_array = warp_link_array(links);
 
 	obs_data_set_array(config, WARP_FLOW_LINKS, link_array);
 	obs_data_array_release(link_array);
@@ -839,7 +1220,6 @@ bool WarpFlowCreateDialog::buildFlow(const char *kind, const QString &name, QCom
 
 	flow_id = QString::fromUtf8(id);
 	bfree(id);
-
 	created.append(flow_id);
 
 	return true;
@@ -857,17 +1237,7 @@ void WarpFlowCreateDialog::linkFedBy(const QString &fedBy, const QString &flowId
 	if (!source_flow)
 		return;
 
-	obs_data_array_t *links = obs_data_get_array(source_flow, WARP_FLOW_LINKS);
-
-	if (!links)
-		links = obs_data_array_create();
-
-	obs_data_t *link = obs_data_create();
-
-	obs_data_set_string(link, WARP_FLOW_LINK_ID, flowId.toUtf8().constData());
-	obs_data_array_push_back(links, link);
-	obs_data_release(link);
-
+	obs_data_array_t *links = warp_link_array(warp_links_of(source_flow) << flowId);
 	obs_data_t *update = obs_data_create();
 
 	obs_data_set_array(update, WARP_FLOW_LINKS, links);
@@ -880,12 +1250,7 @@ void WarpFlowCreateDialog::linkFedBy(const QString &fedBy, const QString &flowId
 
 void WarpFlowCreateDialog::accept()
 {
-	QListWidgetItem *item = kindList->currentItem();
-
-	if (!item)
-		return;
-
-	const QString kind = item->data(Qt::UserRole).toString();
+	const QString value = kind();
 	const QString name = nameEdit->text().trimmed();
 
 	if (name.isEmpty()) {
@@ -898,18 +1263,12 @@ void WarpFlowCreateDialog::accept()
 	if (!warp_flow_name_free(this, name, QString()))
 		return;
 
-	const QByteArray trigger = triggerCombo->currentData().toString().toUtf8();
-	const QByteArray order = orderCombo->currentData().toString().toUtf8();
-	const QByteArray hl_order = hlOrderCombo->currentData().toString().toUtf8();
-	const int max_clips = limitCheck->isChecked() ? limitSpin->value() : 0;
-	QList<int> lengths;
+	const QByteArray trigger = settings->takes->value().toUtf8();
+	const QByteArray order = settings->order->value().toUtf8();
+	const QByteArray hl_order = settings->hlOrder->value().toUtf8();
+	const QList<int> lengths = settings->lengths;
 
-	if (!warp_parse_lengths(this, warp_flow_text("Warp.Flow.Create.Title"), lengthsEdit->text(), lengths)) {
-		lengthsEdit->setFocus();
-		return;
-	}
-
-	if (kind == QString(WARP_FLOW_KIND_COMBO)) {
+	if (value == WARP_FLOW_KIND_COMBO) {
 		const QString hl_name = name + QStringLiteral(" ") + warp_flow_text("Warp.Flow.Combo.HighlightSuffix");
 		QString hl_id;
 		QString replay_id;
@@ -919,12 +1278,12 @@ void WarpFlowCreateDialog::accept()
 
 		/* the highlight list first: the replay list is made linked to
 		 * it, so the pair works from the moment it is there */
-		if (!buildFlow(WARP_FLOW_KIND_HIGHLIGHT, hl_name, hlTargetCombo, hlNewTargetEdit,
-			       WARP_FLOW_TRIGGER_HOTKEY, hl_order.constData(), 0, QList<int>(), QStringList(), hl_id))
+		if (!buildFlow(WARP_FLOW_KIND_HIGHLIGHT, hl_name, true, WARP_FLOW_TRIGGER_HOTKEY, hl_order.constData(),
+			       0, QList<int>(), QStringList(), hl_id))
 			return;
 
-		if (!buildFlow(WARP_FLOW_KIND_REPLAY, name, targetCombo, newTargetEdit, trigger.constData(),
-			       order.constData(), max_clips, lengths, QStringList() << hl_id, replay_id)) {
+		if (!buildFlow(WARP_FLOW_KIND_REPLAY, name, false, trigger.constData(), order.constData(),
+			       settings->maxClips(), lengths, QStringList() << hl_id, replay_id)) {
 			/* the highlight list was made for a pair that did not
 			 * come off, so it goes back with it */
 			for (const QString &made : created)
@@ -933,21 +1292,21 @@ void WarpFlowCreateDialog::accept()
 			created.clear();
 			return;
 		}
-	} else if (kind == QString(WARP_FLOW_KIND_HIGHLIGHT) || kind == QString(WARP_FLOW_KIND_INSTANT)) {
-		const QByteArray flow_kind = kind.toUtf8();
+	} else if (value == WARP_FLOW_KIND_HIGHLIGHT || value == WARP_FLOW_KIND_INSTANT) {
+		const QByteArray flow_kind = value.toUtf8();
 		QString flow_id;
 
-		if (!buildFlow(flow_kind.constData(), name, targetCombo, newTargetEdit, trigger.constData(),
-			       order.constData(), 0, lengths, QStringList(), flow_id))
+		if (!buildFlow(flow_kind.constData(), name, false, trigger.constData(), order.constData(), 0, lengths,
+			       QStringList(), flow_id))
 			return;
 
 		/* fed by a replay flow: it is that flow that has to be told */
-		linkFedBy(fedByCombo->currentData().toString(), flow_id);
+		linkFedBy(settings->fedBy->currentData().toString(), flow_id);
 	} else {
 		QString flow_id;
 
-		if (!buildFlow(WARP_FLOW_KIND_REPLAY, name, targetCombo, newTargetEdit, trigger.constData(),
-			       order.constData(), max_clips, lengths, QStringList(), flow_id))
+		if (!buildFlow(WARP_FLOW_KIND_REPLAY, name, false, trigger.constData(), order.constData(),
+			       settings->maxClips(), lengths, QStringList(), flow_id))
 			return;
 	}
 
@@ -961,131 +1320,185 @@ WarpFlowPropsDialog::WarpFlowPropsDialog(QWidget *parent, const QString &id) : Q
 {
 	obs_data_t *config = warp_flow_get(id.toUtf8().constData());
 
+	kind = QString::fromUtf8(config ? obs_data_get_string(config, WARP_FLOW_KIND) : WARP_FLOW_KIND_REPLAY);
+	obs_data_release(config);
+
 	setWindowTitle(warp_flow_text("Warp.Flow.Props.Title"));
-	resize(560, 520);
+	setMinimumSize(720, 500);
+	resize(960, 640);
 
-	const char *kind = config ? obs_data_get_string(config, WARP_FLOW_KIND) : WARP_FLOW_KIND_REPLAY;
-	const bool is_highlight = strcmp(kind, WARP_FLOW_KIND_HIGHLIGHT) == 0;
-
-	isInstant = strcmp(kind, WARP_FLOW_KIND_INSTANT) == 0;
-	targetSourceId = QString::fromUtf8(warp_flow_target_id(QString::fromUtf8(kind)));
-
-	auto *header = new QHBoxLayout();
+	/* who the flow is: its name, what it is and how it is doing, and
+	 * whether it takes clips */
 	auto *icon = new QLabel(this);
 
-	icon->setPixmap(warp_flow_icon(kind).pixmap(32, 32));
-
-	auto *kind_label = new QLabel(warp_flow_kind_name(kind), this);
-	QFont kind_font = kind_label->font();
-
-	kind_font.setBold(true);
-	kind_label->setFont(kind_font);
-
-	header->addWidget(icon);
-	header->addWidget(kind_label);
-	header->addStretch(1);
-
-	form = new QFormLayout();
-	form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+	icon->setPixmap(warp_flow_icon(kind.toUtf8().constData()).pixmap(QSize(36, 36), devicePixelRatioF()));
 
 	nameEdit = new QLineEdit(this);
-	nameEdit->setText(QString::fromUtf8(config ? obs_data_get_string(config, WARP_FLOW_NAME) : ""));
-	form->addRow(warp_flow_text("Warp.Flow.Name"), nameEdit);
+	QFont name_font = nameEdit->font();
 
-	targetCombo = new QComboBox(this);
-	warp_fill_target_combo(targetCombo,
-			       QString::fromUtf8(config ? obs_data_get_string(config, WARP_FLOW_TARGET_UUID) : ""),
-			       targetSourceId.toUtf8().constData());
-	form->addRow(warp_flow_text(isInstant ? "Warp.Flow.Target.Instant" : "Warp.Flow.Target"), targetCombo);
+	name_font.setBold(true);
+	name_font.setPointSizeF(name_font.pointSizeF() * 1.3);
+	nameEdit->setFont(name_font);
+	nameEdit->setMaximumWidth(420);
 
-	newTargetEdit = new QLineEdit(this);
-	newTargetEdit->setPlaceholderText(warp_flow_text("Warp.Flow.Target.NewName.Placeholder"));
-	form->addRow(warp_flow_text("Warp.Flow.Target.NewName"), newTargetEdit);
+	status = new QLabel(this);
+	status->setEnabled(false);
 
-	triggerCombo = new QComboBox(this);
-	warp_fill_trigger_combo(triggerCombo);
-	warp_select_data(triggerCombo, QString::fromUtf8(config ? obs_data_get_string(config, WARP_FLOW_TRIGGER) : ""));
-	form->addRow(warp_flow_text("Warp.Flow.Trigger"), triggerCombo);
+	enabledText = new QLabel(this);
+	enabledSwitch = new WarpSwitch(this);
 
-	orderCombo = new QComboBox(this);
-	warp_fill_order_combo(orderCombo);
-	warp_select_data(orderCombo, QString::fromUtf8(config ? obs_data_get_string(config, WARP_FLOW_ORDER) : ""));
-	form->addRow(warp_flow_text("Warp.Flow.Order"), orderCombo);
-	warp_set_row_visible(form, orderCombo, !isInstant);
+	auto *identity = new QVBoxLayout();
 
-	/* one clip at a time: what there is to say about it is what playback
-	 * does with it once it is in, and how fast it is played */
-	playbackCombo = new QComboBox(this);
-	warp_fill_playback_combo(playbackCombo);
-	warp_select_data(playbackCombo,
-			 QString::fromUtf8(config ? obs_data_get_string(config, WARP_FLOW_PLAYBACK) : ""));
-	form->addRow(warp_flow_text("Warp.Flow.Playback"), playbackCombo);
-	warp_set_row_visible(form, playbackCombo, isInstant);
+	identity->addWidget(nameEdit);
+	identity->addWidget(status);
 
-	QWidget *speed_row = warp_speed_row(&speedCheck, &speedSpin, this);
-	const int speed = config ? (int)obs_data_get_int(config, WARP_FLOW_SPEED) : 0;
+	auto *header = new QHBoxLayout();
 
-	speedCheck->setChecked(speed > 0);
+	header->addWidget(icon, 0, Qt::AlignTop);
+	header->addLayout(identity, 1);
+	header->addWidget(enabledText);
+	header->addWidget(enabledSwitch);
 
-	if (speed > 0)
-		speedSpin->setValue(speed);
+	/* the sections down the side, and what is in them */
+	sections = new QListWidget(this);
+	sections->setFixedWidth(180);
+	sections->addItems({warp_flow_text("Warp.Flow.Props.Settings"), warp_flow_text("Warp.Flow.Props.Links"),
+			    warp_flow_text("Warp.Flow.Props.Hotkeys")});
 
-	form->addRow(warp_flow_text("Warp.Flow.Speed.Label"), speed_row);
-	warp_set_row_visible(form, speed_row, isInstant);
+	settings = new WarpFlowSettings(this, nullptr);
+	settings->setKind(kind);
 
-	QWidget *limit_row = warp_limit_row(&limitCheck, &limitSpin, this);
-	const int max_clips = config ? (int)obs_data_get_int(config, WARP_FLOW_MAX_CLIPS) : 0;
+	auto *links = new QWidget(this);
+	auto *linksColumn = new QVBoxLayout(links);
+	auto *linksDesc = new QLabel(warp_flow_text("Warp.Flow.Links.Desc"), links);
 
-	limitCheck->setChecked(max_clips > 0);
+	linkList = new QListWidget(links);
+	linkList->setIconSize(QSize(24, 24));
+	fedBy = new QLabel(links);
+	fedBy->setWordWrap(true);
+	linksDesc->setWordWrap(true);
+	linksColumn->addWidget(warp_section_title(warp_flow_text("Warp.Flow.Links"), links));
+	linksColumn->addWidget(linksDesc);
+	linksColumn->addWidget(linkList, 1);
+	linksColumn->addWidget(warp_section_title(warp_flow_text("Warp.Flow.Props.FedBy"), links));
+	linksColumn->addWidget(fedBy);
 
-	if (max_clips > 0)
-		limitSpin->setValue(max_clips);
+	auto *hotkeys = new QWidget(this);
+	auto *hotkeysColumn = new QVBoxLayout(hotkeys);
+	auto *hotkeysDesc = new QLabel(warp_flow_text("Warp.Flow.Props.Hotkeys.Desc"), hotkeys);
 
-	form->addRow(warp_flow_text("Warp.Flow.Limit.Label"), limit_row);
-	warp_set_row_visible(form, limit_row, !is_highlight && !isInstant);
+	hotkeysDesc->setWordWrap(true);
+	hotkeyForm = new QFormLayout();
+	hotkeyForm->setHorizontalSpacing(24);
+	hotkeysColumn->addWidget(warp_section_title(warp_flow_text("Warp.Flow.Props.Hotkeys"), hotkeys));
+	hotkeysColumn->addWidget(hotkeysDesc);
+	hotkeysColumn->addLayout(hotkeyForm);
+	hotkeysColumn->addStretch(1);
 
-	form->addRow(warp_flow_text("Warp.Flow.Length.Label"), warp_length_row(&lengthSpin, this));
-	lengthSpin->setValue(config ? (int)obs_data_get_int(config, WARP_FLOW_LENGTH) : WARP_FLOW_LENGTH_WHOLE);
+	auto *pages = new QStackedWidget(this);
 
-	form->addRow(warp_flow_text("Warp.Flow.Lengths.Label"), warp_lengths_row(&lengthsEdit, this));
-	lengthsEdit->setText(warp_lengths_text(config));
+	pages->addWidget(warp_scroll(settings, this));
+	pages->addWidget(links);
+	pages->addWidget(hotkeys);
 
-	enabledCheck = new QCheckBox(warp_flow_text("Warp.Flow.Enabled"), this);
-	enabledCheck->setChecked(config ? obs_data_get_bool(config, WARP_FLOW_ENABLED) : true);
-	form->addRow(QString(), enabledCheck);
+	auto *body = new QHBoxLayout();
 
-	/* the flows this one hands every clip it takes on to */
-	linkList = new QListWidget(this);
-	linkList->setIconSize(QSize(20, 20));
+	body->addWidget(sections);
+	body->addWidget(pages, 1);
 
-	QStringList linked;
-	obs_data_array_t *links = config ? obs_data_get_array(config, WARP_FLOW_LINKS) : nullptr;
-	const size_t link_count = links ? obs_data_array_count(links) : 0;
+	/* the footer */
+	dirtyLabel = new QLabel(this);
+	revertButton = new QPushButton(warp_flow_text("Warp.Flow.Revert"), this);
+	applyButton = new QPushButton(warp_flow_text("Warp.Flow.Apply"), this);
+	applyButton->setDefault(true);
+	auto *closeButton = new QPushButton(warp_flow_text("Warp.Flow.Close"), this);
+	auto *footer = new QHBoxLayout();
 
-	for (size_t i = 0; i < link_count; i++) {
-		obs_data_t *item = obs_data_array_item(links, i);
+	footer->addWidget(dirtyLabel, 1);
+	footer->addWidget(revertButton);
+	footer->addWidget(applyButton);
+	footer->addSpacing(12);
+	footer->addWidget(closeButton);
 
-		linked.append(QString::fromUtf8(obs_data_get_string(item, WARP_FLOW_LINK_ID)));
-		obs_data_release(item);
-	}
+	auto *layout = new QVBoxLayout(this);
 
-	obs_data_array_release(links);
+	layout->addLayout(header);
+	layout->addLayout(body, 1);
+	layout->addLayout(footer);
 
+	auto changed = [this]() {
+		setDirty(true);
+	};
+
+	settings->changed = changed;
+	connect(nameEdit, &QLineEdit::textEdited, this, changed);
+	connect(enabledSwitch, &QAbstractButton::toggled, this, [this, changed](bool on) {
+		enabledText->setText(warp_flow_text(on ? "Warp.Flow.Props.On" : "Warp.Flow.Props.Off"));
+		changed();
+	});
+	connect(linkList, &QListWidget::itemChanged, this, changed);
+	connect(sections, &QListWidget::currentRowChanged, pages, &QStackedWidget::setCurrentIndex);
+	connect(revertButton, &QPushButton::clicked, this, [this]() { load(); });
+	connect(applyButton, &QPushButton::clicked, this, [this]() { apply(); });
+	connect(closeButton, &QPushButton::clicked, this, &QDialog::close);
+
+	/* the clip count moves as clips land */
+	auto *timer = new QTimer(this);
+
+	connect(timer, &QTimer::timeout, this, [this]() { refreshStatus(); });
+	timer->start(1000);
+
+	sections->setCurrentRow(0);
+	load();
+}
+
+/* Puts the flow as it is saved into every field, which is also what Revert
+ * does. */
+void WarpFlowPropsDialog::load()
+{
+	obs_data_t *config = warp_flow_get(flowId.toUtf8().constData());
+
+	if (!config)
+		return;
+
+	loading = true;
+
+	nameEdit->setText(QString::fromUtf8(obs_data_get_string(config, WARP_FLOW_NAME)));
+	enabledSwitch->setChecked(obs_data_get_bool(config, WARP_FLOW_ENABLED));
+	enabledText->setText(warp_flow_text(enabledSwitch->isChecked() ? "Warp.Flow.Props.On" : "Warp.Flow.Props.Off"));
+	settings->load(config);
+
+	/* the flows this one hands its clips to, and the ones that hand theirs
+	 * to it */
+	const QStringList linked = warp_links_of(config);
+	QStringList feeders;
 	obs_data_array_t *flows = warp_flow_list();
-	const size_t flow_count = obs_data_array_count(flows);
 
-	for (size_t i = 0; i < flow_count; i++) {
+	linkList->clear();
+
+	for (size_t i = 0; i < obs_data_array_count(flows); i++) {
 		obs_data_t *flow = obs_data_array_item(flows, i);
-		const QString other_id = QString::fromUtf8(obs_data_get_string(flow, WARP_FLOW_ID));
+		const QString other = QString::fromUtf8(obs_data_get_string(flow, WARP_FLOW_ID));
+		const char *other_kind = obs_data_get_string(flow, WARP_FLOW_KIND);
 
-		if (other_id != flowId) {
-			auto *item = new QListWidgetItem(warp_flow_icon(obs_data_get_string(flow, WARP_FLOW_KIND)),
-							 QString::fromUtf8(obs_data_get_string(flow, WARP_FLOW_NAME)),
+		if (other != flowId) {
+			const QString line = warp_flow_kind_name(other_kind) + QStringLiteral("  ·  ") +
+					     QString::fromUtf8(obs_data_get_string(flow, WARP_FLOW_TARGET_NAME)) +
+					     QStringLiteral("  ·  ") +
+					     warp_flow_text(obs_data_get_bool(flow, WARP_FLOW_ENABLED)
+								    ? "Warp.Flow.Props.On.Short"
+								    : "Warp.Flow.Props.Off.Short");
+			auto *item = new QListWidgetItem(warp_flow_icon(other_kind),
+							 QString::fromUtf8(obs_data_get_string(flow, WARP_FLOW_NAME)) +
+								 QStringLiteral("\n") + line,
 							 linkList);
 
-			item->setData(Qt::UserRole, other_id);
+			item->setData(Qt::UserRole, other);
 			item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
-			item->setCheckState(linked.contains(other_id) ? Qt::Checked : Qt::Unchecked);
+			item->setCheckState(linked.contains(other) ? Qt::Checked : Qt::Unchecked);
+
+			if (warp_links_of(flow).contains(flowId))
+				feeders.append(QString::fromUtf8(obs_data_get_string(flow, WARP_FLOW_NAME)));
 		}
 
 		obs_data_release(flow);
@@ -1093,40 +1506,85 @@ WarpFlowPropsDialog::WarpFlowPropsDialog(QWidget *parent, const QString &id) : Q
 
 	obs_data_array_release(flows);
 
-	auto *links_label = new QLabel(warp_flow_text("Warp.Flow.Links"), this);
-	auto *links_desc = new QLabel(warp_flow_text("Warp.Flow.Links.Desc"), this);
+	fedBy->setText(feeders.isEmpty() ? warp_flow_text("Warp.Flow.Props.FedBy.None")
+					 : feeders.join(QStringLiteral(", ")));
+	sections->item(1)->setText(warp_flow_text("Warp.Flow.Props.Links") +
+				   QStringLiteral("  (%1)").arg(linked.size()));
 
-	links_desc->setWordWrap(true);
-	links_desc->setTextFormat(Qt::PlainText);
+	/* the keys that run it, as they are bound right now */
+	const QMap<obs_hotkey_id, QStringList> keys = warp_bound_keys();
+	struct warp_flow_hotkeys hotkeys;
+	int rows = 0;
 
-	auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+	while (hotkeyForm->rowCount())
+		hotkeyForm->removeRow(0);
 
-	connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
-	connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+	auto keyRow = [&](const QString &label, obs_hotkey_id id) {
+		const QString key = warp_key_text(keys, id);
+		auto *value = new QLabel(key.isEmpty() ? warp_flow_text("Warp.Window.Hotkey.Unset") : key, this);
 
-	auto *layout = new QVBoxLayout(this);
+		value->setEnabled(!key.isEmpty());
+		hotkeyForm->addRow(label, value);
+		rows++;
+	};
 
-	layout->addLayout(header);
-	layout->addWidget(warp_separator(this));
-	layout->addLayout(form);
-	layout->addWidget(links_label);
-	layout->addWidget(links_desc);
-	layout->addWidget(linkList, 1);
-	layout->addWidget(buttons);
+	if (warp_flow_get_hotkeys(flowId.toUtf8().constData(), &hotkeys)) {
+		keyRow(warp_flow_text("Warp.Window.Menu.Save"), hotkeys.save);
+		for (size_t i = 0; i < hotkeys.lengths_num; i++)
+			keyRow(warp_flow_text("Warp.Window.Menu.SaveLength")
+				       .arg(warp_length_label(hotkeys.length_seconds[i])),
+			       hotkeys.length_hotkeys[i]);
+		keyRow(warp_flow_text("Warp.Window.Menu.AddLast"), hotkeys.promote);
+	}
 
-	connect(targetCombo, &QComboBox::currentIndexChanged, this, [this](int) { targetChanged(); });
+	sections->item(2)->setText(warp_flow_text("Warp.Flow.Props.Hotkeys") + QStringLiteral("  (%1)").arg(rows));
 
-	targetChanged();
+	obs_data_release(config);
 
+	loading = false;
+	setDirty(false);
+	refreshStatus();
+}
+
+void WarpFlowPropsDialog::refreshStatus()
+{
+	obs_data_t *config = warp_flow_get(flowId.toUtf8().constData());
+
+	if (!config)
+		return;
+
+	const QString target = QString::fromUtf8(obs_data_get_string(config, WARP_FLOW_TARGET_NAME));
+	const int clips = warp_flow_clip_count(flowId.toUtf8().constData());
+	const int max = (int)obs_data_get_int(config, WARP_FLOW_MAX_CLIPS);
+	QString text;
+
+	if (clips < 0)
+		text = warp_flow_text("Warp.Window.Feeds.Gone").arg(target);
+	else if (kind == WARP_FLOW_KIND_INSTANT)
+		text = warp_flow_text("Warp.Flow.Props.LoadsInto").arg(target) + QStringLiteral("  ·  ") +
+		       warp_flow_text(clips > 0 ? "Warp.Window.Clips.Loaded" : "Warp.Window.Clips.Empty");
+	else
+		text = warp_flow_text("Warp.Flow.Props.Feeds").arg(target) + QStringLiteral("  ·  ") +
+		       (max > 0 ? warp_flow_text("Warp.Flow.Props.ClipsOf").arg(clips).arg(max)
+				: warp_flow_text("Warp.Flow.Props.Clips").arg(clips));
+
+	status->setText(warp_flow_kind_name(kind.toUtf8().constData()) + QStringLiteral("  ·  ") + text);
 	obs_data_release(config);
 }
 
-void WarpFlowPropsDialog::targetChanged()
+void WarpFlowPropsDialog::setDirty(bool value)
 {
-	warp_set_row_visible(form, newTargetEdit, targetCombo->currentData().toString().isEmpty());
+	if (loading)
+		return;
+
+	dirty = value;
+	dirtyLabel->setText(warp_flow_text(dirty ? "Warp.Flow.Props.Unapplied" : "Warp.Flow.Props.Applied"));
+	dirtyLabel->setEnabled(dirty);
+	revertButton->setEnabled(dirty);
+	applyButton->setEnabled(dirty);
 }
 
-void WarpFlowPropsDialog::accept()
+bool WarpFlowPropsDialog::apply()
 {
 	const QString name = nameEdit->text().trimmed();
 
@@ -1134,64 +1592,66 @@ void WarpFlowPropsDialog::accept()
 		QMessageBox::warning(this, warp_flow_text("Warp.Flow.Props.Title"),
 				     warp_flow_text("Warp.Flow.Error.NameEmpty"));
 		nameEdit->setFocus();
-		return;
+		return false;
 	}
 
 	if (!warp_flow_name_free(this, name, flowId))
-		return;
-
-	QList<int> lengths;
-
-	if (!warp_parse_lengths(this, warp_flow_text("Warp.Flow.Props.Title"), lengthsEdit->text(), lengths)) {
-		lengthsEdit->setFocus();
-		return;
-	}
+		return false;
 
 	QString uuid;
 	QString target_name;
 
-	if (!warp_resolve_target(this, targetCombo, newTargetEdit, name, targetSourceId.toUtf8().constData(), uuid,
-				 target_name))
-		return;
+	if (!warp_resolve_target(this, settings->target, settings->newTarget, name,
+				 settings->targetSourceId.toUtf8().constData(), uuid, target_name))
+		return false;
+
+	QStringList links;
+
+	for (int i = 0; i < linkList->count(); i++) {
+		if (linkList->item(i)->checkState() == Qt::Checked)
+			links.append(linkList->item(i)->data(Qt::UserRole).toString());
+	}
 
 	obs_data_t *config = obs_data_create();
+	obs_data_array_t *link_array = warp_link_array(links);
 
 	obs_data_set_string(config, WARP_FLOW_NAME, name.toUtf8().constData());
 	obs_data_set_string(config, WARP_FLOW_TARGET_UUID, uuid.toUtf8().constData());
 	obs_data_set_string(config, WARP_FLOW_TARGET_NAME, target_name.toUtf8().constData());
-	obs_data_set_string(config, WARP_FLOW_TRIGGER, triggerCombo->currentData().toString().toUtf8().constData());
-	obs_data_set_string(config, WARP_FLOW_ORDER, orderCombo->currentData().toString().toUtf8().constData());
-	obs_data_set_int(config, WARP_FLOW_MAX_CLIPS, limitCheck->isChecked() ? limitSpin->value() : 0);
-	obs_data_set_bool(config, WARP_FLOW_ENABLED, enabledCheck->isChecked());
-	obs_data_set_int(config, WARP_FLOW_LENGTH, lengthSpin->value());
-	warp_set_lengths(config, lengths);
-
-	if (isInstant) {
-		obs_data_set_string(config, WARP_FLOW_PLAYBACK,
-				    playbackCombo->currentData().toString().toUtf8().constData());
-		obs_data_set_int(config, WARP_FLOW_SPEED, speedCheck->isChecked() ? speedSpin->value() : 0);
-	}
-
-	obs_data_array_t *links = obs_data_array_create();
-
-	for (int i = 0; i < linkList->count(); i++) {
-		QListWidgetItem *item = linkList->item(i);
-
-		if (item->checkState() != Qt::Checked)
-			continue;
-
-		obs_data_t *link = obs_data_create();
-
-		obs_data_set_string(link, WARP_FLOW_LINK_ID, item->data(Qt::UserRole).toString().toUtf8().constData());
-		obs_data_array_push_back(links, link);
-		obs_data_release(link);
-	}
-
-	obs_data_set_array(config, WARP_FLOW_LINKS, links);
-	obs_data_array_release(links);
+	obs_data_set_string(config, WARP_FLOW_TRIGGER, settings->takes->value().toUtf8().constData());
+	obs_data_set_string(config, WARP_FLOW_ORDER, settings->order->value().toUtf8().constData());
+	obs_data_set_int(config, WARP_FLOW_MAX_CLIPS, settings->maxClips());
+	obs_data_set_bool(config, WARP_FLOW_ENABLED, enabledSwitch->isChecked());
+	obs_data_set_array(config, WARP_FLOW_LINKS, link_array);
+	settings->write(config, kind == WARP_FLOW_KIND_INSTANT);
 
 	warp_flow_update(flowId.toUtf8().constData(), config);
+
+	obs_data_array_release(link_array);
 	obs_data_release(config);
 
-	QDialog::accept();
+	load();
+	return true;
+}
+
+/* Unapplied changes are applied or let go of before the window goes. */
+void WarpFlowPropsDialog::closeEvent(QCloseEvent *event)
+{
+	if (dirty) {
+		const auto answer = QMessageBox::question(
+			this, windowTitle(), warp_flow_text("Warp.Flow.Props.Leave").arg(nameEdit->text().trimmed()),
+			QMessageBox::Apply | QMessageBox::Discard | QMessageBox::Cancel, QMessageBox::Apply);
+
+		if (answer == QMessageBox::Cancel || (answer == QMessageBox::Apply && !apply())) {
+			event->ignore();
+			return;
+		}
+	}
+
+	event->accept();
+}
+
+void WarpFlowPropsDialog::reject()
+{
+	close();
 }

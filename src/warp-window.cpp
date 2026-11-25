@@ -160,15 +160,6 @@ QIcon warp_buffer_icon(bool active)
 /* ------------------------------------------------------------------------- */
 /* what a flow is, said short */
 
-QString warp_length_label(int seconds)
-{
-	char label[WARP_FLOW_LENGTH_LABEL_SIZE];
-
-	warp_flow_length_label(seconds, label, sizeof(label));
-
-	return QString::fromUtf8(label);
-}
-
 /* the lengths a flow offers on top of its own, in seconds */
 QList<int> warp_other_lengths(obs_data_t *flow)
 {
@@ -291,40 +282,6 @@ QString warp_playback_name(const char *playback)
 /* ------------------------------------------------------------------------- */
 /* hotkeys */
 
-/* Every key bound to anything, by the hotkey it is bound to, as the hotkey
- * settings would write it: "Shift+F9". A hotkey bound to more than one key has
- * them all, in the order they were bound. */
-QMap<obs_hotkey_id, QStringList> warp_bound_keys()
-{
-	QMap<obs_hotkey_id, QStringList> keys;
-
-	obs_enum_hotkey_bindings(
-		[](void *data, size_t, obs_hotkey_binding_t *binding) {
-			auto *map = static_cast<QMap<obs_hotkey_id, QStringList> *>(data);
-			const obs_key_combination_t combination = obs_hotkey_binding_get_key_combination(binding);
-			struct dstr text = {};
-
-			obs_key_combination_to_str(combination, &text);
-
-			if (text.array && *text.array)
-				(*map)[obs_hotkey_binding_get_hotkey_id(binding)].append(QString::fromUtf8(text.array));
-
-			dstr_free(&text);
-			return true;
-		},
-		&keys);
-
-	return keys;
-}
-
-QString warp_key_text(const QMap<obs_hotkey_id, QStringList> &keys, obs_hotkey_id id)
-{
-	if (id == OBS_INVALID_HOTKEY_ID)
-		return QString();
-
-	return keys.value(id).join(QStringLiteral(" / "));
-}
-
 /* ------------------------------------------------------------------------- */
 /* how long ago */
 
@@ -342,53 +299,6 @@ QString warp_ago(uint64_t then_ns)
 
 	return warp_flow_text("Warp.Window.Ago.Hours").arg(seconds / 3600);
 }
-
-/* ------------------------------------------------------------------------- */
-/* the switch a flow is turned on and off with */
-
-class WarpSwitch : public QAbstractButton {
-public:
-	explicit WarpSwitch(QWidget *parent) : QAbstractButton(parent)
-	{
-		setCheckable(true);
-		setCursor(Qt::PointingHandCursor);
-		setFocusPolicy(Qt::StrongFocus);
-		setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
-	}
-
-	QSize sizeHint() const override { return QSize(36, 20); }
-
-protected:
-	void paintEvent(QPaintEvent *) override
-	{
-		QPainter p(this);
-
-		p.setRenderHint(QPainter::Antialiasing, true);
-
-		const QRectF track = QRectF(rect()).adjusted(1, 1, -1, -1);
-		const qreal radius = track.height() / 2.0;
-		const QColor ink = palette().color(QPalette::WindowText);
-
-		p.setPen(Qt::NoPen);
-		p.setBrush(isChecked() ? warp_green : warp_with_alpha(ink, 0.25));
-		p.drawRoundedRect(track, radius, radius);
-
-		const qreal knob = track.height() - 4.0;
-		const qreal x = isChecked() ? track.right() - 2.0 - knob : track.left() + 2.0;
-
-		p.setBrush(isChecked() ? QColor(Qt::white) : warp_with_alpha(ink, 0.7));
-		p.drawEllipse(QRectF(x, track.top() + 2.0, knob, knob));
-
-		if (hasFocus()) {
-			QPen pen(palette().color(QPalette::Highlight));
-
-			pen.setWidthF(1.5);
-			p.setPen(pen);
-			p.setBrush(Qt::NoBrush);
-			p.drawRoundedRect(track, radius, radius);
-		}
-	}
-};
 
 /* ------------------------------------------------------------------------- */
 /* the flow list */
@@ -1740,8 +1650,9 @@ void WarpWindow::editFlow(const QString &id)
 
 	WarpFlowPropsDialog dialog(this, id);
 
-	if (dialog.exec() == QDialog::Accepted)
-		refresh();
+	/* changes are applied from inside it, so whatever it closed with */
+	dialog.exec();
+	refresh();
 }
 
 void WarpWindow::removeFlow(const QString &id)
