@@ -33,4 +33,3 @@ Work that has been thought through but not built yet, with enough of the design 
 
 * **Background probing of playlist files** — duration, resolution, frame rate and a thumbnail read on a worker thread as files are added, for the total run time, flagging unplayable files early, and a playlist panel in the Warp window.
 * **A playlist panel in the Warp window** — the list, the play-next queue, and each file's in/out points and speed, edited directly rather than over obs-websocket.
-* **Render tests in CI** — `tests/` now holds a harness that runs libobs headless under Xvfb, drives real Warp sources and reads the overlays back (see `tests/README.md`), run by hand. Running it on the Ubuntu CI job needs Xvfb, the OBS PPA's `obs-studio` (for libobs, `obs-transitions` and `text-freetype2`) and FFmpeg's command line on the runner, and extending it to the engine and the sources themselves would cover what was checked by hand during development.
